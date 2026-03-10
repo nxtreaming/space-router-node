@@ -6,7 +6,6 @@
 # Required environment variables:
 #   EXPECTED_VERSION  - version string the binary should report
 #   SR_NODE_PORT      - port for the node to bind (use a high port to avoid conflicts)
-#   SR_COORDINATION_API_URL - coordination API URL (can be fake for testing)
 #   SR_PUBLIC_IP      - public IP override
 #   SR_UPNP_ENABLED   - set to "false" for CI
 
@@ -18,10 +17,54 @@ param(
 $ErrorActionPreference = "Continue"
 $Pass = 0
 $Fail = 0
+$MockApiProcess = $null
+$MockApiPort = 19099
 
 function Log($msg) { Write-Host "  [INFO]  $msg" }
 function Pass($msg) { Write-Host "  [PASS]  $msg"; $script:Pass++ }
 function Fail($msg) { Write-Host "  [FAIL]  $msg"; $script:Fail++ }
+
+# Start a mock coordination API
+function Start-MockApi {
+    $mockScript = @"
+import http.server, json
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get('Content-Length', 0))
+        self.rfile.read(length)
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps({'id': 'test-node-001'}).encode())
+    def do_PATCH(self):
+        length = int(self.headers.get('Content-Length', 0))
+        self.rfile.read(length)
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(b'{}')
+    def log_message(self, *args):
+        pass
+
+server = http.server.HTTPServer(('127.0.0.1', $MockApiPort), Handler)
+server.serve_forever()
+"@
+
+    $tempFile = [System.IO.Path]::GetTempFileName() -replace '\.tmp$', '.py'
+    $mockScript | Out-File -FilePath $tempFile -Encoding utf8
+    $script:MockApiProcess = Start-Process -FilePath python -ArgumentList $tempFile -PassThru -NoNewWindow
+    $env:SR_COORDINATION_API_URL = "http://127.0.0.1:$MockApiPort"
+    Log "Started mock coordination API on port $MockApiPort (PID $($script:MockApiProcess.Id))"
+    Start-Sleep -Seconds 2
+}
+
+function Stop-MockApi {
+    if ($null -ne $script:MockApiProcess -and -not $script:MockApiProcess.HasExited) {
+        Stop-Process -Id $script:MockApiProcess.Id -Force -ErrorAction SilentlyContinue
+        $script:MockApiProcess.WaitForExit(5000) | Out-Null
+    }
+}
 
 # ---------- Test 1: --version flag ----------
 function Test-VersionFlag {
@@ -47,7 +90,7 @@ function Test-PortBinding {
     $proc = Start-Process -FilePath $Binary -PassThru -NoNewWindow
     Log "Started binary with PID $($proc.Id)"
 
-    Start-Sleep -Seconds 4
+    Start-Sleep -Seconds 6
 
     if ($proc.HasExited) {
         Fail "Binary exited prematurely with code $($proc.ExitCode)"
@@ -87,7 +130,7 @@ function Test-CleanShutdown {
     $proc = Start-Process -FilePath $Binary -PassThru -NoNewWindow
     Log "Started binary with PID $($proc.Id)"
 
-    Start-Sleep -Seconds 4
+    Start-Sleep -Seconds 6
 
     if ($proc.HasExited) {
         Fail "Binary exited before shutdown signal could be sent"
@@ -128,9 +171,16 @@ Write-Host "Version: $($env:EXPECTED_VERSION)"
 Write-Host "Port:    $($env:SR_NODE_PORT)"
 Write-Host ""
 
-Test-VersionFlag
-Test-PortBinding
-Test-CleanShutdown
+try {
+    Start-MockApi
+
+    Test-VersionFlag
+    Test-PortBinding
+    Test-CleanShutdown
+}
+finally {
+    Stop-MockApi
+}
 
 Write-Host ""
 Write-Host "=== Results: $Pass passed, $Fail failed ==="

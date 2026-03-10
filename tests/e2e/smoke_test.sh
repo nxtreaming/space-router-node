@@ -7,7 +7,6 @@
 # Required environment variables:
 #   EXPECTED_VERSION  - version string the binary should report
 #   SR_NODE_PORT      - port for the node to bind (use a high port to avoid conflicts)
-#   SR_COORDINATION_API_URL - coordination API URL (can be fake for testing)
 #   SR_PUBLIC_IP      - public IP override
 #   SR_UPNP_ENABLED   - set to "false" for CI
 
@@ -16,17 +15,65 @@ set -euo pipefail
 BINARY="$1"
 PASS=0
 FAIL=0
+MOCK_API_PID=""
 
 log()  { echo "  [INFO]  $*"; }
 pass() { echo "  [PASS]  $*"; PASS=$((PASS + 1)); }
 fail() { echo "  [FAIL]  $*"; FAIL=$((FAIL + 1)); }
+
+# Start a mock coordination API that responds to POST /nodes and PATCH requests
+start_mock_api() {
+    local MOCK_PORT=19099
+    export SR_COORDINATION_API_URL="http://127.0.0.1:${MOCK_PORT}"
+
+    python3 -c "
+import http.server, json, threading
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get('Content-Length', 0))
+        self.rfile.read(length)
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps({'id': 'test-node-001'}).encode())
+    def do_PATCH(self):
+        length = int(self.headers.get('Content-Length', 0))
+        self.rfile.read(length)
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(b'{}')
+    def log_message(self, *args):
+        pass  # suppress logs
+
+server = http.server.HTTPServer(('127.0.0.1', ${MOCK_PORT}), Handler)
+server.serve_forever()
+" &
+    MOCK_API_PID=$!
+    log "Started mock coordination API on port ${MOCK_PORT} (PID $MOCK_API_PID)"
+    sleep 1
+}
+
+stop_mock_api() {
+    if [ -n "$MOCK_API_PID" ]; then
+        kill "$MOCK_API_PID" 2>/dev/null || true
+        wait "$MOCK_API_PID" 2>/dev/null || true
+        MOCK_API_PID=""
+    fi
+}
+
+cleanup() {
+    stop_mock_api
+}
+trap cleanup EXIT
 
 # ---------- Test 1: --version flag ----------
 test_version_flag() {
     log "Testing --version flag..."
     VERSION_OUTPUT=$("$BINARY" --version 2>&1) || true
 
-    if echo "$VERSION_OUTPUT" | grep -q "$EXPECTED_VERSION"; then
+    if echo "$VERSION_OUTPUT" | grep -qF "$EXPECTED_VERSION"; then
         pass "--version reports '$EXPECTED_VERSION'"
     else
         fail "--version output was '$VERSION_OUTPUT', expected to contain '$EXPECTED_VERSION'"
@@ -37,14 +84,12 @@ test_version_flag() {
 test_port_binding() {
     log "Testing port binding on port $SR_NODE_PORT..."
 
-    # Start the binary in the background. It will fail to register with the
-    # coordination API but should still bind the TLS listener first.
     "$BINARY" &
     PID=$!
     log "Started binary with PID $PID"
 
-    # Give it time to start and bind
-    sleep 3
+    # Give it time to start, register, and bind
+    sleep 5
 
     if ! kill -0 "$PID" 2>/dev/null; then
         fail "Binary exited prematurely"
@@ -52,17 +97,17 @@ test_port_binding() {
     fi
 
     # Check if the port is listening
-    if command -v ss &>/dev/null; then
-        LISTENING=$(ss -tlnp 2>/dev/null | grep ":${SR_NODE_PORT}" || true)
-    elif command -v lsof &>/dev/null; then
+    if command -v lsof &>/dev/null; then
         LISTENING=$(lsof -iTCP:"${SR_NODE_PORT}" -sTCP:LISTEN 2>/dev/null || true)
+    elif command -v ss &>/dev/null; then
+        LISTENING=$(ss -tlnp 2>/dev/null | grep ":${SR_NODE_PORT}" || true)
     elif command -v netstat &>/dev/null; then
         LISTENING=$(netstat -an 2>/dev/null | grep "LISTEN" | grep ":${SR_NODE_PORT}" || true)
     else
         log "No port-checking tool available, skipping port binding check"
         kill "$PID" 2>/dev/null || true
         wait "$PID" 2>/dev/null || true
-        pass "Binary started (port check skipped — no ss/lsof/netstat)"
+        pass "Binary started (port check skipped — no lsof/ss/netstat)"
         return
     fi
 
@@ -85,7 +130,7 @@ test_clean_shutdown() {
     PID=$!
     log "Started binary with PID $PID"
 
-    sleep 3
+    sleep 5
 
     if ! kill -0 "$PID" 2>/dev/null; then
         fail "Binary exited before SIGTERM could be sent"
@@ -123,6 +168,8 @@ echo "Binary:  $BINARY"
 echo "Version: $EXPECTED_VERSION"
 echo "Port:    $SR_NODE_PORT"
 echo ""
+
+start_mock_api
 
 test_version_flag
 test_port_binding

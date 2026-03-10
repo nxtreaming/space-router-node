@@ -63,10 +63,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt pyinstaller
 
+      - name: Freeze version into binary
+        shell: bash
+        run: |
+          echo "BUILD_VERSION = \"${{ steps.version.outputs.version }}\"" > app/_build_version.py
+
       - name: Build binary
         run: pyinstaller homenode.spec
-        env:
-          SR_BUILD_VERSION: ${{ steps.version.outputs.version }}
 
       - name: Rename artifact
         shell: bash
@@ -83,7 +86,6 @@ jobs:
         run: bash tests/e2e/smoke_test.sh "dist/${{ matrix.artifact }}"
         env:
           EXPECTED_VERSION: ${{ steps.version.outputs.version }}
-          SR_COORDINATION_API_URL: http://localhost:9999
           SR_PUBLIC_IP: 127.0.0.1
           SR_UPNP_ENABLED: "false"
           SR_NODE_PORT: "19090"
@@ -94,7 +96,6 @@ jobs:
         run: .\tests\e2e\smoke_test.ps1 -Binary "dist\${{ matrix.artifact }}.exe"
         env:
           EXPECTED_VERSION: ${{ steps.version.outputs.version }}
-          SR_COORDINATION_API_URL: http://localhost:9999
           SR_PUBLIC_IP: 127.0.0.1
           SR_UPNP_ENABLED: "false"
           SR_NODE_PORT: "19090"
