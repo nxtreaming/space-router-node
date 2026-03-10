@@ -140,8 +140,15 @@ jobs:
           $version = "${{ steps.version.outputs.version }}"
           # Strip leading 'v' for installer version
           $pkg_version = $version -replace '^v', ''
+          # Extract numeric-only version for VIProductVersion (X.X.X.X format)
+          if ($pkg_version -match '^(\d+\.\d+\.\d+)') {
+              $numeric_version = "$($Matches[1]).0"
+          } else {
+              $numeric_version = "0.0.0.0"
+          }
 
           makensis /DVERSION=$pkg_version `
+                   /DNUMERIC_VERSION=$numeric_version `
                    /DBINARY="..\..\dist\${{ matrix.artifact }}.exe" `
                    /DWINSW="WinSW-x64.exe" `
                    packaging\windows\installer.nsi

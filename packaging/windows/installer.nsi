@@ -42,7 +42,12 @@ ShowUninstDetails show
 ; ---------------------------------------------------------------------------
 ; Version info embedded in the executable
 ; ---------------------------------------------------------------------------
-VIProductVersion "${VERSION}.0"
+; NUMERIC_VERSION must be X.X.X.X format for VIProductVersion.
+; CI passes it separately from VERSION (which may contain pre-release tags).
+!ifndef NUMERIC_VERSION
+  !define NUMERIC_VERSION "0.0.0.0"
+!endif
+VIProductVersion "${NUMERIC_VERSION}"
 VIAddVersionKey "ProductName" "Space Router Home Node"
 VIAddVersionKey "CompanyName" "Gluwa Inc."
 VIAddVersionKey "FileDescription" "Space Router Home Node Installer"
