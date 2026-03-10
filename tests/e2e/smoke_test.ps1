@@ -19,6 +19,10 @@ $Pass = 0
 $Fail = 0
 $MockApiProcess = $null
 $MockApiPort = 19099
+$BasePort = [int]$env:SR_NODE_PORT
+if ($BasePort -eq 0) { $BasePort = 19090 }
+$PortBindingPort = $BasePort
+$ShutdownPort = $BasePort + 1
 
 function Log($msg) { Write-Host "  [INFO]  $msg" }
 function Pass($msg) { Write-Host "  [PASS]  $msg"; $script:Pass++ }
@@ -79,28 +83,6 @@ function Stop-MockApi {
     }
 }
 
-# Wait for the node port to be fully released (up to 10 seconds)
-function Wait-PortFree {
-    $port = [int]$env:SR_NODE_PORT
-    Log "Waiting for port $port to be released..."
-    for ($i = 0; $i -lt 20; $i++) {
-        $inUse = $false
-        try {
-            $connection = Test-NetConnection -ComputerName 127.0.0.1 -Port $port -WarningAction SilentlyContinue -InformationLevel Quiet
-            $inUse = $connection
-        }
-        catch {
-            $inUse = $false
-        }
-        if (-not $inUse) {
-            Log "Port $port is free"
-            return
-        }
-        Start-Sleep -Milliseconds 500
-    }
-    Log "WARNING: Port $port may still be in use"
-}
-
 # ---------- Test 1: --version flag ----------
 function Test-VersionFlag {
     Log "Testing --version flag..."
@@ -120,6 +102,8 @@ function Test-VersionFlag {
 
 # ---------- Test 2: Binary starts and binds to port ----------
 function Test-PortBinding {
+    # Use a dedicated port so TIME_WAIT state doesn't affect other tests
+    $env:SR_NODE_PORT = "$PortBindingPort"
     Log "Testing port binding on port $($env:SR_NODE_PORT)..."
 
     $proc = Start-Process -FilePath $Binary -PassThru -NoNewWindow
@@ -156,14 +140,13 @@ function Test-PortBinding {
     else {
         Fail "Binary did not bind to port $($env:SR_NODE_PORT)"
     }
-
-    # Wait for port to be fully released before next test
-    Wait-PortFree
 }
 
 # ---------- Test 3: Clean shutdown ----------
 function Test-CleanShutdown {
-    Log "Testing clean shutdown..."
+    # Use a different port than Test-PortBinding to avoid TIME_WAIT conflicts
+    $env:SR_NODE_PORT = "$ShutdownPort"
+    Log "Testing clean shutdown on port $($env:SR_NODE_PORT)..."
 
     $proc = Start-Process -FilePath $Binary -PassThru -NoNewWindow
     Log "Started binary with PID $($proc.Id)"
@@ -206,7 +189,7 @@ Write-Host ""
 Write-Host "=== Space Router Home Node - E2E Smoke Tests ==="
 Write-Host "Binary:  $Binary"
 Write-Host "Version: $($env:EXPECTED_VERSION)"
-Write-Host "Port:    $($env:SR_NODE_PORT)"
+Write-Host "Ports:   $PortBindingPort (binding), $ShutdownPort (shutdown)"
 Write-Host ""
 
 try {

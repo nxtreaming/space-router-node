@@ -16,6 +16,9 @@ BINARY="$1"
 PASS=0
 FAIL=0
 MOCK_API_PID=""
+BASE_PORT="${SR_NODE_PORT:-19090}"
+PORT_BINDING_PORT=$((BASE_PORT))
+SHUTDOWN_PORT=$((BASE_PORT + 1))
 
 log()  { echo "  [INFO]  $*"; }
 pass() { echo "  [PASS]  $*"; PASS=$((PASS + 1)); }
@@ -77,29 +80,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Wait for the node port to be fully released (up to 10 seconds)
-wait_for_port_free() {
-    log "Waiting for port $SR_NODE_PORT to be released..."
-    for i in $(seq 1 20); do
-        if command -v lsof &>/dev/null; then
-            if ! lsof -iTCP:"${SR_NODE_PORT}" -sTCP:LISTEN &>/dev/null; then
-                log "Port $SR_NODE_PORT is free"
-                return
-            fi
-        elif command -v ss &>/dev/null; then
-            if ! ss -tlnp 2>/dev/null | grep -q ":${SR_NODE_PORT}"; then
-                log "Port $SR_NODE_PORT is free"
-                return
-            fi
-        else
-            sleep 2
-            return
-        fi
-        sleep 0.5
-    done
-    log "WARNING: Port $SR_NODE_PORT may still be in use"
-}
-
 # ---------- Test 1: --version flag ----------
 test_version_flag() {
     log "Testing --version flag..."
@@ -114,6 +94,8 @@ test_version_flag() {
 
 # ---------- Test 2: Binary starts and binds to port ----------
 test_port_binding() {
+    # Use a dedicated port so TIME_WAIT state doesn't affect other tests
+    export SR_NODE_PORT="$PORT_BINDING_PORT"
     log "Testing port binding on port $SR_NODE_PORT..."
 
     "$BINARY" &
@@ -152,14 +134,13 @@ test_port_binding() {
     else
         fail "Binary did not bind to port $SR_NODE_PORT"
     fi
-
-    # Wait for port to be fully released before next test
-    wait_for_port_free
 }
 
 # ---------- Test 3: Clean shutdown via SIGTERM ----------
 test_clean_shutdown() {
-    log "Testing clean shutdown via SIGTERM..."
+    # Use a different port than test_port_binding to avoid TIME_WAIT conflicts
+    export SR_NODE_PORT="$SHUTDOWN_PORT"
+    log "Testing clean shutdown via SIGTERM on port $SR_NODE_PORT..."
 
     "$BINARY" &
     PID=$!
@@ -201,7 +182,7 @@ echo ""
 echo "=== Space Router Home Node — E2E Smoke Tests ==="
 echo "Binary:  $BINARY"
 echo "Version: $EXPECTED_VERSION"
-echo "Port:    $SR_NODE_PORT"
+echo "Ports:   $PORT_BINDING_PORT (binding), $SHUTDOWN_PORT (shutdown)"
 echo ""
 
 start_mock_api
