@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>Space Router Home Node</title>
+    <organization>com.spacerouter</organization>
+    <domains enable_localSystem="true"/>
+    <options customize="never" require-scripts="true" rootVolumeOnly="true"/>
+
+    <!-- Require macOS 12.0+ (Monterey) for Python 3.12 compatibility -->
+    <os-version min="12.0"/>
+
+    <welcome    file="welcome.html"/>
+
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.spacerouter.homenode"/>
+        </line>
+    </choices-outline>
+
+    <choice id="default"/>
+    <choice id="com.spacerouter.homenode" visible="false">
+        <pkg-ref id="com.spacerouter.homenode"/>
+    </choice>
+
+    <pkg-ref id="com.spacerouter.homenode"
+             version="{{VERSION}}"
+             onConclusion="none">component.pkg</pkg-ref>
+</installer-gui-script>

@@ -1,0 +1,15 @@
+#!/bin/bash
+# Pre-install script for Space Router Home Node macOS .pkg
+# Stops the existing service if running before upgrading.
+
+set -e
+
+echo "Space Router Home Node: pre-install"
+
+# Unload existing launchd service if present
+if launchctl list com.spacerouter.homenode &>/dev/null; then
+    echo "Stopping existing Space Router Home Node service..."
+    launchctl unload /Library/LaunchDaemons/com.spacerouter.homenode.plist 2>/dev/null || true
+fi
+
+exit 0

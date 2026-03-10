@@ -1,0 +1,51 @@
+#!/bin/bash
+# Post-install script for Space Router Home Node macOS .pkg
+# Sets up directories, default config, and starts the service.
+
+set -e
+
+echo "Space Router Home Node: post-install"
+
+# Create certs directory with restricted permissions
+mkdir -p /opt/spacerouter/certs
+chmod 700 /opt/spacerouter/certs
+
+# Create config directory
+mkdir -p /etc/spacerouter
+
+# Copy default config if user hasn't configured one yet
+if [ ! -f /etc/spacerouter/spacerouter.env ]; then
+    cp /opt/spacerouter/spacerouter.env.default /etc/spacerouter/spacerouter.env
+    echo "Default configuration installed to /etc/spacerouter/spacerouter.env"
+    echo "Edit this file to configure your node before starting."
+fi
+
+# Set correct permissions on the binary
+chmod 755 /opt/spacerouter/space-router-node
+
+# Set correct ownership on the plist
+chown root:wheel /Library/LaunchDaemons/com.spacerouter.homenode.plist
+chmod 644 /Library/LaunchDaemons/com.spacerouter.homenode.plist
+
+# Load and start the service
+echo "Loading Space Router Home Node service..."
+launchctl load /Library/LaunchDaemons/com.spacerouter.homenode.plist
+
+echo ""
+echo "============================================"
+echo "  Space Router Home Node installed!"
+echo "============================================"
+echo ""
+echo "  Config:  /etc/spacerouter/spacerouter.env"
+echo "  Binary:  /opt/spacerouter/space-router-node"
+echo "  Logs:    /tmp/spacerouter-homenode.stdout.log"
+echo ""
+echo "  Check status:"
+echo "    sudo launchctl list com.spacerouter.homenode"
+echo ""
+echo "  Restart:"
+echo "    sudo launchctl unload /Library/LaunchDaemons/com.spacerouter.homenode.plist"
+echo "    sudo launchctl load /Library/LaunchDaemons/com.spacerouter.homenode.plist"
+echo ""
+
+exit 0
