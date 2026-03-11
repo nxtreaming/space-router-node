@@ -115,7 +115,7 @@ async def _run(settings_override=None) -> None:  # noqa: ANN001
 
         handler = functools.partial(handle_client, settings=s)
         server = await asyncio.start_server(
-            handler, host="0.0.0.0", port=s.NODE_PORT, ssl=ssl_ctx,
+            handler, host=s.BIND_ADDRESS, port=s.NODE_PORT, ssl=ssl_ctx,
         )
         logger.info(
             "Home Node listening on port %d with TLS (node_id=%s, upnp=%s)",

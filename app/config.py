@@ -54,7 +54,3 @@ if not settings.COORDINATION_API_URL.startswith("https://"):
             stacklevel=1,
         )
 
-
-# Testing override — never set in production
-import os
-_ALLOW_LOOPBACK_TARGETS = os.environ.get("SR_ALLOW_LOOPBACK_TARGETS", "").lower() == "true"

@@ -49,23 +49,84 @@ _BLOCKED_NETWORKS = [
 _BLOCKED_PORTS = {22, 23, 25, 135, 136, 137, 138, 139, 445, 3306, 5432, 6379, 11211, 27017}
 
 
-def _is_private_target(host: str, port: int) -> bool:
-    """Return True if the target host resolves to a private/reserved IP or a blocked port."""
-    if port in _BLOCKED_PORTS:
-        return True
+def _is_private_ip(host: str) -> bool:
+    """Return True if *host* (an IP literal) is in a private/reserved range."""
     try:
         addr = ipaddress.ip_address(host)
-        # Handle IPv4-mapped IPv6 addresses (::ffff:192.168.1.1)
         if addr.version == 6 and addr.ipv4_mapped:
             addr = addr.ipv4_mapped
         return any(addr in net for net in _BLOCKED_NETWORKS)
     except ValueError:
-        # hostname, not IP — DNS resolution happens at connect time
-        # For hostnames we cannot pre-check, but we block obvious patterns
+        return False
+
+
+def _is_private_target(host: str, port: int) -> bool:
+    """Return True if the target host resolves to a private/reserved IP or a blocked port."""
+    if port in _BLOCKED_PORTS:
+        return True
+    if _is_private_ip(host):
+        return True
+    # hostname, not IP — block obvious patterns
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
         lower = host.lower()
         if lower in ("localhost", "localhost.localdomain") or lower.endswith(".local"):
             return True
     return False
+
+
+import socket
+
+
+class _DNSRebindingError(Exception):
+    """Raised when DNS resolution yields a private/reserved IP."""
+
+
+async def _resolve_and_connect(
+    host: str,
+    port: int,
+    timeout: float,
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """Resolve *host* via DNS, check the resolved IP against the blocklist,
+    then connect to the resolved IP directly (preventing DNS rebinding).
+
+    Raises ``ConnectionRefusedError`` if the resolved IP is private/reserved.
+    Raises ``OSError`` / ``asyncio.TimeoutError`` on network failure.
+    """
+    loop = asyncio.get_running_loop()
+
+    # Resolve hostname → IP(s)
+    try:
+        infos = await asyncio.wait_for(
+            loop.getaddrinfo(host, port, type=socket.SOCK_STREAM),
+            timeout=min(timeout, 10.0),
+        )
+    except (socket.gaierror, asyncio.TimeoutError) as exc:
+        raise OSError(f"DNS resolution failed for {host}: {exc}") from exc
+
+    if not infos:
+        raise OSError(f"DNS resolution returned no results for {host}")
+
+    # Check ALL resolved IPs — an attacker might have multiple A records
+    # mixing public and private IPs.
+    for family, _type, _proto, _canonname, sockaddr in infos:
+        resolved_ip = sockaddr[0]
+        if _is_private_ip(resolved_ip):
+            raise _DNSRebindingError(
+                f"DNS rebinding blocked: {host} resolved to private IP {resolved_ip}"
+            )
+
+    # Connect to the first resolved address
+    # Using the resolved IP directly prevents TOCTOU race.
+    family, _type, _proto, _canonname, sockaddr = infos[0]
+    resolved_ip = sockaddr[0]
+
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(resolved_ip, port),
+        timeout=timeout,
+    )
+    return reader, writer
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +186,7 @@ async def _pipe(
     writer: asyncio.StreamWriter,
     counter: list[int],
     buffer_size: int,
+    activity_event: asyncio.Event | None = None,
 ) -> None:
     try:
         while True:
@@ -134,8 +196,14 @@ async def _pipe(
             writer.write(data)
             await writer.drain()
             counter[0] += len(data)
+            if activity_event is not None:
+                activity_event.set()
     except (ConnectionResetError, BrokenPipeError, OSError, asyncio.CancelledError):
         pass
+
+
+# Maximum absolute wall-clock timeout for a single relay (safety cap).
+MAX_RELAY_DURATION = 3600.0  # 1 hour
 
 
 async def relay_streams(
@@ -146,17 +214,62 @@ async def relay_streams(
     buffer_size: int,
     timeout: float = 300.0,
 ) -> tuple[int, int]:
+    """Bidirectional byte relay with **idle** timeout.
+
+    The *timeout* is reset every time data flows in either direction.
+    A hard safety cap (``MAX_RELAY_DURATION``) ensures no relay lives
+    forever even if there is continuous low-rate traffic.
+    """
     bytes_a_to_b = [0]
     bytes_b_to_a = [0]
+    activity = asyncio.Event()
 
-    task_a = asyncio.create_task(_pipe(reader_a, writer_b, bytes_a_to_b, buffer_size))
-    task_b = asyncio.create_task(_pipe(reader_b, writer_a, bytes_b_to_a, buffer_size))
+    task_a = asyncio.create_task(
+        _pipe(reader_a, writer_b, bytes_a_to_b, buffer_size, activity)
+    )
+    task_b = asyncio.create_task(
+        _pipe(reader_b, writer_a, bytes_b_to_a, buffer_size, activity)
+    )
+
+    done = asyncio.gather(task_a, task_b, return_exceptions=True)
+    deadline = asyncio.get_event_loop().time() + MAX_RELAY_DURATION
 
     try:
-        await asyncio.wait_for(
-            asyncio.gather(task_a, task_b, return_exceptions=True),
-            timeout=timeout,
-        )
+        while True:
+            activity.clear()
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                logger.debug("Relay hit absolute duration cap")
+                break
+
+            idle_limit = min(timeout, remaining)
+
+            # Wait for either: both pipes finish, or activity, or idle timeout
+            activity_task = asyncio.create_task(activity.wait())
+            finished, pending = await asyncio.wait(
+                [done, activity_task],
+                timeout=idle_limit,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            # Clean up the activity waiter if it didn't fire
+            if activity_task in pending:
+                activity_task.cancel()
+                try:
+                    await activity_task
+                except asyncio.CancelledError:
+                    pass
+
+            if done in finished:
+                # Both pipes completed naturally
+                break
+
+            if not finished:
+                # Neither activity nor completion → idle timeout
+                logger.debug("Relay idle timeout (%ss)", timeout)
+                break
+
+            # Activity detected — loop again with fresh idle timer
     except asyncio.TimeoutError:
         pass
     finally:
@@ -239,18 +352,23 @@ async def handle_connect(
     relay bytes bidirectionally between the client (Proxy Gateway) and the
     target server.
     """
-    # SSRF protection — block private/reserved targets
+    # SSRF protection — block private/reserved targets (static check)
     if _is_private_target(target_host, target_port):
         logger.warning("CONNECT blocked — private target %s:%s", target_host, target_port)
         client_writer.write(_forbidden("Target not allowed"))
         await client_writer.drain()
         return
 
+    # DNS-resolved SSRF check — prevent DNS rebinding attacks
     try:
-        target_reader, target_writer = await asyncio.wait_for(
-            asyncio.open_connection(target_host, target_port),
-            timeout=settings.REQUEST_TIMEOUT,
+        target_reader, target_writer = await _resolve_and_connect(
+            target_host, target_port, settings.REQUEST_TIMEOUT,
         )
+    except _DNSRebindingError as exc:
+        logger.warning("CONNECT blocked (DNS rebinding) — %s", exc)
+        client_writer.write(_forbidden("Target not allowed"))
+        await client_writer.drain()
+        return
     except (OSError, asyncio.TimeoutError) as exc:
         logger.warning("CONNECT failed to %s:%s — %s", target_host, target_port, exc)
         client_writer.write(_bad_gateway("Cannot connect to target"))
@@ -310,19 +428,23 @@ async def handle_http_forward(
         await client_writer.drain()
         return
 
-    # SSRF protection — block private/reserved targets
+    # SSRF protection — block private/reserved targets (static check)
     if _is_private_target(host, port):
         logger.warning("HTTP forward blocked — private target %s:%s", host, port)
         client_writer.write(_forbidden("Target not allowed"))
         await client_writer.drain()
         return
 
-    # Connect to target
+    # DNS-resolved SSRF check — prevent DNS rebinding attacks
     try:
-        target_reader, target_writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port),
-            timeout=settings.REQUEST_TIMEOUT,
+        target_reader, target_writer = await _resolve_and_connect(
+            host, port, settings.REQUEST_TIMEOUT,
         )
+    except _DNSRebindingError as exc:
+        logger.warning("HTTP forward blocked (DNS rebinding) — %s", exc)
+        client_writer.write(_forbidden("Target not allowed"))
+        await client_writer.drain()
+        return
     except (OSError, asyncio.TimeoutError) as exc:
         logger.warning("HTTP forward failed to %s:%s — %s", host, port, exc)
         client_writer.write(_bad_gateway("Cannot connect to target"))
@@ -448,40 +570,88 @@ async def handle_http_forward(
 # Client dispatch
 # ---------------------------------------------------------------------------
 
+# Global connection semaphore — initialized lazily on first use.
+# The limit comes from Settings.MAX_CONNECTIONS.
+_connection_semaphore: asyncio.Semaphore | None = None
+_active_connections: int = 0
+
+
+def _get_semaphore(max_connections: int) -> asyncio.Semaphore:
+    """Return (or create) the global connection semaphore."""
+    global _connection_semaphore
+    if _connection_semaphore is None:
+        _connection_semaphore = asyncio.Semaphore(max_connections)
+    return _connection_semaphore
+
+
+def _service_unavailable() -> bytes:
+    body = b"503 Service Unavailable - connection limit reached"
+    return (
+        b"HTTP/1.1 503 Service Unavailable\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+        b"Connection: close\r\n"
+        b"\r\n" + body
+    )
+
+
 async def handle_client(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
     settings: Settings,
 ) -> None:
     """Entry point for each inbound connection from the Proxy Gateway."""
+    global _active_connections
     peer = writer.get_extra_info("peername")
-    logger.debug("New connection from %s", peer)
 
-    try:
-        result = await _read_request_head(reader, settings.REQUEST_TIMEOUT)
-        if result is None:
-            writer.write(_bad_request("Malformed request"))
-            await writer.drain()
-            return
-
-        _raw_head, method, target, version, headers = result
-
-        if method.upper() == "CONNECT":
-            host_port = target.split(":")
-            target_host = host_port[0]
-            target_port = int(host_port[1]) if len(host_port) > 1 else 443
-
-            logger.info("CONNECT %s:%s", target_host, target_port)
-            await handle_connect(reader, writer, target_host, target_port, settings)
-        else:
-            logger.info("%s %s", method, target)
-            await handle_http_forward(reader, writer, method, target, version, headers, settings)
-
-    except Exception:
-        logger.exception("Unhandled error in client handler")
-    finally:
+    sem = _get_semaphore(settings.MAX_CONNECTIONS)
+    if not sem._value:  # noqa: SLF001 — fast check without awaiting
+        logger.warning(
+            "Connection limit reached (%d) — rejecting %s",
+            settings.MAX_CONNECTIONS, peer,
+        )
         try:
-            writer.close()
-            await writer.wait_closed()
+            writer.write(_service_unavailable())
+            await writer.drain()
         except Exception:
             pass
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+        return
+
+    async with sem:
+        _active_connections += 1
+        logger.debug("New connection from %s (active=%d)", peer, _active_connections)
+        try:
+            result = await _read_request_head(reader, settings.REQUEST_TIMEOUT)
+            if result is None:
+                writer.write(_bad_request("Malformed request"))
+                await writer.drain()
+                return
+
+            _raw_head, method, target, version, headers = result
+
+            if method.upper() == "CONNECT":
+                host_port = target.split(":")
+                target_host = host_port[0]
+                target_port = int(host_port[1]) if len(host_port) > 1 else 443
+
+                logger.info("CONNECT %s:%s", target_host, target_port)
+                await handle_connect(reader, writer, target_host, target_port, settings)
+            else:
+                logger.info("%s %s", method, target)
+                await handle_http_forward(reader, writer, method, target, version, headers, settings)
+
+        except Exception:
+            logger.exception("Unhandled error in client handler")
+        finally:
+            _active_connections -= 1
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass

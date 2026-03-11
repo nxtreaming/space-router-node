@@ -22,7 +22,7 @@ from app.tls import create_server_ssl_context, ensure_certificates
 @pytest.fixture(autouse=True)
 def _bypass_ssrf():
     """Bypass SSRF protection for integration tests using loopback targets."""
-    with patch("app.proxy_handler._is_private_target", return_value=False):
+    with patch("app.proxy_handler._is_private_ip", return_value=False):
         yield
 
 
