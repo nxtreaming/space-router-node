@@ -88,6 +88,9 @@ class TestSSRFProtection:
         # Hostnames that aren't obviously local
         ("example.com", 443, False),
         ("google.com", 80, False),
+        # .internal domains — used by Coordination API challenge probe
+        ("challenge.spacerouter.internal", 443, False),
+        ("anything.internal", 80, False),
         # IPv6
         ("::1", 80, True),          # loopback
         ("fc00::1", 80, True),      # unique local
@@ -324,6 +327,75 @@ class TestErrorSanitization:
             resp = await asyncio.wait_for(reader.read(4096), timeout=10.0)
             resp_text = resp.decode("latin-1")
             assert "93.184.216.34" not in resp_text
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            home.close()
+            await home.wait_closed()
+
+
+# ---------------------------------------------------------------------------
+# Endpoint Challenge Probe (Coordination API registration verification)
+# ---------------------------------------------------------------------------
+
+class TestEndpointChallengeProbe:
+    """Verify that the Coordination API challenge probe receives a valid HTTP
+    response.  During ``POST /nodes``, the API sends
+    ``CONNECT challenge.spacerouter.internal:443`` and accepts any HTTP response
+    (200, 407, 502, etc.) as proof that a proxy is running.
+    """
+
+    @pytest.mark.asyncio
+    async def test_challenge_connect_returns_502(self, settings):
+        """CONNECT to a non-routable challenge domain must return 502, not a
+        silent connection drop."""
+        home, home_port = await _start_home_node(settings)
+        try:
+            reader, writer = await asyncio.open_connection(
+                "127.0.0.1", home_port, ssl=_client_ssl_context(),
+            )
+            writer.write(
+                b"CONNECT challenge.spacerouter.internal:443 HTTP/1.1\r\n"
+                b"Host: challenge.spacerouter.internal:443\r\n"
+                b"\r\n"
+            )
+            await writer.drain()
+
+            resp = await asyncio.wait_for(reader.read(4096), timeout=15.0)
+            resp_text = resp.decode("latin-1")
+
+            # Must be a valid HTTP response (not empty / not a silent drop)
+            assert resp_text.startswith("HTTP/1.1"), "Expected valid HTTP response line"
+            assert "502" in resp_text, "DNS failure should produce 502 Bad Gateway"
+
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            home.close()
+            await home.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_challenge_domain_not_blocked_by_ssrf(self, settings):
+        """The challenge domain must not be caught by SSRF static checks
+        (it is not .local, not localhost, and port 443 is allowed)."""
+        home, home_port = await _start_home_node(settings)
+        try:
+            reader, writer = await asyncio.open_connection(
+                "127.0.0.1", home_port, ssl=_client_ssl_context(),
+            )
+            writer.write(
+                b"CONNECT challenge.spacerouter.internal:443 HTTP/1.1\r\n"
+                b"Host: challenge.spacerouter.internal:443\r\n"
+                b"\r\n"
+            )
+            await writer.drain()
+
+            resp = await asyncio.wait_for(reader.read(4096), timeout=15.0)
+            resp_text = resp.decode("latin-1")
+
+            # Must NOT be 403 (SSRF block) — should be 502 (DNS failure)
+            assert "403" not in resp_text, "Challenge domain must not be SSRF-blocked"
+
             writer.close()
             await writer.wait_closed()
         finally:

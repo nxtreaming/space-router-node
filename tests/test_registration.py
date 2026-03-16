@@ -1,5 +1,7 @@
 """Tests for node registration and IP detection."""
 
+import json
+
 import pytest
 import respx
 from httpx import Response
@@ -214,6 +216,29 @@ class TestRegisterNode:
         # Should succeed without KeyError
         assert node_id == "node-no-class"
         assert gateway_ca_cert is None
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_register_payload_excludes_server_only_fields(self, reg_settings):
+        """ip_type, ip_region, as_type must NOT be sent — they are server-computed."""
+        respx.post("http://coordination:8000/nodes").mock(
+            return_value=Response(201, json={
+                "id": "node-clean-payload",
+                "endpoint_url": "https://1.2.3.4:9090",
+                "node_type": "residential",
+                "status": "online",
+                "health_score": 1.0,
+                "created_at": "2026-01-01T00:00:00Z",
+            })
+        )
+
+        import httpx
+        async with httpx.AsyncClient() as client:
+            await register_node(client, reg_settings, "1.2.3.4")
+
+        body = json.loads(respx.calls[0].request.content)
+        for field in ("ip_type", "ip_region", "as_type"):
+            assert field not in body, f"{field} should not be in registration payload"
 
     @pytest.mark.asyncio
     @respx.mock

@@ -361,6 +361,10 @@ async def handle_connect(
     """Open a TCP connection to *target_host:target_port*, reply 200, then
     relay bytes bidirectionally between the client (Proxy Gateway) and the
     target server.
+
+    Note: The Coordination API sends ``CONNECT challenge.spacerouter.internal:443``
+    during registration to verify the proxy is reachable.  DNS failure returns
+    502 Bad Gateway, which satisfies the challenge (any valid HTTP response is accepted).
     """
     rid_tag = f" [request_id={request_id}]" if request_id else ""
 
