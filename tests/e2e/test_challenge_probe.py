@@ -33,6 +33,7 @@ from app.config import Settings
 from app.proxy_handler import handle_client
 from app.registration import deregister_node, detect_public_ip, register_node
 from app.tls import create_server_ssl_context, ensure_certificates
+from app.wallet import ensure_wallet_key, private_key_to_address
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,9 +48,16 @@ async def run_e2e() -> bool:
     logger.info("Coordination API: %s", settings.COORDINATION_API_URL)
     logger.info("Node port: %d", settings.NODE_PORT)
 
-    # 1. Generate TLS certificates
+    # 1. Generate TLS certificates and wallet key
     ensure_certificates(settings.TLS_CERT_PATH, settings.TLS_KEY_PATH)
     ssl_ctx = create_server_ssl_context(settings.TLS_CERT_PATH, settings.TLS_KEY_PATH)
+
+    if settings.WALLET_PRIVATE_KEY:
+        logger.info("Using wallet key from SR_WALLET_PRIVATE_KEY env var")
+    else:
+        settings.WALLET_PRIVATE_KEY = ensure_wallet_key(settings.WALLET_KEY_PATH)
+    wallet_address = private_key_to_address(settings.WALLET_PRIVATE_KEY)
+    logger.info("Wallet address: %s", wallet_address)
 
     # 2. Start the proxy server
     handler = functools.partial(handle_client, settings=settings)
@@ -82,11 +90,13 @@ async def run_e2e() -> bool:
                 logger.info("Using configured public IP: %s", public_ip)
             else:
                 public_ip = await detect_public_ip(http_client)
+                settings.PUBLIC_IP = public_ip
 
             # 5. Register with Coordination API (this triggers the challenge probe)
             logger.info("Registering with Coordination API (challenge probe will be sent)...")
             node_id, gateway_ca_cert = await register_node(
                 http_client, settings, public_ip, upnp_endpoint=upnp_endpoint,
+                wallet_address=wallet_address,
             )
 
             logger.info("Registration SUCCEEDED — node_id=%s", node_id)
