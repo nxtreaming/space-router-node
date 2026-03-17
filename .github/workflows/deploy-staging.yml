@@ -86,6 +86,7 @@ jobs:
               -e SR_NODE_LABEL="staging-ci" \
               -e SR_NODE_PORT="9090" \
               -e SR_LOG_LEVEL="DEBUG" \
+              -e SR_WALLET_ADDRESS="${{ secrets.SR_STAGING_WALLET_ADDRESS }}" \
               space-router-node:staging
 
             echo "Waiting for container to start..."
