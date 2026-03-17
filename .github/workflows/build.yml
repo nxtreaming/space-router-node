@@ -89,6 +89,7 @@ jobs:
           SR_PUBLIC_IP: 127.0.0.1
           SR_UPNP_ENABLED: "false"
           SR_NODE_PORT: "19090"
+          SR_WALLET_ADDRESS: "0x0000000000000000000000000000000000000001"
 
       - name: Smoke test (Windows)
         if: runner.os == 'Windows'
@@ -99,6 +100,7 @@ jobs:
           SR_PUBLIC_IP: 127.0.0.1
           SR_UPNP_ENABLED: "false"
           SR_NODE_PORT: "19090"
+          SR_WALLET_ADDRESS: "0x0000000000000000000000000000000000000001"
 
       # Build macOS .pkg installer
       - name: Build macOS package
