@@ -36,9 +36,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def _run(settings_override=None) -> None:  # noqa: ANN001
+async def _run(settings_override=None, stop_event=None) -> None:  # noqa: ANN001
     s = settings_override or settings
-    stop_event = asyncio.Event()
+    if stop_event is None:
+        stop_event = asyncio.Event()
 
     if sys.platform != "win32":
         loop = asyncio.get_running_loop()

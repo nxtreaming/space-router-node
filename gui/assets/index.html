@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SpaceRouter</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Onboarding Screen -->
+  <div id="screen-onboarding" class="screen" style="display: none;">
+    <div class="container">
+      <div class="logo">
+        <svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="32" cy="32" r="30" stroke="#6C5CE7" stroke-width="3" fill="none"/>
+          <circle cx="32" cy="32" r="8" fill="#6C5CE7"/>
+          <path d="M32 4 L32 24" stroke="#6C5CE7" stroke-width="2" stroke-linecap="round"/>
+          <path d="M32 40 L32 60" stroke="#6C5CE7" stroke-width="2" stroke-linecap="round"/>
+          <path d="M4 32 L24 32" stroke="#6C5CE7" stroke-width="2" stroke-linecap="round"/>
+          <path d="M40 32 L60 32" stroke="#6C5CE7" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+      </div>
+      <h1>Welcome to SpaceRouter</h1>
+      <p class="description">
+        Enter your CTC address to get started. You'll earn <strong>Spacecoin</strong> to this address.
+      </p>
+      <p class="description">
+        You can also stake your Spacecoin and earn yield &mdash; to earn yield, you must both
+        <strong>stake</strong> AND <strong>run a SpaceRouter node</strong>.
+      </p>
+      <div class="input-group">
+        <label for="wallet-input">CTC Address</label>
+        <input type="text" id="wallet-input" placeholder="0x..." spellcheck="false" autocomplete="off">
+        <span id="wallet-error" class="error"></span>
+      </div>
+      <button id="btn-start" class="btn-primary" disabled>Start SpaceRouter</button>
+    </div>
+  </div>
+
+  <!-- Status Dashboard -->
+  <div id="screen-status" class="screen" style="display: none;">
+    <div class="container">
+      <div class="logo">
+        <svg width="48" height="48" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="32" cy="32" r="30" stroke="#6C5CE7" stroke-width="3" fill="none"/>
+          <circle cx="32" cy="32" r="8" fill="#6C5CE7"/>
+          <path d="M32 4 L32 24" stroke="#6C5CE7" stroke-width="2" stroke-linecap="round"/>
+          <path d="M32 40 L32 60" stroke="#6C5CE7" stroke-width="2" stroke-linecap="round"/>
+          <path d="M4 32 L24 32" stroke="#6C5CE7" stroke-width="2" stroke-linecap="round"/>
+          <path d="M40 32 L60 32" stroke="#6C5CE7" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+      </div>
+      <h2>SpaceRouter</h2>
+
+      <div id="status-card" class="status-card">
+        <div class="status-indicator">
+          <span id="status-dot" class="dot dot-stopped"></span>
+          <span id="status-text">Starting...</span>
+        </div>
+      </div>
+
+      <div class="wallet-display">
+        <span class="wallet-label">CTC Address</span>
+        <span id="wallet-address" class="wallet-value">-</span>
+      </div>
+
+      <div class="info-box">
+        <p>You earn <strong>Spacecoin</strong> to your CTC address while this node is running.</p>
+        <p>Stake your Spacecoin to earn yield. You must both <strong>stake</strong> AND <strong>run a SpaceRouter node</strong> to earn yield.</p>
+      </div>
+
+      <div id="error-banner" class="error-banner" style="display: none;">
+        <span id="error-text"></span>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
