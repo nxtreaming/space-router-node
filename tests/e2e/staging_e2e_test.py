@@ -27,6 +27,7 @@ Required environment variables:
 Not collected by pytest — run directly via ``python tests/e2e/staging_e2e_test.py``.
 """
 
+import http.client
 import json as _json
 import os
 import socket
@@ -194,41 +195,39 @@ def check_direct_connect_relay(cfg):
                     last_error = f"CONNECT returned: {status_line}"
                     continue
 
-                # Tunnel is open — send plain HTTP through it
+                # Tunnel is open — send plain HTTP through it.
+                # Don't send Connection: close so httpbin.org includes
+                # Content-Length, allowing http.client to read exactly the
+                # right number of bytes without waiting for connection close
+                # (the relay's idle timeout would delay EOF by up to 300s).
                 http_req = (
                     f"GET /ip HTTP/1.1\r\n"
                     f"Host: {target_host}\r\n"
-                    f"Connection: close\r\n"
                     f"\r\n"
                 ).encode()
                 sock.sendall(http_req)
 
-                # Read HTTP response from target
+                # Parse HTTP response with proper framing via http.client
                 sock.settimeout(30)
-                chunks = []
-                while True:
-                    chunk = sock.recv(4096)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                raw_resp = b"".join(chunks).decode(errors="replace")
+                resp = http.client.HTTPResponse(sock)
+                resp.begin()
+                resp_status = resp.status
+                body = resp.read().decode(errors="replace")
 
-                resp_status = raw_resp.split("\r\n", 1)[0]
-                log(f"Target response: {resp_status}")
+                log(f"Target response: HTTP/1.1 {resp_status}")
+                log(f"Body: {body[:200]}")
 
-                if "200" in resp_status:
-                    body = raw_resp.split("\r\n\r\n", 1)[-1] if "\r\n\r\n" in raw_resp else ""
-                    log(f"Body: {body[:200]}")
+                if resp_status == 200:
                     if cfg["node_ip"] in body:
                         pass_("Direct CONNECT relay succeeded (exit IP matches node)")
                     else:
                         pass_("Direct CONNECT relay succeeded")
                     return
-                elif "301" in resp_status or "302" in resp_status:
+                elif resp_status in (301, 302):
                     pass_("Direct CONNECT relay succeeded (target redirected)")
                     return
                 else:
-                    last_error = f"target returned: {resp_status}"
+                    last_error = f"target returned: HTTP/1.1 {resp_status}"
 
             finally:
                 sock.close()
