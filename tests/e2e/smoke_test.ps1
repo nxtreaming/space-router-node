@@ -8,6 +8,7 @@
 #   SR_NODE_PORT      - port for the node to bind (use a high port to avoid conflicts)
 #   SR_PUBLIC_IP      - public IP override
 #   SR_UPNP_ENABLED   - set to "false" for CI
+#   SR_WALLET_ADDRESS - EVM wallet address (e.g. 0x0000...0001 for CI)
 
 param(
     [Parameter(Mandatory = $true)]
