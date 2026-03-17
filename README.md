@@ -87,4 +87,4 @@ The Home Node communicates with two components:
 - Handles `GET http://...` for HTTP forwarding
 - Strips all `X-SpaceRouter-*` and `Proxy-Authorization` headers before forwarding to targets
 
-See [component-contracts.md](https://github.com/gluwa/space-router/blob/main/docs/component-contracts.md) for full specifications.
+See [component-contracts.md](https://github.com/space-labs/space-router-protocol/blob/main/component-contracts.md) for full specifications.
