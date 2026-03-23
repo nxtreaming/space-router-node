@@ -17,7 +17,7 @@ if os.path.exists(_build_version_path):
     _ns = {}
     with open(_build_version_path) as _f:
         exec(_f.read(), _ns)  # noqa: S102 — reads our own CI-generated file
-    _bundle_version = _ns.get("BUILD_VERSION", _bundle_version).lstrip("v")
+    _bundle_version = _ns.get("BUILD_VERSION", _bundle_version).lstrip("v").split("-")[0]
 
 hiddenimports = [
     # Conditionally imported at runtime

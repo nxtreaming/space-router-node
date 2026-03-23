@@ -102,18 +102,6 @@ jobs:
           SR_NODE_PORT: "19090"
           SR_WALLET_ADDRESS: "0x0000000000000000000000000000000000000001"
 
-      # Build macOS .pkg installer
-      - name: Build macOS package
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          PKG_VERSION="${VERSION#v}"
-          bash packaging/macos/build_pkg.sh \
-            --binary "dist/${{ matrix.artifact }}" \
-            --version "${PKG_VERSION}" \
-            --output "dist/${{ matrix.artifact }}.pkg"
-
       # Build Windows NSIS installer with WinSW service wrapper
       - name: Download WinSW
         if: runner.os == 'Windows'
@@ -242,6 +230,18 @@ jobs:
 
           # Staple the ticket
           xcrun stapler staple "dist/${{ matrix.artifact }}"
+
+      # Build .pkg from the signed+notarized binary so the payload passes Gatekeeper
+      - name: Build macOS package
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PKG_VERSION="${VERSION#v}"
+          bash packaging/macos/build_pkg.sh \
+            --binary "dist/${{ matrix.artifact }}" \
+            --version "${PKG_VERSION}" \
+            --output "dist/${{ matrix.artifact }}.pkg"
 
       - name: Sign macOS package
         if: runner.os == 'macOS' && env.APPLE_CERTIFICATE_P12 != ''
