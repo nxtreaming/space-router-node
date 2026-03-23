@@ -145,25 +145,24 @@ async def _run(settings_override=None, stop_event=None) -> None:  # noqa: ANN001
         if gateway_ca_cert:
             save_gateway_ca_cert(gateway_ca_cert, s.GATEWAY_CA_CERT_PATH)
 
-        # 6. Upgrade to mTLS if enabled (restart server with client-cert verification)
+        # 6. Upgrade to mTLS if enabled and CA cert is available
         if s.MTLS_ENABLED:
             if not os.path.isfile(s.GATEWAY_CA_CERT_PATH):
-                logger.error(
-                    "mTLS enabled but gateway CA cert not found at %s — aborting",
+                logger.warning(
+                    "mTLS enabled but gateway CA cert not found at %s "
+                    "— falling back to standard TLS (gateway may not have CA configured yet)",
                     s.GATEWAY_CA_CERT_PATH,
                 )
+            else:
+                logger.info("Upgrading to mTLS…")
                 server.close()
                 await server.wait_closed()
-                sys.exit(1)
-            logger.info("Upgrading to mTLS…")
-            server.close()
-            await server.wait_closed()
-            ssl_ctx = create_mtls_server_ssl_context(
-                s.TLS_CERT_PATH, s.TLS_KEY_PATH, s.GATEWAY_CA_CERT_PATH,
-            )
-            server = await asyncio.start_server(
-                handler, host=s.BIND_ADDRESS, port=s.NODE_PORT, ssl=ssl_ctx,
-            )
+                ssl_ctx = create_mtls_server_ssl_context(
+                    s.TLS_CERT_PATH, s.TLS_KEY_PATH, s.GATEWAY_CA_CERT_PATH,
+                )
+                server = await asyncio.start_server(
+                    handler, host=s.BIND_ADDRESS, port=s.NODE_PORT, ssl=ssl_ctx,
+                )
 
         logger.info(
             "Home Node ready (node_id=%s, wallet=%s, upnp=%s)",
