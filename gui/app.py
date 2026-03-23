@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import threading
+import time
 
 import webview
 
@@ -29,14 +30,87 @@ def _asset_path(filename: str) -> str:
     return os.path.join(base, filename)
 
 
+def _run_smoke_tests(window, api: Api) -> None:
+    """Run automated GUI checks then exit. Called from the 'shown' event."""
+    results: list[bool] = []
+
+    def check(name, fn):
+        try:
+            result = fn()
+            if result:
+                print(f"  [PASS]  {name}")
+                results.append(True)
+            else:
+                print(f"  [FAIL]  {name}: got {result!r}")
+                results.append(False)
+        except Exception as e:
+            print(f"  [FAIL]  {name}: {e}")
+            results.append(False)
+
+    # Give the webview a moment to fully render and for JS init() to run
+    time.sleep(3)
+
+    print("\n=== SpaceRouter GUI — Smoke Tests ===\n")
+
+    check(
+        "Document title is 'SpaceRouter'",
+        lambda: window.evaluate_js("document.title") == "SpaceRouter",
+    )
+
+    check(
+        "pywebview API bridge exists",
+        lambda: window.evaluate_js("typeof window.pywebview") == "object",
+    )
+
+    check(
+        "pywebview.api object exists",
+        lambda: window.evaluate_js("typeof window.pywebview.api") == "object",
+    )
+
+    check(
+        "get_status() returns dict with 'running' key",
+        lambda: "running" in (api.get_status() or {}),
+    )
+
+    check(
+        "Two screen elements in DOM",
+        lambda: window.evaluate_js("document.querySelectorAll('.screen').length") == 2,
+    )
+
+    check(
+        "Either onboarding or status screen is visible",
+        lambda: window.evaluate_js(
+            "document.getElementById('screen-onboarding').style.display === 'flex' || "
+            "document.getElementById('screen-status').style.display === 'flex'"
+        )
+        is True,
+    )
+
+    passed = sum(results)
+    failed = len(results) - passed
+    print(f"\n=== Results: {passed} passed, {failed} failed ===\n")
+
+    exit_code = 0 if failed == 0 else 1
+    window.destroy()
+    # Use os._exit to ensure immediate termination (webview.start blocks the main thread)
+    os._exit(exit_code)
+
+
 def main() -> None:
+    smoke_test = "--smoke-test" in sys.argv
+
     config = ConfigStore()
     node_manager = NodeManager()
     api = Api(config, node_manager)
-    tray = SpaceRouterTray()
 
     # Apply saved config to environment before anything imports app.config
     config.apply_to_env()
+
+    # Start health-check server in smoke-test mode so external scripts can poll
+    if smoke_test:
+        from gui.health import start_health_server
+
+        start_health_server(api)
 
     window = webview.create_window(
         title="SpaceRouter",
@@ -48,35 +122,44 @@ def main() -> None:
         resizable=True,
     )
 
-    # Hide window on close instead of quitting — node keeps running in background.
-    def on_closing() -> bool:
-        logger.info("Window closing — hiding to tray")
-        window.hide()
-        return False  # Cancel the close so the window stays alive
+    if smoke_test:
+        # In smoke-test mode: run checks after window is shown, then exit
+        def on_shown_smoke() -> None:
+            threading.Thread(
+                target=_run_smoke_tests, args=(window, api), daemon=True
+            ).start()
 
-    window.events.closing += on_closing
+        window.events.shown += on_shown_smoke
+    else:
+        # Normal mode: tray icon and hide-on-close behaviour
+        tray = SpaceRouterTray()
 
-    # Tray callbacks
-    def on_show() -> None:
-        window.show()
+        def on_closing() -> bool:
+            logger.info("Window closing — hiding to tray")
+            window.hide()
+            return False  # Cancel the close so the window stays alive
 
-    def on_quit() -> None:
-        logger.info("Quit requested — stopping node…")
-        # Stop node in a background thread to avoid blocking the main/AppKit thread
-        def _shutdown() -> None:
-            node_manager.stop(timeout=15.0)
-            tray.shutdown()
-            window.destroy()
+        window.events.closing += on_closing
 
-        threading.Thread(target=_shutdown, daemon=True).start()
+        def on_show() -> None:
+            window.show()
 
-    atexit.register(lambda: node_manager.stop(timeout=5.0))
+        def on_quit() -> None:
+            logger.info("Quit requested — stopping node…")
 
-    # Start tray icon once webview's AppKit run loop is active.
-    def on_shown() -> None:
-        tray.start(on_show=on_show, on_quit=on_quit, node_manager=node_manager)
+            def _shutdown() -> None:
+                node_manager.stop(timeout=15.0)
+                tray.shutdown()
+                window.destroy()
 
-    window.events.shown += on_shown
+            threading.Thread(target=_shutdown, daemon=True).start()
+
+        atexit.register(lambda: node_manager.stop(timeout=5.0))
+
+        def on_shown() -> None:
+            tray.start(on_show=on_show, on_quit=on_quit, node_manager=node_manager)
+
+        window.events.shown += on_shown
 
     webview.start(debug=os.environ.get("SR_GUI_DEBUG", "").lower() in ("1", "true"))
 

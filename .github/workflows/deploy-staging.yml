@@ -5,6 +5,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: staging-deploy
+  cancel-in-progress: false
+
 env:
   DROPLET_IP: "159.223.44.4"
   DROPLET_USER: "root"
