@@ -10,7 +10,7 @@ block_cipher = None
 # Read build version from app/_build_version.py (written by CI)
 _bundle_version = "0.1.0"
 _build_version_path = os.path.join(
-    os.path.dirname(os.path.abspath(SPECPATH if "SPECPATH" in dir() else ".")),
+    os.path.abspath(SPECPATH if "SPECPATH" in dir() else "."),
     "app", "_build_version.py",
 )
 if os.path.exists(_build_version_path):
