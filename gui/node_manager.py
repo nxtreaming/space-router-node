@@ -66,8 +66,16 @@ class NodeManager:
         if not self.is_running:
             return
 
-        if self._loop and self._stop_event:
-            self._loop.call_soon_threadsafe(self._stop_event.set)
+        # Capture local refs to avoid TOCTOU race with _run_loop's finally block,
+        # which can close/null the loop between our check and our use.
+        loop = self._loop
+        stop_event = self._stop_event
+        if loop and stop_event:
+            try:
+                loop.call_soon_threadsafe(stop_event.set)
+            except RuntimeError:
+                # Loop already closed — node is shutting down on its own
+                pass
 
         if self._thread:
             self._thread.join(timeout=timeout)

@@ -235,7 +235,15 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] in ("--version", "-V"):
         print(f"space-router-node {__version__}")
         sys.exit(0)
-    asyncio.run(_run())
+    try:
+        asyncio.run(_run())
+    finally:
+        # Restore default signal handlers on Windows to avoid calling
+        # loop.call_soon_threadsafe() on the now-closed event loop if a
+        # late signal arrives between asyncio.run() returning and process exit.
+        if sys.platform == "win32":
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
 
 if __name__ == "__main__":

@@ -64,7 +64,10 @@ def main() -> None:
         logger.info("Quit requested — stopping node…")
         # Stop node in a background thread to avoid blocking the main/AppKit thread
         def _shutdown() -> None:
-            node_manager.stop(timeout=15.0)
+            try:
+                node_manager.stop(timeout=15.0)
+            except Exception:
+                logger.exception("Error stopping node")
             tray.shutdown()
             window.destroy()
 
