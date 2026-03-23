@@ -1,10 +1,23 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller spec for SpaceRouter Desktop GUI."""
 
+import os
 import sys
 from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
+
+# Read build version from app/_build_version.py (written by CI)
+_bundle_version = "0.1.0"
+_build_version_path = os.path.join(
+    os.path.dirname(os.path.abspath(SPECPATH if "SPECPATH" in dir() else ".")),
+    "app", "_build_version.py",
+)
+if os.path.exists(_build_version_path):
+    _ns = {}
+    with open(_build_version_path) as _f:
+        exec(_f.read(), _ns)  # noqa: S102 — reads our own CI-generated file
+    _bundle_version = _ns.get("BUILD_VERSION", _bundle_version).lstrip("v")
 
 hiddenimports = [
     # Conditionally imported at runtime
@@ -104,10 +117,10 @@ if sys.platform == "darwin":
     app = BUNDLE(
         exe,
         name="SpaceRouter.app",
-        icon=None,  # TODO: add icon.icns when available
+        icon="packaging/macos/SpaceRouter.icns",
         bundle_identifier="com.spacerouter.desktop",
         info_plist={
-            "CFBundleShortVersionString": "0.1.0",
+            "CFBundleShortVersionString": _bundle_version,
             "CFBundleName": "SpaceRouter",
             "NSHighResolutionCapable": True,
         },

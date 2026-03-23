@@ -243,6 +243,39 @@ jobs:
           # Staple the ticket
           xcrun stapler staple "dist/${{ matrix.artifact }}"
 
+      - name: Sign macOS package
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE_P12 != ''
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: bash
+        run: |
+          PKG="dist/${{ matrix.artifact }}.pkg"
+          if [ -f "$PKG" ]; then
+            productsign --sign "Developer ID Installer: Gluwa ($APPLE_TEAM_ID)" \
+              "$PKG" "$PKG.signed"
+            mv "$PKG.signed" "$PKG"
+          fi
+
+      - name: Notarize macOS package
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE_P12 != ''
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: bash
+        run: |
+          PKG="dist/${{ matrix.artifact }}.pkg"
+          if [ -f "$PKG" ]; then
+            xcrun notarytool submit "$PKG" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_ID_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait
+            xcrun stapler staple "$PKG"
+          fi
+
       - name: Clean up macOS keychain
         if: always() && runner.os == 'macOS' && env.KEYCHAIN_PATH != ''
         shell: bash
@@ -348,29 +381,8 @@ jobs:
       - name: Build GUI app
         run: pyinstaller spacerouter_gui.spec
 
-      - name: Rename artifact (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          if [ -d "dist/SpaceRouter.app" ]; then
-            # macOS .app bundle — create a .dmg
-            hdiutil create -volname "SpaceRouter" \
-              -srcfolder "dist/SpaceRouter.app" \
-              -ov -format UDZO \
-              "dist/${{ matrix.artifact }}.dmg"
-          elif [ -f "dist/SpaceRouter" ]; then
-            mv "dist/SpaceRouter" "dist/${{ matrix.artifact }}"
-          fi
-
-      - name: Rename artifact (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          if (Test-Path "dist\SpaceRouter.exe") {
-            Move-Item "dist\SpaceRouter.exe" "dist\${{ matrix.artifact }}.exe"
-          }
-
       # ---- macOS code signing & notarization ----
+      # Sign the .app BEFORE creating the .dmg so the .dmg contains the signed app.
       - name: Import macOS signing certificate
         if: runner.os == 'macOS' && env.APPLE_CERTIFICATE_P12 != ''
         env:
@@ -403,7 +415,19 @@ jobs:
           codesign --force --deep --options runtime \
             --sign "Developer ID Application: Gluwa ($APPLE_TEAM_ID)" \
             --timestamp \
-            "dist/SpaceRouter.app" || true
+            "dist/SpaceRouter.app"
+
+      # Create .dmg from the (now signed) .app bundle
+      - name: Package macOS DMG
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          if [ -d "dist/SpaceRouter.app" ]; then
+            hdiutil create -volname "SpaceRouter" \
+              -srcfolder "dist/SpaceRouter.app" \
+              -ov -format UDZO \
+              "dist/${{ matrix.artifact }}.dmg"
+          fi
 
       - name: Notarize macOS DMG
         if: runner.os == 'macOS' && env.APPLE_CERTIFICATE_P12 != ''
@@ -420,14 +444,23 @@ jobs:
               --apple-id "$APPLE_ID" \
               --password "$APPLE_ID_PASSWORD" \
               --team-id "$APPLE_TEAM_ID" \
-              --wait || true
-            xcrun stapler staple "$DMG" || true
+              --wait
+            xcrun stapler staple "$DMG"
           fi
 
       - name: Clean up macOS keychain
         if: always() && runner.os == 'macOS' && env.KEYCHAIN_PATH != ''
         shell: bash
         run: security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+
+      # ---- Windows: rename and sign ----
+      - name: Rename artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (Test-Path "dist\SpaceRouter.exe") {
+            Move-Item "dist\SpaceRouter.exe" "dist\${{ matrix.artifact }}.exe"
+          }
 
       # ---- Windows code signing ----
       - name: Sign Windows binary
