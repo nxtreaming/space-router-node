@@ -367,7 +367,7 @@ def check_http_proxy_relay(cfg, node_id):
 # Test 6: Full Proxy Relay via SOCKS5 Gateway (non-critical)
 # ---------------------------------------------------------------------------
 
-def _socks5_over_tls_request(cfg, target_host, target_port):
+def _socks5_request(cfg, target_host, target_port):
     """Perform a SOCKS5 handshake over a plain TCP connection and send an HTTP request."""
     # 1. Connect to the SOCKS5 gateway (plain TCP — TLS removed per PR #112)
     sock = socket.create_connection(
@@ -425,18 +425,30 @@ def _socks5_over_tls_request(cfg, target_host, target_port):
         headers = data[:header_end].decode(errors="replace").lower()
         body_so_far = data[header_end:]
 
-        # Determine expected body length
-        content_length = 0
+        # Determine expected body length; fall back to a bounded recv if
+        # Content-Length is absent (e.g. chunked transfer-encoding).
+        content_length = None
         for line in headers.split("\r\n"):
             if line.startswith("content-length:"):
                 content_length = int(line.split(":", 1)[1].strip())
                 break
 
-        while len(body_so_far) < content_length:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            body_so_far += chunk
+        if content_length is not None:
+            while len(body_so_far) < content_length:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                body_so_far += chunk
+        else:
+            # No Content-Length — read until timeout or connection close
+            try:
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    body_so_far += chunk
+            except socket.timeout:
+                pass
 
         return data[:header_end].decode(errors="replace") + body_so_far.decode(errors="replace")
     finally:
@@ -450,7 +462,7 @@ def check_socks5_proxy_relay(cfg, node_id):
     last_error = None
     for attempt in range(1, PROXY_RETRIES + 1):
         try:
-            raw_resp = _socks5_over_tls_request(cfg, "httpbin.org", 80)
+            raw_resp = _socks5_request(cfg, "httpbin.org", 80)
             log(f"Attempt {attempt}: raw response (first 300 chars): {raw_resp[:300]}")
 
             # Parse status line

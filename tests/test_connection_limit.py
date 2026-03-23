@@ -76,7 +76,7 @@ class TestConnectionLimit:
             data = await asyncio.wait_for(reader.read(4096), timeout=5.0)
             # Should get a response (likely 502 since example.com isn't reachable,
             # but NOT 503)
-            assert b"503" not in data
+            assert not data.startswith(b"HTTP/1.1 503")
             writer.close()
             try:
                 await writer.wait_closed()
@@ -174,7 +174,7 @@ class TestConnectionLimit:
             w2.write(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
             await w2.drain()
             data = await asyncio.wait_for(r2.read(4096), timeout=5.0)
-            assert b"503" not in data
+            assert not data.startswith(b"HTTP/1.1 503")
             w2.close()
             try:
                 await w2.wait_closed()
