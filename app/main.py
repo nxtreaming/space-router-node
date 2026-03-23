@@ -155,14 +155,18 @@ async def _run(settings_override=None, stop_event=None) -> None:  # noqa: ANN001
                 )
             else:
                 logger.info("Upgrading to mTLS…")
-                server.close()
-                await server.wait_closed()
                 ssl_ctx = create_mtls_server_ssl_context(
                     s.TLS_CERT_PATH, s.TLS_KEY_PATH, s.GATEWAY_CA_CERT_PATH,
                 )
-                server = await asyncio.start_server(
+                # Start the mTLS server before closing the old one to avoid
+                # a window where the port is unbound (zero-downtime upgrade).
+                new_server = await asyncio.start_server(
                     handler, host=s.BIND_ADDRESS, port=s.NODE_PORT, ssl=ssl_ctx,
+                    reuse_port=True,
                 )
+                server.close()
+                await server.wait_closed()
+                server = new_server
 
         logger.info(
             "Home Node ready (node_id=%s, wallet=%s, upnp=%s)",
