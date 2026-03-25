@@ -141,7 +141,6 @@ class TestRegisterNode:
             node_id, gateway_ca_cert = await register_node(
                 client, reg_settings, "1.2.3.4",
                 identity_key=TEST_IDENTITY_KEY,
-                identity_key=TEST_IDENTITY_KEY,
                 wallet_address=TEST_WALLET,
             )
 
