@@ -78,6 +78,16 @@ class Api:
             return {"ok": False, "error": str(exc)}
         return {"ok": True, "url": url}
 
+    def retry_node(self) -> dict:
+        """Retry from ERROR_PERMANENT without clearing config."""
+        self._config.apply_to_env()
+        try:
+            self._node.retry()
+        except Exception as exc:
+            logger.exception("Failed to retry node")
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True}
+
     def get_status(self) -> dict:
         """Return current node status for the dashboard."""
         staking = self._config.get("SR_STAKING_ADDRESS")
@@ -85,13 +95,23 @@ class Api:
         wallet = self._config.get("SR_WALLET_ADDRESS")
         env = self._config.get_environment()
         api_url = self._config.get("SR_COORDINATION_API_URL")
+        ns = self._node.status
         return {
+            # New state machine fields
+            "state": ns.state.value,
+            "detail": ns.detail,
+            "error_code": ns.error_code,
+            "retry_count": ns.retry_count,
+            "next_retry_at": ns.next_retry_at,
+            "node_id": ns.node_id,
+            "cert_expiry_warning": ns.cert_expiry_warning,
+            # Backward-compatible fields
             "running": self._node.is_running,
             "phase": self._node.phase,
             "staking_address": staking or wallet,
             "collection_address": collection or staking or wallet,
-            "wallet": staking or wallet,  # backward compat
-            "error": self._node.last_error,
+            "wallet": staking or wallet,
+            "error": ns.error_message,
             "environment": env,
             "api_url": api_url,
         }

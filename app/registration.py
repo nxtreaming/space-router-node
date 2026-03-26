@@ -196,6 +196,34 @@ async def request_probe(
         logger.warning("Failed to request probe for node %s: %s", node_id, exc)
 
 
+async def check_node_status(
+    http_client: httpx.AsyncClient,
+    settings: Settings,
+    node_id: str,
+    *,
+    identity_key: str,
+) -> str:
+    """Check if the node is still registered and online.
+
+    Returns the status string ('online', 'offline', etc.) or raises on error.
+    """
+    signature, timestamp = sign_request(identity_key, "check_status", node_id)
+
+    url = f"{settings.COORDINATION_API_URL}/nodes/{node_id}/status"
+    resp = await http_client.get(
+        url,
+        params={
+            "wallet_address": _effective_wallet(settings),
+            "signature": signature,
+            "timestamp": timestamp,
+        },
+        timeout=10.0,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("status", "unknown")
+
+
 async def deregister_node(
     http_client: httpx.AsyncClient,
     settings: Settings,

@@ -81,6 +81,7 @@
           <span id="status-dot" class="dot dot-stopped"></span>
           <span id="status-text">Starting...</span>
         </div>
+        <div id="status-detail" class="status-detail"></div>
         <div id="env-badge" class="env-badge"></div>
       </div>
 
@@ -99,11 +100,19 @@
         <p>Stake your Spacecoin to earn yield. You must both <strong>stake</strong> AND <strong>run a SpaceRouter node</strong> to earn yield.</p>
       </div>
 
+      <div id="cert-warning" class="cert-warning" style="display: none;">
+        TLS certificate expires soon. It will be auto-renewed.
+      </div>
+
       <div id="error-banner" class="error-banner" style="display: none;">
         <span id="error-text"></span>
       </div>
 
-      <button id="btn-fresh-restart" class="btn-danger">Fresh Restart</button>
+      <div id="action-buttons" class="action-buttons">
+        <button id="btn-retry" class="btn-primary" style="display: none;">Retry</button>
+        <button id="btn-stop" class="btn-secondary" style="display: none;">Stop</button>
+        <button id="btn-fresh-restart" class="btn-danger">Fresh Restart</button>
+      </div>
     </div>
   </div>
 

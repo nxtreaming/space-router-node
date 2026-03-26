@@ -260,11 +260,15 @@ async function updateStatus() {
 
     const dot = $("#status-dot");
     const text = $("#status-text");
+    const detail = $("#status-detail");
     const stakingEl = $("#staking-address");
     const collectionEl = $("#collection-address");
     const envBadge = $("#env-badge");
     const errorBanner = $("#error-banner");
     const errorText = $("#error-text");
+    const certWarning = $("#cert-warning");
+    const btnRetry = $("#btn-retry");
+    const btnStop = $("#btn-stop");
 
     // Wallet addresses
     stakingEl.textContent = status.staking_address || status.wallet || "-";
@@ -278,31 +282,90 @@ async function updateStatus() {
       envBadge.style.display = "none";
     }
 
-    // Status indicator — use phase for granular state
-    const phase = status.phase || "stopped";
-    if (phase === "running") {
-      dot.className = "dot dot-running";
-      text.textContent = "SpaceRouter is running";
-    } else if (phase === "registering") {
-      dot.className = "dot dot-starting";
-      text.textContent = "Registering with network...";
-    } else if (phase === "starting") {
-      dot.className = "dot dot-starting";
-      text.textContent = "Starting...";
-    } else if (status.error) {
-      dot.className = "dot dot-stopped";
-      text.textContent = "SpaceRouter is stopped";
-    } else {
-      dot.className = "dot dot-stopped";
-      text.textContent = "Stopped";
+    // State-based display
+    const state = status.state || "idle";
+
+    switch (state) {
+      case "idle":
+        dot.className = "dot dot-idle";
+        text.textContent = "Node is stopped";
+        detail.textContent = "";
+        break;
+      case "initializing":
+        dot.className = "dot dot-starting";
+        text.textContent = "Initializing...";
+        detail.textContent = status.detail || "Loading certificates";
+        break;
+      case "binding":
+        dot.className = "dot dot-starting";
+        text.textContent = "Starting server...";
+        detail.textContent = status.detail || "";
+        break;
+      case "registering":
+        dot.className = "dot dot-starting";
+        text.textContent = "Registering...";
+        detail.textContent = status.detail || "";
+        break;
+      case "running":
+        dot.className = "dot dot-running";
+        text.textContent = "SpaceRouter is running";
+        detail.textContent = status.detail || "";
+        break;
+      case "reconnecting":
+        dot.className = "dot dot-reconnecting";
+        text.textContent = "Reconnecting...";
+        detail.textContent = status.detail || "";
+        break;
+      case "error_transient":
+        dot.className = "dot dot-reconnecting";
+        text.textContent = "Retrying...";
+        // Show countdown if next_retry_at is set
+        if (status.next_retry_at) {
+          const secsLeft = Math.max(0, Math.ceil(status.next_retry_at - Date.now() / 1000));
+          detail.textContent = secsLeft > 0
+            ? status.detail + " (" + secsLeft + "s)"
+            : status.detail;
+        } else {
+          detail.textContent = status.detail || "";
+        }
+        break;
+      case "error_permanent":
+        dot.className = "dot dot-stopped";
+        text.textContent = "Error";
+        detail.textContent = "";
+        break;
+      case "stopping":
+        dot.className = "dot dot-starting";
+        text.textContent = "Shutting down...";
+        detail.textContent = "";
+        break;
+      default:
+        dot.className = "dot dot-stopped";
+        text.textContent = "Stopped";
+        detail.textContent = "";
     }
 
     // Error display
-    if (status.error) {
+    if (status.error && state !== "error_transient") {
       errorText.textContent = status.error;
       errorBanner.style.display = "block";
     } else {
       errorBanner.style.display = "none";
+    }
+
+    // Cert expiry warning
+    certWarning.style.display = status.cert_expiry_warning ? "block" : "none";
+
+    // Action buttons
+    if (state === "error_permanent") {
+      btnRetry.style.display = "block";
+      btnStop.style.display = "none";
+    } else if (state === "idle") {
+      btnRetry.style.display = "none";
+      btnStop.style.display = "none";
+    } else {
+      btnRetry.style.display = "none";
+      btnStop.style.display = "block";
     }
   } catch (e) {
     // Backend not ready yet — ignore
@@ -381,6 +444,32 @@ async function loadSavedAddresses() {
     }
     validateInputs();
   } catch (e) {}
+}
+
+// ── Action Buttons (Retry / Stop) ──
+
+function initActionButtons() {
+  $("#btn-retry").addEventListener("click", async function () {
+    const btn = $("#btn-retry");
+    btn.disabled = true;
+    btn.textContent = "Retrying...";
+    try {
+      await window.pywebview.api.retry_node();
+    } catch (e) {}
+    btn.disabled = false;
+    btn.textContent = "Retry";
+  });
+
+  $("#btn-stop").addEventListener("click", async function () {
+    const btn = $("#btn-stop");
+    btn.disabled = true;
+    btn.textContent = "Stopping...";
+    try {
+      await window.pywebview.api.stop_node();
+    } catch (e) {}
+    btn.disabled = false;
+    btn.textContent = "Stop";
+  });
 }
 
 // ── Settings Panel (test builds only) ──
@@ -544,8 +633,9 @@ async function init() {
     // Variant setup is non-blocking
     initTestVariant();
 
-    // Fresh restart is always available
+    // Action buttons
     initFreshRestart();
+    initActionButtons();
 
     if (needsOnboarding) {
       // First time: show network setup, then onboarding
