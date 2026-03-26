@@ -14,9 +14,31 @@ from app.wallet import validate_wallet_address
 # Default Coordination API for production
 _DEFAULT_COORDINATION_API_URL = "https://spacerouter-coordination-api.fly.dev"
 
+# Pre-configured environments for easy switching
+ENVIRONMENTS = {
+    "production": {
+        "label": "Production",
+        "url": "https://spacerouter-coordination-api.fly.dev",
+    },
+    "test": {
+        "label": "Test (CC Testnet)",
+        "url": "https://spacerouter-coordination-api-test.fly.dev",
+    },
+    "staging": {
+        "label": "Staging",
+        "url": "https://spacerouter-coordination-api-staging.fly.dev",
+    },
+    "local": {
+        "label": "Local",
+        "url": "http://localhost:8000",
+    },
+}
+
 _DEFAULTS = {
     "SR_COORDINATION_API_URL": _DEFAULT_COORDINATION_API_URL,
     "SR_WALLET_ADDRESS": "",
+    "SR_STAKING_ADDRESS": "",
+    "SR_COLLECTION_ADDRESS": "",
     "SR_NODE_PORT": "9090",
     "SR_UPNP_ENABLED": "true",
     "SR_LOG_LEVEL": "INFO",
@@ -69,10 +91,49 @@ class ConfigStore:
         set_key(str(self._path), "SR_WALLET_ADDRESS", normalised)
         return normalised
 
+    def save_wallets(self, staking_address: str, collection_address: str = "") -> tuple[str, str]:
+        """Validate and persist staking and collection addresses.
+
+        Returns ``(normalised_staking, normalised_collection)``.
+        """
+        normalised_staking = validate_wallet_address(staking_address)
+        set_key(str(self._path), "SR_STAKING_ADDRESS", normalised_staking)
+
+        if collection_address.strip():
+            normalised_collection = validate_wallet_address(collection_address)
+        else:
+            normalised_collection = normalised_staking
+        set_key(str(self._path), "SR_COLLECTION_ADDRESS", normalised_collection)
+
+        # Also set WALLET_ADDRESS for backward compat
+        set_key(str(self._path), "SR_WALLET_ADDRESS", normalised_staking)
+
+        return normalised_staking, normalised_collection
+
+    def save_environment(self, env_key: str) -> str:
+        """Switch the coordination API URL to the given environment.
+
+        Returns the URL that was set.
+        """
+        env = ENVIRONMENTS.get(env_key)
+        if not env:
+            raise ValueError(f"Unknown environment: {env_key}")
+        set_key(str(self._path), "SR_COORDINATION_API_URL", env["url"])
+        return env["url"]
+
+    def get_environment(self) -> str:
+        """Return the current environment key based on the coordination URL."""
+        url = self.get("SR_COORDINATION_API_URL")
+        for key, env in ENVIRONMENTS.items():
+            if env["url"] == url:
+                return key
+        return "custom"
+
     def needs_onboarding(self) -> bool:
-        """True if no wallet address has been configured yet."""
-        addr = self.get("SR_WALLET_ADDRESS")
-        return not addr
+        """True if no wallet/staking address has been configured yet."""
+        staking = self.get("SR_STAKING_ADDRESS")
+        wallet = self.get("SR_WALLET_ADDRESS")
+        return not staking and not wallet
 
     def apply_to_env(self) -> None:
         """Load all config values into os.environ so pydantic-settings picks them up."""
@@ -80,14 +141,15 @@ class ConfigStore:
             if value and key not in os.environ:
                 os.environ[key] = value
 
-        # Point TLS cert paths to the writable config directory.  The default
-        # relative paths ("certs/...") resolve inside the PyInstaller temp dir
-        # which is read-only.
+        # Point TLS cert and identity key paths to the writable config directory.
+        # The default relative paths ("certs/...") resolve inside the PyInstaller
+        # temp dir which is read-only.
         certs_dir = self._dir / "certs"
         for key, filename in (
             ("SR_TLS_CERT_PATH", "node.crt"),
             ("SR_TLS_KEY_PATH", "node.key"),
             ("SR_GATEWAY_CA_CERT_PATH", "gateway-ca.crt"),
+            ("SR_IDENTITY_KEY_PATH", "node-identity.key"),
         ):
             if key not in os.environ:
                 os.environ[key] = str(certs_dir / filename)

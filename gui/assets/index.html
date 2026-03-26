@@ -22,16 +22,26 @@
       </div>
       <h1>Welcome to SpaceRouter</h1>
       <p class="description">
-        Enter your CTC address to get started. You'll earn <strong>Spacecoin</strong> to this address.
+        Enter your CTC address to get started. You'll earn <strong>Spacecoin</strong> for running a node.
       </p>
       <p class="description">
-        You can also stake your Spacecoin and earn yield &mdash; to earn yield, you must both
-        <strong>stake</strong> AND <strong>run a SpaceRouter node</strong>.
+        To earn yield, you must both <strong>stake</strong> AND <strong>run a SpaceRouter node</strong>.
       </p>
+
       <div class="input-group">
-        <label for="wallet-input">CTC Address</label>
-        <input type="text" id="wallet-input" placeholder="0x..." spellcheck="false" autocomplete="off">
-        <span id="wallet-error" class="error"></span>
+        <label for="env-select">Environment</label>
+        <select id="env-select"></select>
+      </div>
+
+      <div class="input-group">
+        <label for="staking-input">Staking Address</label>
+        <input type="text" id="staking-input" placeholder="0x..." spellcheck="false" autocomplete="off">
+        <span id="staking-error" class="error"></span>
+      </div>
+      <div class="input-group">
+        <label for="collection-input">Collection Address <span class="optional">(optional &mdash; defaults to staking address)</span></label>
+        <input type="text" id="collection-input" placeholder="0x..." spellcheck="false" autocomplete="off">
+        <span id="collection-error" class="error"></span>
       </div>
       <button id="btn-start" class="btn-primary" disabled>Start SpaceRouter</button>
     </div>
@@ -57,15 +67,21 @@
           <span id="status-dot" class="dot dot-stopped"></span>
           <span id="status-text">Starting...</span>
         </div>
+        <div id="env-badge" class="env-badge"></div>
       </div>
 
       <div class="wallet-display">
-        <span class="wallet-label">CTC Address</span>
-        <span id="wallet-address" class="wallet-value">-</span>
+        <span class="wallet-label">Staking Address</span>
+        <span id="staking-address" class="wallet-value">-</span>
+      </div>
+
+      <div class="wallet-display">
+        <span class="wallet-label">Collection Address</span>
+        <span id="collection-address" class="wallet-value">-</span>
       </div>
 
       <div class="info-box">
-        <p>You earn <strong>Spacecoin</strong> to your CTC address while this node is running.</p>
+        <p>You earn <strong>Spacecoin</strong> while this node is running.</p>
         <p>Stake your Spacecoin to earn yield. You must both <strong>stake</strong> AND <strong>run a SpaceRouter node</strong> to earn yield.</p>
       </div>
 

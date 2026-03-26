@@ -18,10 +18,10 @@ class Api:
     def needs_onboarding(self) -> bool:
         return self._config.needs_onboarding()
 
-    def save_wallet_and_start(self, address: str) -> dict:
-        """Validate wallet, persist it, and start the node."""
+    def save_wallet_and_start(self, address: str, collection_address: str = "") -> dict:
+        """Validate wallet(s), persist, and start the node."""
         try:
-            normalised = self._config.save_wallet(address)
+            staking, collection = self._config.save_wallets(address, collection_address)
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -34,7 +34,7 @@ class Api:
             logger.exception("Failed to start node")
             return {"ok": False, "error": f"Failed to start node: {exc}"}
 
-        return {"ok": True, "wallet": normalised}
+        return {"ok": True, "staking_address": staking, "collection_address": collection}
 
     def start_node(self) -> dict:
         """Start the node (config must already be set)."""
@@ -60,11 +60,37 @@ class Api:
             return {"ok": False, "error": str(exc)}
         return {"ok": True}
 
+    def get_environments(self) -> list:
+        """Return available environment presets."""
+        from gui.config_store import ENVIRONMENTS
+        current = self._config.get_environment()
+        return [
+            {"key": k, "label": v["label"], "url": v["url"], "active": k == current}
+            for k, v in ENVIRONMENTS.items()
+        ]
+
+    def set_environment(self, env_key: str) -> dict:
+        """Switch environment. Requires node restart to take effect."""
+        try:
+            url = self._config.save_environment(env_key)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "url": url}
+
     def get_status(self) -> dict:
         """Return current node status for the dashboard."""
+        staking = self._config.get("SR_STAKING_ADDRESS")
+        collection = self._config.get("SR_COLLECTION_ADDRESS")
         wallet = self._config.get("SR_WALLET_ADDRESS")
+        env = self._config.get_environment()
+        api_url = self._config.get("SR_COORDINATION_API_URL")
         return {
             "running": self._node.is_running,
-            "wallet": wallet,
+            "phase": self._node.phase,
+            "staking_address": staking or wallet,
+            "collection_address": collection or staking or wallet,
+            "wallet": staking or wallet,  # backward compat
             "error": self._node.last_error,
+            "environment": env,
+            "api_url": api_url,
         }

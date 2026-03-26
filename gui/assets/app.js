@@ -27,51 +27,115 @@ function truncateAddress(addr) {
   return addr.slice(0, 6) + "..." + addr.slice(-4);
 }
 
+// ── Environment Selector ──
+
+async function populateEnvSelector() {
+  const select = $("#env-select");
+  try {
+    const envs = await window.pywebview.api.get_environments();
+    select.innerHTML = "";
+    for (const env of envs) {
+      const opt = document.createElement("option");
+      opt.value = env.key;
+      opt.textContent = env.label;
+      if (env.active) opt.selected = true;
+      select.appendChild(opt);
+    }
+    select.addEventListener("change", async function () {
+      await window.pywebview.api.set_environment(select.value);
+    });
+  } catch (e) {
+    // Fallback if API not ready
+  }
+}
+
+function envLabel(envKey) {
+  const labels = {
+    production: "Production",
+    test: "Test (CC Testnet)",
+    staging: "Staging",
+    local: "Local",
+  };
+  return labels[envKey] || envKey;
+}
+
 // ── Onboarding Screen ──
 
-function initOnboarding() {
-  const input = $("#wallet-input");
-  const error = $("#wallet-error");
+function validateInputs() {
+  const stakingInput = $("#staking-input");
+  const stakingError = $("#staking-error");
+  const collectionInput = $("#collection-input");
+  const collectionError = $("#collection-error");
   const btn = $("#btn-start");
 
-  input.addEventListener("input", function () {
-    const val = input.value.trim();
-    if (!val) {
-      error.textContent = "";
-      input.classList.remove("invalid");
-      btn.disabled = true;
-      return;
-    }
-    if (!EVM_RE.test(val)) {
-      error.textContent = "Invalid address — expected 0x followed by 40 hex characters";
-      input.classList.add("invalid");
-      btn.disabled = true;
-    } else {
-      error.textContent = "";
-      input.classList.remove("invalid");
-      btn.disabled = false;
-    }
-  });
+  const stakingVal = stakingInput.value.trim();
+  const collectionVal = collectionInput.value.trim();
+
+  let stakingValid = false;
+  let collectionValid = true; // optional — valid when empty
+
+  // Validate staking (required)
+  if (!stakingVal) {
+    stakingError.textContent = "";
+    stakingInput.classList.remove("invalid");
+  } else if (!EVM_RE.test(stakingVal)) {
+    stakingError.textContent = "Invalid address — expected 0x followed by 40 hex characters";
+    stakingInput.classList.add("invalid");
+  } else {
+    stakingError.textContent = "";
+    stakingInput.classList.remove("invalid");
+    stakingValid = true;
+  }
+
+  // Validate collection (optional)
+  if (!collectionVal) {
+    collectionError.textContent = "";
+    collectionInput.classList.remove("invalid");
+  } else if (!EVM_RE.test(collectionVal)) {
+    collectionError.textContent = "Invalid address — expected 0x followed by 40 hex characters";
+    collectionInput.classList.add("invalid");
+    collectionValid = false;
+  } else {
+    collectionError.textContent = "";
+    collectionInput.classList.remove("invalid");
+  }
+
+  btn.disabled = !(stakingValid && collectionValid);
+}
+
+function initOnboarding() {
+  const stakingInput = $("#staking-input");
+  const collectionInput = $("#collection-input");
+  const stakingError = $("#staking-error");
+  const btn = $("#btn-start");
+
+  populateEnvSelector();
+
+  stakingInput.addEventListener("input", validateInputs);
+  collectionInput.addEventListener("input", validateInputs);
 
   btn.addEventListener("click", async function () {
-    const addr = input.value.trim();
-    if (!EVM_RE.test(addr)) return;
+    const stakingAddr = stakingInput.value.trim();
+    const collectionAddr = collectionInput.value.trim();
+    if (!EVM_RE.test(stakingAddr)) return;
 
     btn.disabled = true;
     btn.textContent = "Starting...";
 
     try {
-      const result = await window.pywebview.api.save_wallet_and_start(addr);
+      const result = await window.pywebview.api.save_wallet_and_start(
+        stakingAddr, collectionAddr
+      );
       if (result.ok) {
         hide("screen-onboarding");
         showStatus();
       } else {
-        error.textContent = result.error || "Unknown error";
+        stakingError.textContent = result.error || "Unknown error";
         btn.disabled = false;
         btn.textContent = "Start SpaceRouter";
       }
     } catch (e) {
-      error.textContent = "Failed to connect to backend";
+      stakingError.textContent = "Failed to connect to backend";
       btn.disabled = false;
       btn.textContent = "Start SpaceRouter";
     }
@@ -94,23 +158,41 @@ async function updateStatus() {
 
     const dot = $("#status-dot");
     const text = $("#status-text");
-    const walletEl = $("#wallet-address");
+    const stakingEl = $("#staking-address");
+    const collectionEl = $("#collection-address");
+    const envBadge = $("#env-badge");
     const errorBanner = $("#error-banner");
     const errorText = $("#error-text");
 
-    // Wallet address
-    walletEl.textContent = status.wallet || "-";
+    // Wallet addresses
+    stakingEl.textContent = status.staking_address || status.wallet || "-";
+    collectionEl.textContent = status.collection_address || "-";
 
-    // Status indicator
-    if (status.running) {
+    // Environment badge
+    if (status.environment && status.environment !== "production") {
+      envBadge.textContent = envLabel(status.environment);
+      envBadge.style.display = "block";
+    } else {
+      envBadge.style.display = "none";
+    }
+
+    // Status indicator — use phase for granular state
+    const phase = status.phase || "stopped";
+    if (phase === "running") {
       dot.className = "dot dot-running";
       text.textContent = "SpaceRouter is running";
+    } else if (phase === "registering") {
+      dot.className = "dot dot-starting";
+      text.textContent = "Registering with network...";
+    } else if (phase === "starting") {
+      dot.className = "dot dot-starting";
+      text.textContent = "Starting...";
     } else if (status.error) {
       dot.className = "dot dot-stopped";
       text.textContent = "SpaceRouter is stopped";
     } else {
-      dot.className = "dot dot-starting";
-      text.textContent = "Starting...";
+      dot.className = "dot dot-stopped";
+      text.textContent = "Stopped";
     }
 
     // Error display
