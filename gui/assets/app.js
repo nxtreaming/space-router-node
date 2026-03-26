@@ -339,9 +339,8 @@ function updateTestBannerLabel(url) {
 
 // ── Initialisation ──
 
-async function init() {
+async function initTestVariant() {
   try {
-    // Check build variant
     const variant = await window.pywebview.api.get_build_variant();
     isTestBuild = variant === "test";
 
@@ -363,8 +362,17 @@ async function init() {
       // Init settings panel
       initSettings();
     }
+  } catch (e) {
+    // Variant check failed — continue as production
+  }
+}
 
+async function init() {
+  try {
     const needsOnboarding = await window.pywebview.api.needs_onboarding();
+
+    // Variant setup is non-blocking — don't let it prevent screens from showing
+    initTestVariant();
 
     if (needsOnboarding) {
       show("screen-onboarding");
