@@ -73,8 +73,8 @@ def _run_smoke_tests(window, api: Api) -> None:
     )
 
     check(
-        "Two screen elements in DOM",
-        lambda: window.evaluate_js("document.querySelectorAll('.screen').length") == 2,
+        "Screen elements in DOM (2 production, 3 test)",
+        lambda: window.evaluate_js("document.querySelectorAll('.screen').length") >= 2,
     )
 
     check(
