@@ -457,6 +457,43 @@ class TestRegisterNodeV2:
 
     @pytest.mark.asyncio
     @respx.mock
+    async def test_v2_register_normalizes_checksummed_addresses(self):
+        """EIP-55 checksummed (mixed-case) addresses must be lowercased."""
+        checksummed_staking = "0xAbCdEf1111111111111111111111111111111111"
+        checksummed_collection = "0x2222222222222222222222222222222222AbCdEf"
+        settings = Settings(
+            NODE_PORT=9090,
+            COORDINATION_API_URL="http://coordination:8000",
+            NODE_LABEL="test-node",
+            PUBLIC_IP="",
+            WALLET_ADDRESS=TEST_WALLET,
+            REGISTRATION_MODE="v2",
+            STAKING_ADDRESS=checksummed_staking,
+            COLLECTION_ADDRESS=checksummed_collection,
+        )
+        _mock_request_probe()
+        respx.post("http://coordination:8000/nodes/register").mock(
+            return_value=Response(200, json=_v2_register_response(
+                staking_address=checksummed_staking.lower(),
+                collection_address=checksummed_collection.lower(),
+            ))
+        )
+
+        import httpx
+        async with httpx.AsyncClient() as client:
+            await register_node(
+                client, settings, "1.2.3.4",
+                identity_key=TEST_IDENTITY_KEY,
+                node_address=TEST_NODE_ADDRESS,
+                wallet_address=TEST_WALLET,
+            )
+
+        body = json.loads(respx.calls[0].request.content)
+        assert body["staking_address"] == checksummed_staking.lower()
+        assert body["collection_address"] == checksummed_collection.lower()
+
+    @pytest.mark.asyncio
+    @respx.mock
     async def test_v2_register_vouching_signature_valid(self, v2_multi_wallet_settings):
         """Vouching signature must recover to the identity address."""
         _mock_request_probe()

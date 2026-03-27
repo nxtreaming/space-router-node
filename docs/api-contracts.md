@@ -26,7 +26,9 @@ X-SpaceRouter-Address: 0x{wallet_address}\r\n
 \r\n
 ```
 
-The server verifies that `X-SpaceRouter-Address` matches the registered `wallet_address`.
+The server verifies that `X-SpaceRouter-Address` matches the registered address:
+- **v0.1.2:** matches `wallet_address`
+- **v0.2.0:** matches `identity_address`
 
 ---
 
@@ -189,7 +191,7 @@ Both signatures are signed by the identity wallet's private key.
 **Server-side verification:**
 1. Recover signer from `identity_signature` — must match `identity_address`
 2. Recover signer from `vouching_signature` — must match `identity_address`
-3. Probe `endpoint_url` via CONNECT — verify `X-SpaceRouter-Address`
+3. Probe `endpoint_url` via CONNECT — verify `X-SpaceRouter-Address` matches `identity_address`
 4. Check on-chain stake for `staking_address`
 5. Classify IP via IPinfo
 

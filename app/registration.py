@@ -142,8 +142,8 @@ async def _register_v2(
         endpoint_url = f"https://{public_ip}:{settings.NODE_PORT}"
 
     # Resolve staking/collection addresses (wallet collapsing)
-    staking_address = settings.STAKING_ADDRESS or wallet_address
-    collection_address = settings.COLLECTION_ADDRESS or wallet_address
+    staking_address = (settings.STAKING_ADDRESS or wallet_address).lower()
+    collection_address = (settings.COLLECTION_ADDRESS or wallet_address).lower()
 
     # Sign: space-router:register:{identity_address}:{timestamp}
     identity_signature, timestamp = sign_request(
