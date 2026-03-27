@@ -24,7 +24,7 @@ def settings(tmp_path):
         COORDINATION_API_URL="http://localhost:8000",
         NODE_LABEL="test-node",
         PUBLIC_IP="127.0.0.1",
-        WALLET_ADDRESS=TEST_WALLET_ADDRESS,
+        STAKING_ADDRESS=TEST_WALLET_ADDRESS,
         BUFFER_SIZE=65536,
         REQUEST_TIMEOUT=5.0,
         RELAY_TIMEOUT=10.0,

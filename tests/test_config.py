@@ -6,6 +6,34 @@ import warnings
 import pytest
 
 
+class TestWalletAddressBackwardCompat:
+    """SR_WALLET_ADDRESS (v0.1.2) must be accepted as an alias for SR_STAKING_ADDRESS."""
+
+    def test_sr_wallet_address_env_var_maps_to_staking_address(self):
+        """Existing deployments that set SR_WALLET_ADDRESS must keep working."""
+        from app.config import Settings
+
+        os.environ["SR_WALLET_ADDRESS"] = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        try:
+            s = Settings()
+            assert s.STAKING_ADDRESS == "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        finally:
+            del os.environ["SR_WALLET_ADDRESS"]
+
+    def test_sr_staking_address_takes_precedence_over_wallet_address(self):
+        """If both are set, SR_STAKING_ADDRESS wins."""
+        from app.config import Settings
+
+        os.environ["SR_WALLET_ADDRESS"] = "0x" + "aa" * 20
+        os.environ["SR_STAKING_ADDRESS"] = "0x" + "bb" * 20
+        try:
+            s = Settings()
+            assert s.STAKING_ADDRESS == "0x" + "bb" * 20
+        finally:
+            del os.environ["SR_WALLET_ADDRESS"]
+            del os.environ["SR_STAKING_ADDRESS"]
+
+
 class TestConfigDefaults:
     def test_default_port(self):
         from app.config import Settings

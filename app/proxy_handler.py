@@ -366,7 +366,7 @@ async def _handle_challenge_probe(
 
     response = (
         f"HTTP/1.1 200 Connection Established\r\n"
-        f"X-SpaceRouter-Address: {settings.WALLET_ADDRESS}\r\n"
+        f"X-SpaceRouter-Address: {settings.STAKING_ADDRESS}\r\n"
         f"{extra}"
         f"Content-Length: 0\r\n"
         f"Connection: close\r\n"

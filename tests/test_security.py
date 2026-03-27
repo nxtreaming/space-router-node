@@ -378,7 +378,7 @@ class TestEndpointChallengeProbe:
             else:
                 pytest.fail("X-SpaceRouter-Address header not found")
 
-            assert address == settings.WALLET_ADDRESS
+            assert address == settings.STAKING_ADDRESS
 
             writer.close()
             await writer.wait_closed()

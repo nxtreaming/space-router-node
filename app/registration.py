@@ -142,7 +142,7 @@ async def _register_v2(
         endpoint_url = f"https://{public_ip}:{settings.NODE_PORT}"
 
     # Resolve staking/collection addresses (wallet collapsing)
-    staking_address = (settings.STAKING_ADDRESS or wallet_address).lower()
+    staking_address = wallet_address.lower()
     collection_address = (settings.COLLECTION_ADDRESS or wallet_address).lower()
 
     # Sign: space-router:register:{identity_address}:{timestamp}
@@ -286,7 +286,7 @@ async def request_probe(
     url = f"{settings.COORDINATION_API_URL}/nodes/{node_id}/request-probe"
     try:
         resp = await http_client.post(url, json={
-            "wallet_address": settings.WALLET_ADDRESS.lower(),
+            "wallet_address": settings.STAKING_ADDRESS.lower(),
             "signature": signature,
             "timestamp": timestamp,
         }, timeout=10.0)
@@ -314,7 +314,7 @@ async def deregister_node(
     try:
         resp = await http_client.patch(url, json={
             "status": "offline",
-            "wallet_address": settings.WALLET_ADDRESS.lower(),
+            "wallet_address": settings.STAKING_ADDRESS.lower(),
             "signature": signature,
             "timestamp": timestamp,
         }, timeout=10.0)

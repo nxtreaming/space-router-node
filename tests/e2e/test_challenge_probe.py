@@ -52,12 +52,12 @@ async def run_e2e() -> bool:
     ensure_certificates(settings.TLS_CERT_PATH, settings.TLS_KEY_PATH)
     ssl_ctx = create_server_ssl_context(settings.TLS_CERT_PATH, settings.TLS_KEY_PATH)
 
-    if not settings.WALLET_ADDRESS:
-        logger.error("SR_WALLET_ADDRESS is required")
+    if not settings.STAKING_ADDRESS:
+        logger.error("SR_STAKING_ADDRESS is required")
         return False
-    settings.WALLET_ADDRESS = validate_wallet_address(settings.WALLET_ADDRESS)
-    wallet_address = settings.WALLET_ADDRESS
-    logger.info("Wallet address: %s", wallet_address)
+    settings.STAKING_ADDRESS = validate_wallet_address(settings.STAKING_ADDRESS)
+    wallet_address = settings.STAKING_ADDRESS
+    logger.info("Staking address: %s", wallet_address)
 
     # 2. Start the proxy server
     handler = functools.partial(handle_client, settings=settings)

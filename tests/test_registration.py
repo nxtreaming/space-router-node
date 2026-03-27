@@ -41,7 +41,7 @@ def reg_settings():
         COORDINATION_API_URL="http://coordination:8000",
         NODE_LABEL="test-node",
         PUBLIC_IP="",
-        WALLET_ADDRESS=TEST_WALLET,
+        STAKING_ADDRESS=TEST_WALLET,
         REGISTRATION_MODE="v1",
     )
 
@@ -54,7 +54,7 @@ def v2_settings():
         COORDINATION_API_URL="http://coordination:8000",
         NODE_LABEL="test-node",
         PUBLIC_IP="",
-        WALLET_ADDRESS=TEST_WALLET,
+        STAKING_ADDRESS=TEST_WALLET,
         REGISTRATION_MODE="v2",
     )
 
@@ -67,7 +67,6 @@ def v2_multi_wallet_settings():
         COORDINATION_API_URL="http://coordination:8000",
         NODE_LABEL="test-node",
         PUBLIC_IP="",
-        WALLET_ADDRESS=TEST_WALLET,
         STAKING_ADDRESS=TEST_STAKING_ADDRESS,
         COLLECTION_ADDRESS=TEST_COLLECTION_ADDRESS,
         REGISTRATION_MODE="v2",
@@ -82,7 +81,7 @@ def auto_settings():
         COORDINATION_API_URL="http://coordination:8000",
         NODE_LABEL="test-node",
         PUBLIC_IP="",
-        WALLET_ADDRESS=TEST_WALLET,
+        STAKING_ADDRESS=TEST_WALLET,
         REGISTRATION_MODE="auto",
     )
 
@@ -410,7 +409,7 @@ class TestRegisterNodeV2:
     @pytest.mark.asyncio
     @respx.mock
     async def test_v2_register_wallet_collapsing(self, v2_settings):
-        """When STAKING/COLLECTION_ADDRESS empty, all default to WALLET_ADDRESS."""
+        """When COLLECTION_ADDRESS empty, it defaults to wallet_address (staking address)."""
         _mock_request_probe()
         respx.post("http://coordination:8000/nodes/register").mock(
             return_value=Response(200, json=_v2_register_response())
@@ -426,7 +425,7 @@ class TestRegisterNodeV2:
             )
 
         body = json.loads(respx.calls[0].request.content)
-        # With empty STAKING_ADDRESS/COLLECTION_ADDRESS, both fall back to WALLET_ADDRESS
+        # With empty COLLECTION_ADDRESS, it falls back to wallet_address (= staking address)
         assert body["staking_address"] == TEST_WALLET
         assert body["collection_address"] == TEST_WALLET
 
@@ -448,7 +447,7 @@ class TestRegisterNodeV2:
                 client, v2_multi_wallet_settings, "1.2.3.4",
                 identity_key=TEST_IDENTITY_KEY,
                 node_address=TEST_NODE_ADDRESS,
-                wallet_address=TEST_WALLET,
+                wallet_address=TEST_STAKING_ADDRESS,
             )
 
         body = json.loads(respx.calls[0].request.content)
@@ -466,10 +465,9 @@ class TestRegisterNodeV2:
             COORDINATION_API_URL="http://coordination:8000",
             NODE_LABEL="test-node",
             PUBLIC_IP="",
-            WALLET_ADDRESS=TEST_WALLET,
-            REGISTRATION_MODE="v2",
             STAKING_ADDRESS=checksummed_staking,
             COLLECTION_ADDRESS=checksummed_collection,
+            REGISTRATION_MODE="v2",
         )
         _mock_request_probe()
         respx.post("http://coordination:8000/nodes/register").mock(
@@ -485,7 +483,7 @@ class TestRegisterNodeV2:
                 client, settings, "1.2.3.4",
                 identity_key=TEST_IDENTITY_KEY,
                 node_address=TEST_NODE_ADDRESS,
-                wallet_address=TEST_WALLET,
+                wallet_address=checksummed_staking,
             )
 
         body = json.loads(respx.calls[0].request.content)
@@ -507,7 +505,7 @@ class TestRegisterNodeV2:
                 client, v2_multi_wallet_settings, "1.2.3.4",
                 identity_key=TEST_IDENTITY_KEY,
                 node_address=TEST_NODE_ADDRESS,
-                wallet_address=TEST_WALLET,
+                wallet_address=TEST_STAKING_ADDRESS,
             )
 
         body = json.loads(respx.calls[0].request.content)
@@ -685,7 +683,6 @@ class TestV1PayloadIsolation:
             NODE_PORT=9090,
             COORDINATION_API_URL="http://coordination:8000",
             NODE_LABEL="test-node",
-            WALLET_ADDRESS=TEST_WALLET,
             STAKING_ADDRESS=TEST_STAKING_ADDRESS,
             COLLECTION_ADDRESS=TEST_COLLECTION_ADDRESS,
             REGISTRATION_MODE="v1",
@@ -1049,21 +1046,20 @@ class TestActiveModeTracking:
 
 class TestRegistrationModeConfig:
     def test_default_mode_is_v1(self):
-        s = Settings(WALLET_ADDRESS=TEST_WALLET)
+        s = Settings(STAKING_ADDRESS=TEST_WALLET)
         assert s.REGISTRATION_MODE == "v1"
 
     def test_valid_modes_accepted(self):
         for mode in ("v1", "v2", "auto"):
-            s = Settings(WALLET_ADDRESS=TEST_WALLET, REGISTRATION_MODE=mode)
+            s = Settings(STAKING_ADDRESS=TEST_WALLET, REGISTRATION_MODE=mode)
             assert s.REGISTRATION_MODE == mode
 
     def test_invalid_mode_rejected(self):
         with pytest.raises(Exception):
-            Settings(WALLET_ADDRESS=TEST_WALLET, REGISTRATION_MODE="v3")
+            Settings(STAKING_ADDRESS=TEST_WALLET, REGISTRATION_MODE="v3")
 
-    def test_default_staking_and_collection_empty(self):
-        s = Settings(WALLET_ADDRESS=TEST_WALLET)
-        assert s.STAKING_ADDRESS == ""
+    def test_default_collection_empty(self):
+        s = Settings(STAKING_ADDRESS=TEST_WALLET)
         assert s.COLLECTION_ADDRESS == ""
 
 
@@ -1105,7 +1101,7 @@ class TestV2EdgeCases:
             NODE_PORT=9090,
             COORDINATION_API_URL="http://coordination:8000",
             NODE_LABEL="",
-            WALLET_ADDRESS=TEST_WALLET,
+            STAKING_ADDRESS=TEST_WALLET,
             REGISTRATION_MODE="v2",
         )
         _mock_request_probe()
@@ -1133,7 +1129,7 @@ class TestV2EdgeCases:
             NODE_PORT=9090,
             COORDINATION_API_URL="http://coordination:8000",
             NODE_LABEL="",
-            WALLET_ADDRESS=TEST_WALLET,
+            STAKING_ADDRESS=TEST_WALLET,
             REGISTRATION_MODE="v1",
         )
         _mock_request_probe()

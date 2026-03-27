@@ -22,18 +22,55 @@
       </div>
       <h1>Welcome to SpaceRouter</h1>
       <p class="description">
-        Enter your CTC address to get started. You'll earn <strong>Spacecoin</strong> to this address.
+        Run a node and earn <strong>Spacecoin</strong>. A signing identity key will be
+        created for this node automatically.
       </p>
-      <p class="description">
-        You can also stake your Spacecoin and earn yield &mdash; to earn yield, you must both
-        <strong>stake</strong> AND <strong>run a SpaceRouter node</strong>.
-      </p>
+
+      <!-- Identity Key -->
       <div class="input-group">
-        <label for="wallet-input">CTC Address</label>
-        <input type="text" id="wallet-input" placeholder="0x..." spellcheck="false" autocomplete="off">
-        <span id="wallet-error" class="error"></span>
+        <label>Identity Key</label>
+        <div class="radio-group">
+          <label class="radio-option">
+            <input type="radio" name="key-mode" id="radio-generate" value="generate" checked>
+            <span>Generate new key <span class="badge">Recommended</span></span>
+          </label>
+          <label class="radio-option">
+            <input type="radio" name="key-mode" id="radio-import" value="import">
+            <span>Import existing key</span>
+          </label>
+        </div>
+        <div id="import-key-section" style="display: none; margin-top: 10px;">
+          <input type="password" id="identity-key-input" placeholder="0x… (64 hex chars)" spellcheck="false" autocomplete="off">
+          <span id="identity-key-error" class="error"></span>
+        </div>
       </div>
-      <button id="btn-start" class="btn-primary" disabled>Start SpaceRouter</button>
+
+      <!-- Advanced Settings (collapsible) -->
+      <div class="advanced-toggle" id="advanced-toggle">
+        <span id="advanced-arrow">▸</span>
+        <span>Advanced Settings</span>
+      </div>
+      <div class="advanced-section" id="advanced-section" style="display: none;">
+        <div class="input-group" style="margin-top: 0;">
+          <label for="passphrase-input">Identity Passphrase</label>
+          <input type="password" id="passphrase-input" placeholder="Optional — encrypts the identity key" autocomplete="new-password">
+          <span class="help-text">If set, the identity key is stored encrypted on disk.</span>
+        </div>
+        <div class="input-group">
+          <label for="staking-input">Staking Address</label>
+          <input type="text" id="staking-input" placeholder="0x… defaults to identity address" spellcheck="false" autocomplete="off">
+          <span id="staking-error" class="error"></span>
+          <span class="help-text">The wallet that earns staking rewards. Leave blank to use the identity address.</span>
+        </div>
+        <div class="input-group">
+          <label for="collection-input">Collection Address</label>
+          <input type="text" id="collection-input" placeholder="0x… defaults to staking address" spellcheck="false" autocomplete="off">
+          <span id="collection-error" class="error"></span>
+          <span class="help-text">Where traffic fees accumulate. Leave blank to use the staking address.</span>
+        </div>
+      </div>
+
+      <button id="btn-start" class="btn-primary">Start SpaceRouter</button>
     </div>
   </div>
 
@@ -59,19 +96,33 @@
         </div>
       </div>
 
-      <div class="wallet-display">
-        <span class="wallet-label">CTC Address</span>
-        <span id="wallet-address" class="wallet-value">-</span>
+      <div class="wallet-display" id="staking-display" style="display: none;">
+        <span class="wallet-label">Staking Address</span>
+        <span id="staking-address" class="wallet-value">-</span>
       </div>
 
       <div class="info-box">
-        <p>You earn <strong>Spacecoin</strong> to your CTC address while this node is running.</p>
+        <p>You earn <strong>Spacecoin</strong> while this node is running.</p>
         <p>Stake your Spacecoin to earn yield. You must both <strong>stake</strong> AND <strong>run a SpaceRouter node</strong> to earn yield.</p>
       </div>
 
       <div id="error-banner" class="error-banner" style="display: none;">
         <span id="error-text"></span>
       </div>
+    </div>
+  </div>
+
+  <!-- Passphrase Unlock Dialog -->
+  <div id="dialog-overlay" class="dialog-overlay" style="display: none;">
+    <div class="dialog">
+      <h3>Identity Key Locked</h3>
+      <p class="dialog-desc">Your identity key is encrypted. Enter the passphrase to unlock it.</p>
+      <div class="input-group" style="margin-top: 16px;">
+        <label for="unlock-passphrase">Passphrase</label>
+        <input type="password" id="unlock-passphrase" placeholder="Enter passphrase" autocomplete="current-password">
+        <span id="unlock-error" class="error"></span>
+      </div>
+      <button id="btn-unlock" class="btn-primary" style="margin-top: 8px;">Unlock</button>
     </div>
   </div>
 

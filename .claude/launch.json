@@ -14,6 +14,12 @@
       "port": 9090
     },
     {
+      "name": "GUI Preview",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "8765", "--directory", "gui/assets"],
+      "port": 8765
+    },
+    {
       "name": "Tests",
       "runtimeExecutable": "python3",
       "runtimeArgs": ["-m", "pytest", "tests/", "-v", "--ignore=tests/e2e"],
