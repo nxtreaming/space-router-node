@@ -1,8 +1,15 @@
 """Node registration with the Coordination API.
 
+Supports two protocol versions selected via ``SR_REGISTRATION_MODE``:
+
+- **v1** (v0.1.2): Single ``wallet_address`` + ``identity_signature``.
+- **v2** (v0.2.0): Multi-wallet model with ``identity_address``,
+  ``staking_address``, ``collection_address``, and ``vouching_signature``.
+- **auto**: Try v2 first; fall back to v1 on HTTP 400/422.
+
 Lifecycle:
   1. detect_public_ip()   — determine the machine's public IP
-  2. register_node()      — POST /nodes/register with identity signature
+  2. register_node()      — dispatch to v1 or v2 registration
   3. request_probe()      — POST /nodes/{id}/request-probe (signed)
   4. deregister_node()    — PATCH /nodes/{id}/status → offline (signed)
 
@@ -15,7 +22,7 @@ import os
 import httpx
 
 from app.config import Settings
-from app.identity import sign_request
+from app.identity import sign_request, sign_vouch
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +32,10 @@ _IP_SERVICES = [
     ("https://api.ipify.org?format=json", "ip"),
     ("https://ifconfig.me/ip", None),  # plain-text response
 ]
+
+# Tracks which registration mode actually succeeded so deregistration
+# can match the protocol.  Set by register_node() after success.
+_active_mode: str | None = None
 
 
 async def detect_public_ip(http_client: httpx.AsyncClient) -> str:
@@ -50,7 +61,11 @@ async def detect_public_ip(http_client: httpx.AsyncClient) -> str:
     raise RuntimeError("Failed to detect public IP from all services")
 
 
-async def register_node(
+# ---------------------------------------------------------------------------
+# v0.1.2 registration (legacy)
+# ---------------------------------------------------------------------------
+
+async def _register_v1(
     http_client: httpx.AsyncClient,
     settings: Settings,
     public_ip: str,
@@ -59,15 +74,7 @@ async def register_node(
     wallet_address: str,
     upnp_endpoint: tuple | None = None,
 ) -> tuple[str, str | None]:
-    """Register this node with the Coordination API.
-
-    Uses the unified ``POST /nodes/register`` endpoint with an identity
-    signature.  The server recovers the node identity address from the
-    signature.
-
-    Returns ``(node_id, gateway_ca_cert_pem_or_None)``.
-    Raises on failure — the caller should abort startup.
-    """
+    """v0.1.2 registration: ``wallet_address`` + ``identity_signature``."""
     if upnp_endpoint:
         upnp_ip, upnp_port = upnp_endpoint
         endpoint_url = f"https://{upnp_ip}:{upnp_port}"
@@ -88,7 +95,7 @@ async def register_node(
 
     url = f"{settings.COORDINATION_API_URL}/nodes/register"
     logger.info(
-        "Registering node at %s → endpoint=%s wallet=%s",
+        "Registering node (v1) at %s → endpoint=%s wallet=%s",
         url, endpoint_url, wallet_address,
     )
 
@@ -102,7 +109,7 @@ async def register_node(
     reg_status = data.get("status", "registered")
 
     logger.info(
-        "Registered as node %s (status=%s, identity=%s, wallet=%s, mtls_ca=%s)",
+        "Registered as node %s (v1, status=%s, identity=%s, wallet=%s, mtls_ca=%s)",
         node_id, reg_status, node_address, wallet_address,
         "provided" if gateway_ca_cert else "not provided",
     )
@@ -111,6 +118,150 @@ async def register_node(
     await request_probe(http_client, settings, node_id, identity_key=identity_key)
 
     return node_id, gateway_ca_cert
+
+
+# ---------------------------------------------------------------------------
+# v0.2.0 registration (multi-wallet)
+# ---------------------------------------------------------------------------
+
+async def _register_v2(
+    http_client: httpx.AsyncClient,
+    settings: Settings,
+    public_ip: str,
+    *,
+    identity_key: str,
+    node_address: str,
+    wallet_address: str,
+    upnp_endpoint: tuple | None = None,
+) -> tuple[str, str | None]:
+    """v0.2.0 registration: multi-wallet with vouching signature."""
+    if upnp_endpoint:
+        upnp_ip, upnp_port = upnp_endpoint
+        endpoint_url = f"https://{upnp_ip}:{upnp_port}"
+    else:
+        endpoint_url = f"https://{public_ip}:{settings.NODE_PORT}"
+
+    # Resolve staking/collection addresses (wallet collapsing)
+    staking_address = settings.STAKING_ADDRESS or wallet_address
+    collection_address = settings.COLLECTION_ADDRESS or wallet_address
+
+    # Sign: space-router:register:{identity_address}:{timestamp}
+    identity_signature, timestamp = sign_request(
+        identity_key, "register", node_address,
+    )
+
+    # Vouch: space-router:vouch:{staking_address}:{collection_address}
+    vouching_sig = sign_vouch(identity_key, staking_address, collection_address)
+
+    payload = {
+        "identity_address": node_address,
+        "staking_address": staking_address,
+        "collection_address": collection_address,
+        "vouching_signature": vouching_sig,
+        "identity_signature": identity_signature,
+        "endpoint_url": endpoint_url,
+        "timestamp": timestamp,
+    }
+    if settings.NODE_LABEL:
+        payload["label"] = settings.NODE_LABEL
+
+    url = f"{settings.COORDINATION_API_URL}/nodes/register"
+    logger.info(
+        "Registering node (v2) at %s → endpoint=%s identity=%s staking=%s collection=%s",
+        url, endpoint_url, node_address, staking_address, collection_address,
+    )
+
+    resp = await http_client.post(url, json=payload, timeout=15.0)
+    resp.raise_for_status()
+    data = resp.json()
+
+    node_id = data["node_id"]
+    gateway_ca_cert = data.get("gateway_ca_cert")
+    reg_status = data.get("status", "registered")
+
+    logger.info(
+        "Registered as node %s (v2, status=%s, identity=%s, staking=%s, mtls_ca=%s)",
+        node_id, reg_status, node_address, staking_address,
+        "provided" if gateway_ca_cert else "not provided",
+    )
+
+    # Request a health probe so the Coordination API can verify us
+    await request_probe(http_client, settings, node_id, identity_key=identity_key)
+
+    return node_id, gateway_ca_cert
+
+
+# ---------------------------------------------------------------------------
+# Public dispatcher
+# ---------------------------------------------------------------------------
+
+async def register_node(
+    http_client: httpx.AsyncClient,
+    settings: Settings,
+    public_ip: str,
+    *,
+    identity_key: str,
+    node_address: str,
+    wallet_address: str,
+    upnp_endpoint: tuple | None = None,
+) -> tuple[str, str | None]:
+    """Register this node with the Coordination API.
+
+    Dispatches to v1 or v2 based on ``settings.REGISTRATION_MODE``.
+    Returns ``(node_id, gateway_ca_cert_pem_or_None)``.
+    Raises on failure — the caller should abort startup.
+    """
+    global _active_mode  # noqa: PLW0603
+    mode = settings.REGISTRATION_MODE
+
+    if mode == "v1":
+        result = await _register_v1(
+            http_client, settings, public_ip,
+            identity_key=identity_key,
+            wallet_address=wallet_address,
+            upnp_endpoint=upnp_endpoint,
+        )
+        _active_mode = "v1"
+        return result
+
+    if mode == "v2":
+        result = await _register_v2(
+            http_client, settings, public_ip,
+            identity_key=identity_key,
+            node_address=node_address,
+            wallet_address=wallet_address,
+            upnp_endpoint=upnp_endpoint,
+        )
+        _active_mode = "v2"
+        return result
+
+    # auto: try v2 first, fall back to v1 on 400/422
+    assert mode == "auto"
+    try:
+        result = await _register_v2(
+            http_client, settings, public_ip,
+            identity_key=identity_key,
+            node_address=node_address,
+            wallet_address=wallet_address,
+            upnp_endpoint=upnp_endpoint,
+        )
+        _active_mode = "v2"
+        return result
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in (400, 422):
+            logger.info(
+                "v0.2.0 registration rejected (%s), falling back to v0.1.2",
+                exc.response.status_code,
+            )
+            result = await _register_v1(
+                http_client, settings, public_ip,
+                identity_key=identity_key,
+                wallet_address=wallet_address,
+                upnp_endpoint=upnp_endpoint,
+            )
+            _active_mode = "v1"
+            return result
+        raise
 
 
 def save_gateway_ca_cert(pem_data: str, path: str) -> None:

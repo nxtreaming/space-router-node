@@ -132,6 +132,7 @@ async def _run(settings_override=None, stop_event=None) -> None:  # noqa: ANN001
                 node_id, gateway_ca_cert = await register_node(
                     http_client, s, public_ip,
                     identity_key=identity_key,
+                    node_address=node_address,
                     upnp_endpoint=upnp_endpoint,
                     wallet_address=wallet_address,
                 )

@@ -1,6 +1,7 @@
 import logging
 import warnings
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,11 @@ class Settings(BaseSettings):
     PUBLIC_IP: str = ""  # Auto-detected if empty
     WALLET_ADDRESS: str = ""  # Required — user-provided EVM address
 
+    # v0.2.0 multi-wallet support
+    STAKING_ADDRESS: str = ""       # If empty, falls back to WALLET_ADDRESS
+    COLLECTION_ADDRESS: str = ""    # If empty, falls back to WALLET_ADDRESS
+    REGISTRATION_MODE: str = "v1"   # "v1" (v0.1.2) | "v2" (v0.2.0) | "auto"
+
     # UPnP / NAT-PMP automatic port forwarding
     UPNP_ENABLED: bool = True
     UPNP_LEASE_DURATION: int = 3600  # seconds; 0 = permanent
@@ -43,6 +49,14 @@ class Settings(BaseSettings):
     # mTLS — Gateway authentication (requires gateway_ca_cert from registration)
     MTLS_ENABLED: bool = True
     GATEWAY_CA_CERT_PATH: str = "certs/gateway-ca.crt"
+
+    @field_validator("REGISTRATION_MODE")
+    @classmethod
+    def _validate_registration_mode(cls, v: str) -> str:
+        allowed = ("v1", "v2", "auto")
+        if v not in allowed:
+            raise ValueError(f"REGISTRATION_MODE must be one of {allowed}, got {v!r}")
+        return v
 
 
 settings = Settings()

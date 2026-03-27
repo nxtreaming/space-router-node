@@ -20,6 +20,7 @@ _DEFAULTS = {
     "SR_NODE_PORT": "9090",
     "SR_UPNP_ENABLED": "true",
     "SR_LOG_LEVEL": "INFO",
+    "SR_REGISTRATION_MODE": "v1",
 }
 
 
