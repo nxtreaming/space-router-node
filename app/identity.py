@@ -52,8 +52,8 @@ def sign_request(private_key: str, action: str, target: str) -> tuple[str, int]:
 
     Creates an EIP-191 signature of ``space-router:{action}:{target}:{timestamp}``.
 
-    *target* is the ``node_id`` for most actions, or ``wallet_address`` for
-    registration.
+    *target* is the ``node_id`` for most actions, or ``wallet_address`` /
+    ``identity_address`` for registration.
 
     Returns ``(signature_hex, timestamp)``.
     """
@@ -62,3 +62,22 @@ def sign_request(private_key: str, action: str, target: str) -> tuple[str, int]:
     message = encode_defunct(text=message_text)
     signed = _w3.eth.account.sign_message(message, private_key=private_key)
     return signed.signature.hex(), timestamp
+
+
+def sign_vouch(
+    private_key: str, staking_address: str, collection_address: str,
+) -> str:
+    """Sign a vouching message binding the identity to staking + collection wallets.
+
+    Creates an EIP-191 signature of
+    ``space-router:vouch:{staking_address}:{collection_address}``.
+
+    No timestamp — vouching is a one-time binding that persists across
+    registrations until the wallet configuration changes.
+
+    Returns ``signature_hex``.
+    """
+    message_text = f"space-router:vouch:{staking_address}:{collection_address}"
+    message = encode_defunct(text=message_text)
+    signed = _w3.eth.account.sign_message(message, private_key=private_key)
+    return signed.signature.hex()

@@ -47,8 +47,29 @@ def _run_smoke_tests(window, api: Api) -> None:
             print(f"  [FAIL]  {name}: {e}")
             results.append(False)
 
-    # Give the webview a moment to fully render and for JS init() to run
-    time.sleep(3)
+    # Wait for the pywebview JS bridge to be injected (pywebviewready event).
+    # On slow CI runners (especially Windows WebView2) this can take >3 s, so
+    # poll rather than using a fixed sleep.  Give up after 30 s.
+    print("  [INFO]  Waiting for pywebview bridge (up to 30 s)...")
+    deadline = time.time() + 30
+    bridge_ready = False
+    while time.time() < deadline:
+        try:
+            if window.evaluate_js("typeof window.pywebview") == "object":
+                bridge_ready = True
+                break
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    if not bridge_ready:
+        print("  [FAIL]  pywebview bridge did not become available within 30 s")
+        print("\n=== Results: 0 passed, 1 failed ===\n")
+        window.destroy()
+        os._exit(1)
+
+    # Give JS init() a moment to complete the first API round-trip and show a screen
+    time.sleep(0.5)
 
     print("\n=== SpaceRouter GUI — Smoke Tests ===\n")
 
