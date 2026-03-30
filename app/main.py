@@ -72,66 +72,81 @@ def _first_run_setup() -> bool:
     """Interactive first-time setup wizard.
 
     Creates the identity key file and writes settings to .env.
+    Skips identity key steps when the key already exists (e.g. after --reset --keep-identity).
     Returns True on success, False if user cancels (Ctrl+C).
     """
     s = load_settings()
+    key_exists = os.path.isfile(s.IDENTITY_KEY_PATH)
+    step = 1
+
     print()
     print("─" * 53)
-    print("  SpaceRouter Node — First-Time Setup")
+    print("  SpaceRouter Node — Setup")
     print("─" * 53)
 
     try:
-        # --- Step 1: Identity Key ---
-        print()
-        print("1. Identity Key")
-        generate = _prompt("   Generate a new identity key? [Y/n]", default="Y").lower()
-
-        if generate in ("y", "yes", ""):
-            # Auto-generate — key is created by load_or_create_identity during node start.
-            # We create it now so we can show the address.
-            identity_key_hex = None
-            print("   (Identity key will be generated on first start)")
-            identity_address = None
-        else:
-            while True:
-                raw = getpass.getpass("   Enter identity private key (hex): ").strip()
-                try:
-                    from eth_account import Account
-                    account = Account.from_key(raw)
-                    identity_key_hex = account.key.hex()
-                    identity_address = account.address.lower()
-                    print(f"   ✓ Identity address: {account.address}")
-                    break
-                except Exception:
-                    print("   Invalid private key — expected 32-byte hex (with or without 0x prefix).")
-
-        # --- Step 2: Identity Passphrase ---
-        print()
-        print("2. Identity Passphrase (optional)")
-        encrypt = _prompt("   Encrypt the identity key with a passphrase? [y/N]", default="N").lower()
-
+        identity_address = None
         passphrase = ""
-        if encrypt in ("y", "yes"):
-            while True:
-                p1 = getpass.getpass("   Enter passphrase: ")
-                p2 = getpass.getpass("   Confirm passphrase: ")
-                if p1 == p2:
-                    passphrase = p1
-                    break
-                print("   Passphrases do not match — try again.")
 
-        # Write the identity key file now (so we can show the address for steps 3+)
-        key_path = s.IDENTITY_KEY_PATH
-        if identity_key_hex is not None:
-            identity_address = write_identity_key(key_path, identity_key_hex, passphrase)
+        if key_exists:
+            # Identity key already exists — load it and skip key/passphrase steps
+            try:
+                _, identity_address = load_or_create_identity(s.IDENTITY_KEY_PATH)
+                print(f"\n   Identity key found: {identity_address}")
+            except KeystorePassphraseRequired:
+                passphrase = getpass.getpass("\n   Identity key is encrypted. Passphrase: ")
+                _, identity_address = load_or_create_identity(s.IDENTITY_KEY_PATH, passphrase)
+                print(f"   ✓ Unlocked identity: {identity_address}")
         else:
-            # Auto-generate now so we can show the address
-            _, identity_address = load_or_create_identity(key_path, passphrase)
-            print(f"   ✓ Generated identity address: {identity_address}")
+            # --- Step 1: Identity Key ---
+            print()
+            print(f"{step}. Identity Key")
+            step += 1
+            generate = _prompt("   Generate a new identity key? [Y/n]", default="Y").lower()
 
-        # --- Step 3: Staking Address ---
+            identity_key_hex = None
+            if generate in ("y", "yes", ""):
+                print("   (Identity key will be generated on first start)")
+            else:
+                while True:
+                    raw = getpass.getpass("   Enter identity private key (hex): ").strip()
+                    try:
+                        from eth_account import Account
+                        account = Account.from_key(raw)
+                        identity_key_hex = account.key.hex()
+                        identity_address = account.address.lower()
+                        print(f"   ✓ Identity address: {account.address}")
+                        break
+                    except Exception:
+                        print("   Invalid private key — expected 32-byte hex (with or without 0x prefix).")
+
+            # --- Step 2: Identity Passphrase ---
+            print()
+            print(f"{step}. Identity Passphrase (optional)")
+            step += 1
+            encrypt = _prompt("   Encrypt the identity key with a passphrase? [y/N]", default="N").lower()
+
+            if encrypt in ("y", "yes"):
+                while True:
+                    p1 = getpass.getpass("   Enter passphrase: ")
+                    p2 = getpass.getpass("   Confirm passphrase: ")
+                    if p1 == p2:
+                        passphrase = p1
+                        break
+                    print("   Passphrases do not match — try again.")
+
+            # Write the identity key file now (so we can show the address for steps 3+)
+            key_path = s.IDENTITY_KEY_PATH
+            if identity_key_hex is not None:
+                identity_address = write_identity_key(key_path, identity_key_hex, passphrase)
+            else:
+                _, identity_address = load_or_create_identity(key_path, passphrase)
+                print(f"   ✓ Generated identity address: {identity_address}")
+
+        # --- Staking Address ---
         print()
-        print("3. Staking Address (optional)")
+        print(f"{step}. Staking Address (optional)")
+        step += 1
         print(f"   Leave blank to use identity address ({identity_address})")
         while True:
             raw = _prompt("   Enter staking wallet address", default="")
@@ -146,9 +161,10 @@ def _first_run_setup() -> bool:
 
         effective_staking = staking_address or identity_address
 
-        # --- Step 4: Collection Address ---
+        # --- Collection Address ---
         print()
-        print("4. Collection Address (optional)")
+        print(f"{step}. Collection Address (optional)")
+        step += 1
         print(f"   Leave blank to use staking address ({effective_staking})")
         while True:
             raw = _prompt("   Enter collection wallet address", default="")
@@ -709,10 +725,17 @@ def main() -> None:
             print(f"Error reading password file: {exc}", file=sys.stderr)
             sys.exit(1)
 
-    # First-run wizard: trigger when identity key file doesn't exist yet,
-    # but only in interactive (TTY) sessions — skip silently in CI/piped mode.
+    # Setup wizard: trigger when identity key is missing, when --setup is
+    # passed explicitly, or when config looks unconfigured (no staking address
+    # and default coordination URL). Only in interactive TTY.
     s = load_settings()
-    if not os.path.isfile(s.IDENTITY_KEY_PATH) and sys.stdin.isatty():
+    explicit_setup = "--setup" in sys.argv
+    needs_setup = (
+        explicit_setup
+        or not os.path.isfile(s.IDENTITY_KEY_PATH)
+        or (not s.STAKING_ADDRESS and s.COORDINATION_API_URL == "http://localhost:8000")
+    )
+    if needs_setup and sys.stdin.isatty():
         if not _first_run_setup():
             sys.exit(0)
         # Reload settings so _run() picks up values written to .env
