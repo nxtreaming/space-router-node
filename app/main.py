@@ -91,7 +91,7 @@ def _first_run_setup() -> bool:
             # We create it now so we can show the address.
             identity_key_hex = None
             print("   (Identity key will be generated on first start)")
-            node_address = None
+            identity_address = None
         else:
             while True:
                 raw = getpass.getpass("   Enter identity private key (hex): ").strip()
@@ -99,7 +99,7 @@ def _first_run_setup() -> bool:
                     from eth_account import Account
                     account = Account.from_key(raw)
                     identity_key_hex = account.key.hex()
-                    node_address = account.address.lower()
+                    identity_address = account.address.lower()
                     print(f"   ✓ Identity address: {account.address}")
                     break
                 except Exception:
@@ -123,16 +123,16 @@ def _first_run_setup() -> bool:
         # Write the identity key file now (so we can show the address for steps 3+)
         key_path = s.IDENTITY_KEY_PATH
         if identity_key_hex is not None:
-            node_address = write_identity_key(key_path, identity_key_hex, passphrase)
+            identity_address = write_identity_key(key_path, identity_key_hex, passphrase)
         else:
             # Auto-generate now so we can show the address
-            _, node_address = load_or_create_identity(key_path, passphrase)
-            print(f"   ✓ Generated identity address: {node_address}")
+            _, identity_address = load_or_create_identity(key_path, passphrase)
+            print(f"   ✓ Generated identity address: {identity_address}")
 
         # --- Step 3: Staking Address ---
         print()
         print("3. Staking Address (optional)")
-        print(f"   Leave blank to use identity address ({node_address})")
+        print(f"   Leave blank to use identity address ({identity_address})")
         while True:
             raw = _prompt("   Enter staking wallet address", default="")
             if not raw:
@@ -144,7 +144,7 @@ def _first_run_setup() -> bool:
             except ValueError as exc:
                 print(f"   Invalid address: {exc}")
 
-        effective_staking = staking_address or node_address
+        effective_staking = staking_address or identity_address
 
         # --- Step 4: Collection Address ---
         print()
@@ -193,7 +193,7 @@ class _NodeContext:
         self.public_ip: str = ""
         self.upnp_endpoint: tuple[str, int] | None = None
         self.identity_key: str = ""
-        self.node_address: str = ""
+        self.identity_address: str = ""
         self.staking_address: str = ""
         self.collection_address: str = ""
         self.wallet_address: str = ""
@@ -264,19 +264,19 @@ async def _phase_init(ctx: _NodeContext) -> None:
 
     # 4. Identity keypair (with passphrase support)
     try:
-        ctx.identity_key, ctx.node_address = load_or_create_identity(
+        ctx.identity_key, ctx.identity_address = load_or_create_identity(
             s.IDENTITY_KEY_PATH, s.IDENTITY_PASSPHRASE,
         )
     except KeystorePassphraseRequired:
         raise  # Let caller (NodeManager or CLI) handle passphrase prompt
     except Exception as exc:
         raise NodeError(NodeErrorCode.IDENTITY_KEY_ERROR, str(exc))
-    logger.info("Node identity: %s", ctx.node_address)
+    logger.info("Node identity: %s", ctx.identity_address)
 
     # Staking address falls back to identity address if not configured
     if not ctx.staking_address:
-        ctx.staking_address = ctx.node_address
-        ctx.wallet_address = ctx.node_address
+        ctx.staking_address = ctx.identity_address
+        ctx.wallet_address = ctx.identity_address
         logger.info("Staking address (identity fallback): %s", ctx.staking_address)
 
     # 5. TLS certificates
@@ -309,6 +309,7 @@ async def _phase_register(ctx: _NodeContext) -> None:
     node_id, gateway_ca_cert = await register_node(
         ctx.http, ctx.s, ctx.public_ip,
         identity_key=ctx.identity_key,
+        identity_address=ctx.identity_address,
         upnp_endpoint=ctx.upnp_endpoint,
         wallet_address=ctx.wallet_address,
         staking_address=ctx.staking_address,

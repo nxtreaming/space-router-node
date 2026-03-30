@@ -180,7 +180,7 @@ async def _register_v2(
     public_ip: str,
     *,
     identity_key: str,
-    node_address: str,
+    identity_address: str,
     wallet_address: str,
     upnp_endpoint: tuple | None = None,
 ) -> tuple[str, str | None]:
@@ -198,7 +198,7 @@ async def _register_v2(
 
     # Sign: space-router:register:{identity_address}:{timestamp}
     identity_signature, timestamp = sign_request(
-        identity_key, "register", node_address,
+        identity_key, "register", identity_address,
     )
 
     # Vouch: space-router:vouch:{staking}:{collection}:{timestamp}
@@ -207,7 +207,7 @@ async def _register_v2(
     )
 
     payload = {
-        "identity_address": node_address,
+        "identity_address": identity_address,
         "staking_address": staking_address,
         "collection_address": collection_address,
         "staking_vouching_signature": vouching_sig,
@@ -221,7 +221,7 @@ async def _register_v2(
     url = f"{settings.COORDINATION_API_URL}/nodes/register"
     logger.info(
         "Registering node (v2) at %s → endpoint=%s identity=%s staking=%s collection=%s",
-        url, endpoint_url, node_address, staking_address, collection_address,
+        url, endpoint_url, identity_address, staking_address, collection_address,
     )
 
     resp = await http_client.post(url, json=payload, timeout=15.0)
@@ -234,7 +234,7 @@ async def _register_v2(
 
     logger.info(
         "Registered as node %s (v2, status=%s, identity=%s, staking=%s, mtls_ca=%s)",
-        node_id, reg_status, node_address, staking_address,
+        node_id, reg_status, identity_address, staking_address,
         "provided" if gateway_ca_cert else "not provided",
     )
 
@@ -254,7 +254,7 @@ async def register_node(
     public_ip: str,
     *,
     identity_key: str,
-    node_address: str = "",
+    identity_address: str = "",
     wallet_address: str,
     staking_address: str = "",
     collection_address: str = "",
@@ -285,7 +285,7 @@ async def register_node(
         result = await _register_v2(
             http_client, settings, public_ip,
             identity_key=identity_key,
-            node_address=node_address,
+            identity_address=identity_address,
             wallet_address=wallet_address,
             upnp_endpoint=upnp_endpoint,
         )
@@ -298,7 +298,7 @@ async def register_node(
         result = await _register_v2(
             http_client, settings, public_ip,
             identity_key=identity_key,
-            node_address=node_address,
+            identity_address=identity_address,
             wallet_address=wallet_address,
             upnp_endpoint=upnp_endpoint,
         )
