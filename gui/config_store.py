@@ -10,24 +10,27 @@ from pathlib import Path
 from dotenv import dotenv_values, set_key
 
 from app.identity import write_identity_key
+from app.variant import BUILD_VARIANT
 from app.wallet import validate_wallet_address
 
-# Default Coordination API for production
-_DEFAULT_COORDINATION_API_URL = "https://spacerouter-coordination-api.fly.dev"
+# Coordination API URLs per environment
+_PROD_URL = "https://spacerouter-coordination-api.fly.dev"
+_TEST_URL = "https://spacerouter-coordination-api-test.fly.dev"
+_STAGING_URL = "https://spacerouter-coordination-api-staging.fly.dev"
 
-# Pre-configured environments for easy switching
+# Pre-configured environments for easy switching (test builds only)
 ENVIRONMENTS = {
     "production": {
         "label": "Production",
-        "url": "https://spacerouter-coordination-api.fly.dev",
+        "url": _PROD_URL,
     },
     "test": {
         "label": "Test (CC Testnet)",
-        "url": "https://spacerouter-coordination-api-test.fly.dev",
+        "url": _TEST_URL,
     },
     "staging": {
         "label": "Staging",
-        "url": "https://spacerouter-coordination-api-staging.fly.dev",
+        "url": _STAGING_URL,
     },
     "local": {
         "label": "Local",
@@ -35,8 +38,19 @@ ENVIRONMENTS = {
     },
 }
 
+
+def _default_coordination_url() -> str:
+    """Return the default coordination API URL for the current build variant.
+
+    Test builds target the test environment; production builds target prod.
+    """
+    if BUILD_VARIANT == "test":
+        return _TEST_URL
+    return _PROD_URL
+
+
 _DEFAULTS = {
-    "SR_COORDINATION_API_URL": _DEFAULT_COORDINATION_API_URL,
+    "SR_COORDINATION_API_URL": _default_coordination_url(),
     "SR_STAKING_ADDRESS": "",
     "SR_COLLECTION_ADDRESS": "",
     "SR_NODE_PORT": "9090",

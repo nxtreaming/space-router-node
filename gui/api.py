@@ -95,7 +95,9 @@ class Api:
         return {"ok": True}
 
     def get_environments(self) -> list:
-        """Return available environment presets."""
+        """Return available environment presets (test builds only)."""
+        if BUILD_VARIANT != "test":
+            return []
         from gui.config_store import ENVIRONMENTS
         current = self._config.get_environment()
         return [
@@ -104,7 +106,9 @@ class Api:
         ]
 
     def set_environment(self, env_key: str) -> dict:
-        """Switch environment. Requires node restart to take effect."""
+        """Switch environment. Requires node restart to take effect (test builds only)."""
+        if BUILD_VARIANT != "test":
+            return {"ok": False, "error": "Environment switching is disabled in production builds."}
         try:
             url = self._config.save_environment(env_key)
         except ValueError as exc:
@@ -155,16 +159,19 @@ class Api:
 
     def get_settings(self) -> dict:
         """Return current settings for the settings panel."""
+        from gui.config_store import _default_coordination_url
         return {
             "coordination_api_url": self._config.get(
                 "SR_COORDINATION_API_URL",
-                "https://spacerouter-coordination-api.fly.dev",
+                _default_coordination_url(),
             ),
             "mtls_enabled": self._config.get("SR_MTLS_ENABLED", "true").lower() == "true",
         }
 
     def save_settings(self, coordination_api_url: str, mtls_enabled: bool) -> dict:
-        """Save advanced settings. Requires node restart to take effect."""
+        """Save advanced settings. Requires node restart to take effect (test builds only)."""
+        if BUILD_VARIANT != "test":
+            return {"ok": False, "error": "Settings are locked in production builds."}
         try:
             self._config.save_settings(coordination_api_url, mtls_enabled)
             return {"ok": True, "restart_required": True}
