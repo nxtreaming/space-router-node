@@ -186,20 +186,23 @@ jobs:
             fi
           fi
 
-      # Rename Windows artifact
+      # Rename Windows artifact (onefile mode produces dist/SpaceRouter.exe directly)
       - name: Rename artifact (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           if (Test-Path "dist\SpaceRouter.exe") {
             Move-Item "dist\SpaceRouter.exe" "dist\${{ matrix.artifact }}.exe"
+          } else {
+            Write-Error "SpaceRouter.exe not found in dist\"
+            Get-ChildItem dist\ | Select-Object FullName
+            exit 1
           }
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: |
-            dist/${{ matrix.artifact }}
             dist/${{ matrix.artifact }}.exe
             dist/${{ matrix.artifact }}.dmg
 

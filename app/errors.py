@@ -18,6 +18,7 @@ class NodeErrorCode(enum.Enum):
     INVALID_WALLET = "invalid_wallet"
     MISSING_WALLET = "missing_wallet"
     IDENTITY_KEY_ERROR = "identity_key_error"
+    IDENTITY_KEY_LOCKED = "identity_key_locked"
     TLS_CERT_ERROR = "tls_cert_error"
 
     # ── Network / binding errors ──
@@ -28,6 +29,8 @@ class NodeErrorCode(enum.Enum):
     # ── Registration errors ──
     NETWORK_UNREACHABLE = "network_unreachable"
     REGISTRATION_REJECTED = "registration_rejected"
+    IP_CONFLICT = "ip_conflict"
+    WALLET_CONFLICT = "wallet_conflict"
     API_SERVER_ERROR = "api_server_error"
 
     # ── Runtime errors ──
@@ -39,12 +42,15 @@ _USER_MESSAGES: dict[NodeErrorCode, str] = {
     NodeErrorCode.INVALID_WALLET: "Wallet address is invalid. Check Settings.",
     NodeErrorCode.MISSING_WALLET: "No wallet address configured.",
     NodeErrorCode.IDENTITY_KEY_ERROR: "Cannot load node identity key. Try Fresh Restart.",
+    NodeErrorCode.IDENTITY_KEY_LOCKED: "Identity key is encrypted. Passphrase required to unlock.",
     NodeErrorCode.TLS_CERT_ERROR: "Cannot create TLS certificates. Check disk permissions.",
     NodeErrorCode.PORT_IN_USE: "Port is already in use. Retrying...",
     NodeErrorCode.PORT_PERMISSION: "Permission denied for port. Try a port above 1024.",
     NodeErrorCode.BIND_ERROR: "Cannot start server.",
     NodeErrorCode.NETWORK_UNREACHABLE: "Cannot reach coordination server. Retrying...",
     NodeErrorCode.REGISTRATION_REJECTED: "Registration rejected by server. Check wallet and environment.",
+    NodeErrorCode.IP_CONFLICT: "Another node is already using this IP address. Only one node per IP is allowed.",
+    NodeErrorCode.WALLET_CONFLICT: "Wallet address is already registered to another node.",
     NodeErrorCode.API_SERVER_ERROR: "Coordination server error. Retrying...",
     NodeErrorCode.NODE_OFFLINE: "Node went offline. Reconnecting...",
     NodeErrorCode.UNEXPECTED_ERROR: "An unexpected error occurred.",
@@ -92,6 +98,27 @@ def classify_error(exc: Exception) -> NodeError:
     # ── httpx errors (registration / health check) ──
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
+        # 409 — distinguish IP conflict vs wallet conflict
+        if status == 409:
+            body = exc.response.text[:300].lower()
+            if "ip" in body and "already registered" in body:
+                return NodeError(
+                    NodeErrorCode.IP_CONFLICT,
+                    exc.response.text[:200],
+                    cause=exc,
+                )
+            if "staking_address" in body or "collection_address" in body or "wallet" in body:
+                return NodeError(
+                    NodeErrorCode.WALLET_CONFLICT,
+                    exc.response.text[:200],
+                    cause=exc,
+                )
+            # Fallback for unknown 409
+            return NodeError(
+                NodeErrorCode.REGISTRATION_REJECTED,
+                f"HTTP 409: {exc.response.text[:200]}",
+                cause=exc,
+            )
         # 422 from challenge verification is transient (node may not be reachable yet)
         if status == 422:
             body = exc.response.text[:300].lower()

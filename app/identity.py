@@ -69,7 +69,7 @@ def _migrate_to_keystore(key_path: str, private_key: str, passphrase: str) -> No
 def load_or_create_identity(key_path: str, passphrase: str = "") -> tuple[str, str]:
     """Load or generate a secp256k1 identity keypair.
 
-    Returns ``(private_key_hex, node_address)``.
+    Returns ``(private_key_hex, identity_address)``.
 
     Storage behaviour
     -----------------

@@ -72,67 +72,82 @@ def _first_run_setup() -> bool:
     """Interactive first-time setup wizard.
 
     Creates the identity key file and writes settings to .env.
+    Skips identity key steps when the key already exists (e.g. after --reset --keep-identity).
     Returns True on success, False if user cancels (Ctrl+C).
     """
     s = load_settings()
+    key_exists = os.path.isfile(s.IDENTITY_KEY_PATH)
+    step = 1
+
     print()
     print("─" * 53)
-    print("  SpaceRouter Node — First-Time Setup")
+    print("  SpaceRouter Node — Setup")
     print("─" * 53)
 
     try:
-        # --- Step 1: Identity Key ---
-        print()
-        print("1. Identity Key")
-        generate = _prompt("   Generate a new identity key? [Y/n]", default="Y").lower()
-
-        if generate in ("y", "yes", ""):
-            # Auto-generate — key is created by load_or_create_identity during node start.
-            # We create it now so we can show the address.
-            identity_key_hex = None
-            print("   (Identity key will be generated on first start)")
-            node_address = None
-        else:
-            while True:
-                raw = getpass.getpass("   Enter identity private key (hex): ").strip()
-                try:
-                    from eth_account import Account
-                    account = Account.from_key(raw)
-                    identity_key_hex = account.key.hex()
-                    node_address = account.address.lower()
-                    print(f"   ✓ Identity address: {account.address}")
-                    break
-                except Exception:
-                    print("   Invalid private key — expected 32-byte hex (with or without 0x prefix).")
-
-        # --- Step 2: Identity Passphrase ---
-        print()
-        print("2. Identity Passphrase (optional)")
-        encrypt = _prompt("   Encrypt the identity key with a passphrase? [y/N]", default="N").lower()
-
+        identity_address = None
         passphrase = ""
-        if encrypt in ("y", "yes"):
-            while True:
-                p1 = getpass.getpass("   Enter passphrase: ")
-                p2 = getpass.getpass("   Confirm passphrase: ")
-                if p1 == p2:
-                    passphrase = p1
-                    break
-                print("   Passphrases do not match — try again.")
 
-        # Write the identity key file now (so we can show the address for steps 3+)
-        key_path = s.IDENTITY_KEY_PATH
-        if identity_key_hex is not None:
-            node_address = write_identity_key(key_path, identity_key_hex, passphrase)
+        if key_exists:
+            # Identity key already exists — load it and skip key/passphrase steps
+            try:
+                _, identity_address = load_or_create_identity(s.IDENTITY_KEY_PATH)
+                print(f"\n   Identity key found: {identity_address}")
+            except KeystorePassphraseRequired:
+                passphrase = getpass.getpass("\n   Identity key is encrypted. Passphrase: ")
+                _, identity_address = load_or_create_identity(s.IDENTITY_KEY_PATH, passphrase)
+                print(f"   ✓ Unlocked identity: {identity_address}")
         else:
-            # Auto-generate now so we can show the address
-            _, node_address = load_or_create_identity(key_path, passphrase)
-            print(f"   ✓ Generated identity address: {node_address}")
+            # --- Step 1: Identity Key ---
+            print()
+            print(f"{step}. Identity Key")
+            step += 1
+            generate = _prompt("   Generate a new identity key? [Y/n]", default="Y").lower()
 
-        # --- Step 3: Staking Address ---
+            identity_key_hex = None
+            if generate in ("y", "yes", ""):
+                print("   (Identity key will be generated on first start)")
+            else:
+                while True:
+                    raw = getpass.getpass("   Enter identity private key (hex): ").strip()
+                    try:
+                        from eth_account import Account
+                        account = Account.from_key(raw)
+                        identity_key_hex = account.key.hex()
+                        identity_address = account.address.lower()
+                        print(f"   ✓ Identity address: {account.address}")
+                        break
+                    except Exception:
+                        print("   Invalid private key — expected 32-byte hex (with or without 0x prefix).")
+
+            # --- Step 2: Identity Passphrase ---
+            print()
+            print(f"{step}. Identity Passphrase (optional)")
+            step += 1
+            encrypt = _prompt("   Encrypt the identity key with a passphrase? [y/N]", default="N").lower()
+
+            if encrypt in ("y", "yes"):
+                while True:
+                    p1 = getpass.getpass("   Enter passphrase: ")
+                    p2 = getpass.getpass("   Confirm passphrase: ")
+                    if p1 == p2:
+                        passphrase = p1
+                        break
+                    print("   Passphrases do not match — try again.")
+
+            # Write the identity key file now (so we can show the address for steps 3+)
+            key_path = s.IDENTITY_KEY_PATH
+            if identity_key_hex is not None:
+                identity_address = write_identity_key(key_path, identity_key_hex, passphrase)
+            else:
+                _, identity_address = load_or_create_identity(key_path, passphrase)
+                print(f"   ✓ Generated identity address: {identity_address}")
+
+        # --- Staking Address ---
         print()
-        print("3. Staking Address (optional)")
-        print(f"   Leave blank to use identity address ({node_address})")
+        print(f"{step}. Staking Address (optional)")
+        step += 1
+        print(f"   Leave blank to use identity address ({identity_address})")
         while True:
             raw = _prompt("   Enter staking wallet address", default="")
             if not raw:
@@ -144,11 +159,12 @@ def _first_run_setup() -> bool:
             except ValueError as exc:
                 print(f"   Invalid address: {exc}")
 
-        effective_staking = staking_address or node_address
+        effective_staking = staking_address or identity_address
 
-        # --- Step 4: Collection Address ---
+        # --- Collection Address ---
         print()
-        print("4. Collection Address (optional)")
+        print(f"{step}. Collection Address (optional)")
+        step += 1
         print(f"   Leave blank to use staking address ({effective_staking})")
         while True:
             raw = _prompt("   Enter collection wallet address", default="")
@@ -193,7 +209,7 @@ class _NodeContext:
         self.public_ip: str = ""
         self.upnp_endpoint: tuple[str, int] | None = None
         self.identity_key: str = ""
-        self.node_address: str = ""
+        self.identity_address: str = ""
         self.staking_address: str = ""
         self.collection_address: str = ""
         self.wallet_address: str = ""
@@ -264,19 +280,19 @@ async def _phase_init(ctx: _NodeContext) -> None:
 
     # 4. Identity keypair (with passphrase support)
     try:
-        ctx.identity_key, ctx.node_address = load_or_create_identity(
+        ctx.identity_key, ctx.identity_address = load_or_create_identity(
             s.IDENTITY_KEY_PATH, s.IDENTITY_PASSPHRASE,
         )
     except KeystorePassphraseRequired:
         raise  # Let caller (NodeManager or CLI) handle passphrase prompt
     except Exception as exc:
         raise NodeError(NodeErrorCode.IDENTITY_KEY_ERROR, str(exc))
-    logger.info("Node identity: %s", ctx.node_address)
+    logger.info("Node identity: %s", ctx.identity_address)
 
     # Staking address falls back to identity address if not configured
     if not ctx.staking_address:
-        ctx.staking_address = ctx.node_address
-        ctx.wallet_address = ctx.node_address
+        ctx.staking_address = ctx.identity_address
+        ctx.wallet_address = ctx.identity_address
         logger.info("Staking address (identity fallback): %s", ctx.staking_address)
 
     # 5. TLS certificates
@@ -482,7 +498,12 @@ async def _run(
             try:
                 await _phase_init(ctx)
             except KeystorePassphraseRequired:
-                raise  # Let NodeManager surface this to the frontend
+                if state_machine:
+                    state_machine.transition(
+                        NodeState.PASSPHRASE_REQUIRED,
+                        "Identity key is encrypted — passphrase required",
+                    )
+                raise
             except NodeError:
                 raise
             except Exception as exc:
@@ -636,15 +657,85 @@ async def _run(
     logger.info("Home Node shut down cleanly")
 
 
+def _do_reset() -> None:
+    """Handle --reset: delete config and optionally identity key."""
+    from app.paths import config_dir
+
+    keep_identity = "--keep-identity" in sys.argv
+    s = load_settings()
+
+    # Check both well-known config dir and CWD for config files
+    cfg_dir = config_dir()
+    wellknown_env = cfg_dir / "spacerouter.env"
+    cwd_env = os.path.abspath(".env")
+
+    env_file = str(wellknown_env) if wellknown_env.is_file() else cwd_env
+    certs_dir = os.path.dirname(os.path.abspath(s.IDENTITY_KEY_PATH)) or "certs"
+    identity_path = os.path.abspath(s.IDENTITY_KEY_PATH)
+
+    if not keep_identity and sys.stdin.isatty():
+        print("WARNING: This will delete your identity key and all configuration.")
+        confirm = input("Type YES to confirm: ").strip()
+        if confirm != "YES":
+            print("Reset cancelled.")
+            sys.exit(0)
+
+    # Delete .env
+    if os.path.isfile(env_file):
+        os.remove(env_file)
+        print(f"Removed {env_file}")
+
+    # Delete certs (except identity key if --keep-identity)
+    if os.path.isdir(certs_dir):
+        import shutil
+        if keep_identity:
+            for f in os.listdir(certs_dir):
+                fp = os.path.join(certs_dir, f)
+                if os.path.abspath(fp) != identity_path and os.path.isfile(fp):
+                    os.remove(fp)
+                    print(f"Removed {fp}")
+            print(f"Kept identity key: {identity_path}")
+        else:
+            shutil.rmtree(certs_dir)
+            print(f"Removed {certs_dir}/")
+
+    print("Reset complete." + (" Identity key preserved." if keep_identity else ""))
+
+
 def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] in ("--version", "-V"):
         print(f"space-router-node {__version__}")
         sys.exit(0)
 
-    # First-run wizard: trigger when identity key file doesn't exist yet,
-    # but only in interactive (TTY) sessions — skip silently in CI/piped mode.
+    if "--reset" in sys.argv:
+        _do_reset()
+        sys.exit(0)
+
+    # --password-file: read passphrase from file for automation/systemd
+    if "--password-file" in sys.argv:
+        idx = sys.argv.index("--password-file")
+        if idx + 1 >= len(sys.argv):
+            print("Error: --password-file requires a file path argument", file=sys.stderr)
+            sys.exit(1)
+        pw_path = sys.argv[idx + 1]
+        try:
+            with open(pw_path) as f:
+                os.environ["SR_IDENTITY_PASSPHRASE"] = f.readline().rstrip("\n")
+        except (OSError, IOError) as exc:
+            print(f"Error reading password file: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    # Setup wizard: trigger when identity key is missing, when --setup is
+    # passed explicitly, or when config looks unconfigured (no staking address
+    # and default coordination URL). Only in interactive TTY.
     s = load_settings()
-    if not os.path.isfile(s.IDENTITY_KEY_PATH) and sys.stdin.isatty():
+    explicit_setup = "--setup" in sys.argv
+    needs_setup = (
+        explicit_setup
+        or not os.path.isfile(s.IDENTITY_KEY_PATH)
+        or (not s.STAKING_ADDRESS and s.COORDINATION_API_URL == "http://localhost:8000")
+    )
+    if needs_setup and sys.stdin.isatty():
         if not _first_run_setup():
             sys.exit(0)
         # Reload settings so _run() picks up values written to .env
@@ -659,6 +750,31 @@ def main() -> None:
 
     try:
         asyncio.run(_run())
+    except KeystorePassphraseRequired:
+        if sys.stdin.isatty():
+            # Prompt for passphrase and retry
+            try:
+                passphrase = getpass.getpass("Identity key passphrase: ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                sys.exit(1)
+            os.environ["SR_IDENTITY_PASSPHRASE"] = passphrase
+            try:
+                asyncio.run(_run(settings_override=load_settings()))
+            except NodeError as exc:
+                logger.error("Node failed: %s", exc.user_message)
+                sys.exit(1)
+            finally:
+                if sys.platform == "win32":
+                    signal.signal(signal.SIGINT, signal.SIG_DFL)
+                    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        else:
+            print(
+                "Identity key is encrypted. Set SR_IDENTITY_PASSPHRASE "
+                "environment variable or run interactively.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     except NodeError as exc:
         logger.error("Node failed: %s", exc.user_message)
         sys.exit(1)

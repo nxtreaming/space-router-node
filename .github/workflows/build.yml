@@ -483,12 +483,17 @@ jobs:
         run: security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
 
       # ---- Windows: rename and sign ----
+      # Onefile mode produces dist/SpaceRouter.exe directly
       - name: Rename artifact (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           if (Test-Path "dist\SpaceRouter.exe") {
             Move-Item "dist\SpaceRouter.exe" "dist\${{ matrix.artifact }}.exe"
+          } else {
+            Write-Error "SpaceRouter.exe not found in dist\"
+            Get-ChildItem dist\ | Select-Object FullName
+            exit 1
           }
 
       # ---- Windows code signing ----
@@ -513,7 +518,6 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: |
-            dist/${{ matrix.artifact }}
             dist/${{ matrix.artifact }}.exe
             dist/${{ matrix.artifact }}.dmg
 

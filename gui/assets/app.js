@@ -182,7 +182,14 @@ function initOnboarding() {
   const advancedSection = $("#advanced-section");
   const advancedArrow = $("#advanced-arrow");
 
-  populateEnvSelector();
+  // Environment selector: test builds only
+  const envGroup = $("#env-select").parentElement;
+  if (isTestBuild) {
+    populateEnvSelector();
+    envGroup.style.display = "";
+  } else {
+    envGroup.style.display = "none";
+  }
 
   // ── Identity key mode toggle ──
   function updateKeyMode() {
@@ -221,6 +228,15 @@ function initOnboarding() {
     advancedSection.style.display = open ? "none" : "block";
     advancedArrow.textContent = open ? "▸" : "▾";
   });
+
+  // ── Network mode toggle (in advanced section) ──
+  const onboardNetworkRadios = document.querySelectorAll('input[name="onboard-network-mode"]');
+  const onboardTunnelConfig = $("#onboard-tunnel-config");
+  for (const radio of onboardNetworkRadios) {
+    radio.addEventListener("change", function () {
+      onboardTunnelConfig.style.display = this.value === "tunnel" ? "block" : "none";
+    });
+  }
 
   // ── Optional address validation ──
   function validateAddress(input, errorEl) {
@@ -271,7 +287,14 @@ function initOnboarding() {
     const collection = collectionInput.value.trim();
     const identityKeyHex = radioImport.checked ? identityKeyInput.value.trim() : "";
 
+    // Save network mode from advanced section
+    const networkMode = document.querySelector('input[name="onboard-network-mode"]:checked');
+    const mode = networkMode ? networkMode.value : "upnp";
+    const tunnelHost = mode === "tunnel" ? ($("#onboard-tunnel-host").value.trim() || "") : "";
+    const tunnelPort = mode === "tunnel" ? ($("#onboard-tunnel-port").value.trim() || "") : "";
+
     try {
+      await window.pywebview.api.save_network_mode(mode, tunnelHost, tunnelPort);
       const result = await window.pywebview.api.save_onboarding_and_start(
         passphrase, staking, collection, identityKeyHex,
       );
@@ -279,18 +302,19 @@ function initOnboarding() {
         hideAll();
         showStatus();
       } else {
-        // Show error inline
+        // Show error inline (remove any previous error first)
+        btn.parentNode.querySelectorAll("p.error").forEach(el => el.remove());
         const errEl = document.createElement("p");
         errEl.className = "error";
         errEl.style.marginTop = "12px";
         errEl.textContent = result.error || "Unknown error";
         btn.parentNode.insertBefore(errEl, btn.nextSibling);
         btn.disabled = false;
-        btn.textContent = "Start SpaceRouter";
+        btn.textContent = "Start Node";
       }
     } catch (e) {
       btn.disabled = false;
-      btn.textContent = "Start SpaceRouter";
+      btn.textContent = "Start Node";
     }
   });
 }
@@ -324,14 +348,22 @@ async function updateStatus() {
     const errorText = $("#error-text");
     const certWarning = $("#cert-warning");
     const btnRetry = $("#btn-retry");
+    const btnStartNode = $("#btn-start-node");
     const btnStop = $("#btn-stop");
 
-    // Wallet addresses
-    stakingEl.textContent = status.staking_address || status.wallet || "-";
-    collectionEl.textContent = status.collection_address || "-";
+    // Wallet addresses (truncated, full on hover)
+    const fullStaking = status.staking_address || status.wallet || "";
+    const fullCollection = status.collection_address || "";
+    stakingEl.textContent = truncateAddress(fullStaking) || "-";
+    stakingEl.title = fullStaking;
+    collectionEl.textContent = truncateAddress(fullCollection) || "-";
+    collectionEl.title = fullCollection;
 
-    // Check for passphrase-required error
-    if (status.error && status.error.includes("KeystorePassphraseRequired")) {
+    // State-based display
+    const state = status.state || "idle";
+
+    // Passphrase required — show unlock dialog immediately
+    if (state === "passphrase_required") {
       showUnlockDialog();
       return;
     }
@@ -343,9 +375,6 @@ async function updateStatus() {
     } else {
       envBadge.style.display = "none";
     }
-
-    // State-based display
-    const state = status.state || "idle";
 
     switch (state) {
       case "idle":
@@ -394,7 +423,27 @@ async function updateStatus() {
       case "error_permanent":
         dot.className = "dot dot-stopped";
         text.textContent = "Error";
-        detail.textContent = "";
+        // Use error_code for user-friendly messages
+        if (status.error_code === "identity_key_locked") {
+          showUnlockDialog();
+          return;
+        } else if (status.error_code === "ip_conflict") {
+          detail.textContent = "Another node is already using this IP address. Only one node per IP is allowed.";
+        } else if (status.error_code === "wallet_conflict") {
+          detail.textContent = "Wallet address is already registered to another node.";
+        } else if (status.error_code === "registration_rejected") {
+          detail.textContent = "Registration rejected. Check your staking balance and wallet address.";
+        } else if (status.error_code === "network_unreachable") {
+          detail.textContent = "Cannot reach coordination server. Check your internet connection.";
+        } else if (status.error_code === "invalid_wallet") {
+          detail.textContent = "Invalid wallet address. Use Fresh Restart to reconfigure.";
+        } else if (status.error_code === "port_permission") {
+          detail.textContent = "Port permission denied. Use a port above 1024.";
+        } else if (status.error_code === "port_in_use") {
+          detail.textContent = "Port is already in use by another application.";
+        } else {
+          detail.textContent = status.error_message || status.error || "";
+        }
         break;
       case "stopping":
         dot.className = "dot dot-starting";
@@ -408,7 +457,7 @@ async function updateStatus() {
     }
 
     // Error display
-    if (status.error && state !== "error_transient" && !status.error.includes("KeystorePassphraseRequired")) {
+    if (status.error && state !== "error_transient" && state !== "passphrase_required") {
       errorText.textContent = status.error;
       errorBanner.style.display = "block";
     } else {
@@ -421,12 +470,15 @@ async function updateStatus() {
     // Action buttons
     if (state === "error_permanent") {
       btnRetry.style.display = "block";
+      btnStartNode.style.display = "none";
       btnStop.style.display = "none";
     } else if (state === "idle") {
       btnRetry.style.display = "none";
+      btnStartNode.style.display = "block";
       btnStop.style.display = "none";
     } else {
       btnRetry.style.display = "none";
+      btnStartNode.style.display = "none";
       btnStop.style.display = "block";
     }
   } catch (e) {
@@ -474,18 +526,14 @@ async function doFreshRestart(keepAddresses) {
       return;
     }
 
-    // Go to network setup, then onboarding
-    showNetworkSetup(function () {
-      // Pre-fill addresses if kept
-      hideAll();
-      show("screen-onboarding");
-      initOnboarding();
+    // Go directly to onboarding
+    hideAll();
+    show("screen-onboarding");
+    initOnboarding();
 
-      if (keepAddresses) {
-        // Reload addresses from config
-        loadSavedAddresses();
-      }
-    });
+    if (keepAddresses) {
+      loadSavedAddresses();
+    }
   } catch (e) {
     btn.disabled = false;
     btn.textContent = keepAddresses ? "Keep Addresses" : "Clear Everything";
@@ -521,6 +569,17 @@ function initActionButtons() {
     btn.textContent = "Retry";
   });
 
+  $("#btn-start-node").addEventListener("click", async function () {
+    const btn = $("#btn-start-node");
+    btn.disabled = true;
+    btn.textContent = "Starting...";
+    try {
+      await window.pywebview.api.start_node();
+    } catch (e) {}
+    btn.disabled = false;
+    btn.textContent = "Start";
+  });
+
   $("#btn-stop").addEventListener("click", async function () {
     const btn = $("#btn-stop");
     btn.disabled = true;
@@ -533,7 +592,7 @@ function initActionButtons() {
   });
 }
 
-// ── Settings Panel (test builds only) ──
+// ── Settings Panel ──
 
 function initSettings() {
   const envSelect = $("#settings-env");
@@ -543,6 +602,23 @@ function initSettings() {
   const mtlsWarning = $("#mtls-warning");
   const saveBtn = $("#btn-save-settings");
   const statusEl = $("#settings-status");
+  const networkRadios = document.querySelectorAll('input[name="settings-network-mode"]');
+  const tunnelConfig = $("#settings-tunnel-config");
+  const tunnelHost = $("#settings-tunnel-host");
+  const tunnelPort = $("#settings-tunnel-port");
+
+  // Show test-only settings groups
+  if (isTestBuild) {
+    $("#settings-env-group").style.display = "";
+    $("#settings-mtls-group").style.display = "";
+  }
+
+  // Show/hide tunnel config
+  for (const radio of networkRadios) {
+    radio.addEventListener("change", function () {
+      tunnelConfig.style.display = this.value === "tunnel" ? "block" : "none";
+    });
+  }
 
   // Show/hide custom URL input based on dropdown
   envSelect.addEventListener("change", function () {
@@ -563,27 +639,41 @@ function initSettings() {
 
   // Open settings
   $("#btn-settings").addEventListener("click", async function () {
-    // Load current settings
+    // Load current network mode
     try {
-      const settings = await window.pywebview.api.get_settings();
-      const url = settings.coordination_api_url;
+      const net = await window.pywebview.api.get_network_mode();
+      const radio = document.querySelector(
+        'input[name="settings-network-mode"][value="' + net.mode + '"]'
+      );
+      if (radio) radio.checked = true;
+      tunnelConfig.style.display = net.mode === "tunnel" ? "block" : "none";
+      tunnelHost.value = net.public_host || "";
+      tunnelPort.value = net.port || "";
+    } catch (e) {}
 
-      // Set dropdown value
-      if (ENV_URLS[url]) {
-        envSelect.value = url;
-        customUrl.style.display = "none";
-      } else {
-        envSelect.value = "custom";
-        customUrl.value = url;
-        customUrl.style.display = "block";
+    // Load current settings (test builds)
+    if (isTestBuild) {
+      try {
+        const settings = await window.pywebview.api.get_settings();
+        const url = settings.coordination_api_url;
+
+        // Set dropdown value
+        if (ENV_URLS[url]) {
+          envSelect.value = url;
+          customUrl.style.display = "none";
+        } else {
+          envSelect.value = "custom";
+          customUrl.value = url;
+          customUrl.style.display = "block";
+        }
+
+        // Set mTLS toggle
+        mtlsToggle.checked = settings.mtls_enabled;
+        mtlsLabel.textContent = settings.mtls_enabled ? "Enabled" : "Disabled";
+        mtlsWarning.style.display = settings.mtls_enabled ? "none" : "block";
+      } catch (e) {
+        // Use defaults
       }
-
-      // Set mTLS toggle
-      mtlsToggle.checked = settings.mtls_enabled;
-      mtlsLabel.textContent = settings.mtls_enabled ? "Enabled" : "Disabled";
-      mtlsWarning.style.display = settings.mtls_enabled ? "none" : "block";
-    } catch (e) {
-      // Use defaults
     }
 
     statusEl.textContent = "";
@@ -599,30 +689,55 @@ function initSettings() {
 
   // Save settings
   saveBtn.addEventListener("click", async function () {
-    let url = envSelect.value;
-    if (url === "custom") {
-      url = customUrl.value.trim();
-      if (!url) {
-        statusEl.textContent = "Please enter a custom URL";
-        statusEl.style.color = "#e74c3c";
-        return;
-      }
+    // Validate tunnel config
+    const selectedMode = document.querySelector('input[name="settings-network-mode"]:checked');
+    const mode = selectedMode ? selectedMode.value : "upnp";
+    if (mode === "tunnel" && !tunnelHost.value.trim()) {
+      statusEl.textContent = "Please enter a public hostname for tunnel mode";
+      statusEl.style.color = "#e74c3c";
+      tunnelHost.classList.add("invalid");
+      return;
     }
-
-    const mtlsEnabled = mtlsToggle.checked;
+    tunnelHost.classList.remove("invalid");
 
     saveBtn.disabled = true;
     saveBtn.textContent = "Saving...";
     statusEl.textContent = "";
 
     try {
-      const result = await window.pywebview.api.save_settings(url, mtlsEnabled);
-      if (!result.ok) {
-        statusEl.textContent = result.error || "Failed to save";
-        statusEl.style.color = "#e74c3c";
-        saveBtn.disabled = false;
-        saveBtn.textContent = "Save & Restart Node";
-        return;
+      // Save network mode (all builds)
+      await window.pywebview.api.save_network_mode(
+        mode,
+        mode === "tunnel" ? tunnelHost.value.trim() : "",
+        mode === "tunnel" ? tunnelPort.value.trim() : "",
+      );
+
+      // Save API URL and mTLS (test builds only)
+      if (isTestBuild) {
+        let url = envSelect.value;
+        if (url === "custom") {
+          url = customUrl.value.trim();
+          if (!url) {
+            statusEl.textContent = "Please enter a custom URL";
+            statusEl.style.color = "#e74c3c";
+            saveBtn.disabled = false;
+            saveBtn.textContent = "Save & Restart Node";
+            return;
+          }
+        }
+
+        const mtlsEnabled = mtlsToggle.checked;
+        const result = await window.pywebview.api.save_settings(url, mtlsEnabled);
+        if (!result.ok) {
+          statusEl.textContent = result.error || "Failed to save";
+          statusEl.style.color = "#e74c3c";
+          saveBtn.disabled = false;
+          saveBtn.textContent = "Save & Restart Node";
+          return;
+        }
+
+        // Update test banner env label
+        updateTestBannerLabel(url);
       }
 
       // Restart node with new settings
@@ -631,9 +746,6 @@ function initSettings() {
 
       await window.pywebview.api.stop_node();
       await window.pywebview.api.start_node();
-
-      // Update test banner env label
-      updateTestBannerLabel(url);
 
       saveBtn.disabled = false;
       saveBtn.textContent = "Save & Restart Node";
@@ -716,20 +828,18 @@ async function initTestVariant() {
       banner.style.display = "block";
       document.body.classList.add("has-test-banner");
 
-      // Show settings button
-      $("#btn-settings").style.display = "block";
-
       // Load current env for banner label
       try {
         const settings = await window.pywebview.api.get_settings();
         updateTestBannerLabel(settings.coordination_api_url);
       } catch (e) {}
-
-      // Init settings panel
-      initSettings();
     }
+
+    // Init settings panel for all builds (network mode is always editable)
+    initSettings();
   } catch (e) {
-    // Variant check failed — continue as production
+    // Variant check failed — continue as production, still init settings
+    initSettings();
   }
 }
 
@@ -737,18 +847,15 @@ async function init() {
   try {
     const needsOnboarding = await window.pywebview.api.needs_onboarding();
 
-    // Variant setup is non-blocking
-    initTestVariant();
+    // Determine build variant before showing any screens
+    await initTestVariant();
 
     // Action buttons
     initFreshRestart();
     initActionButtons();
 
     if (needsOnboarding) {
-      // First time: show network setup, then onboarding
-      showNetworkSetup(function () {
-        showOnboarding();
-      });
+      showOnboarding();
     } else {
       // Already configured — start node and show status
       await window.pywebview.api.start_node();
