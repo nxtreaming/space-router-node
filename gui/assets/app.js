@@ -427,6 +427,10 @@ async function updateStatus() {
         if (status.error_code === "identity_key_locked") {
           showUnlockDialog();
           return;
+        } else if (status.error_code === "ip_conflict") {
+          detail.textContent = "Another node is already using this IP address. Only one node per IP is allowed.";
+        } else if (status.error_code === "wallet_conflict") {
+          detail.textContent = "Wallet address is already registered to another node.";
         } else if (status.error_code === "registration_rejected") {
           detail.textContent = "Registration rejected. Check your staking balance and wallet address.";
         } else if (status.error_code === "network_unreachable") {
