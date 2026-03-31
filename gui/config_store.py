@@ -244,7 +244,7 @@ class ConfigStore:
     def apply_to_env(self) -> None:
         """Load all config values into os.environ so pydantic-settings picks them up."""
         for key, value in self.load().items():
-            if value and key not in os.environ:
+            if value:
                 os.environ[key] = value
 
         # Point TLS cert + identity key paths to the writable config directory.
@@ -257,5 +257,4 @@ class ConfigStore:
             ("SR_GATEWAY_CA_CERT_PATH", "gateway-ca.crt"),
             ("SR_IDENTITY_KEY_PATH", "node-identity.key"),
         ):
-            if key not in os.environ:
-                os.environ[key] = str(certs_dir / filename)
+            os.environ[key] = str(certs_dir / filename)
