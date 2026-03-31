@@ -21,7 +21,7 @@ import sys
 import httpx
 from dotenv import set_key
 
-from app.config import Settings, load_settings
+from app.config import Settings, load_settings, _default_coordination_url
 from app.errors import NodeError, NodeErrorCode, classify_error
 from app.identity import KeystorePassphraseRequired, load_or_create_identity, write_identity_key
 from app.proxy_handler import handle_client
@@ -733,7 +733,7 @@ def main() -> None:
     needs_setup = (
         explicit_setup
         or not os.path.isfile(s.IDENTITY_KEY_PATH)
-        or (not s.STAKING_ADDRESS and s.COORDINATION_API_URL == "http://localhost:8000")
+        or (not s.STAKING_ADDRESS and s.COORDINATION_API_URL == _default_coordination_url())
     )
     if needs_setup and sys.stdin.isatty():
         if not _first_run_setup():

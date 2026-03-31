@@ -97,7 +97,7 @@ class TestConfigHTTPWarning:
                 http_warnings = [x for x in w if "plain HTTP" in str(x.message)]
                 assert len(http_warnings) > 0
         finally:
-            os.environ["SR_COORDINATION_API_URL"] = "http://localhost:8000"
+            os.environ.pop("SR_COORDINATION_API_URL", None)
             import importlib
             import app.config
             importlib.reload(app.config)
@@ -114,7 +114,7 @@ class TestConfigHTTPWarning:
                 http_warnings = [x for x in w if "plain HTTP" in str(x.message)]
                 assert len(http_warnings) == 0
         finally:
-            os.environ["SR_COORDINATION_API_URL"] = "http://localhost:8000"
+            os.environ.pop("SR_COORDINATION_API_URL", None)
             import importlib
             import app.config
             importlib.reload(app.config)

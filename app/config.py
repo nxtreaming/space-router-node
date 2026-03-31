@@ -4,7 +4,19 @@ import warnings
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.variant import BUILD_VARIANT
+
 logger = logging.getLogger(__name__)
+
+_PROD_URL = "https://spacerouter-coordination-api.fly.dev"
+_TEST_URL = "https://spacerouter-coordination-api-test.fly.dev"
+
+
+def _default_coordination_url() -> str:
+    """Return the default coordination API URL for the current build variant."""
+    if BUILD_VARIANT == "test":
+        return _TEST_URL
+    return _PROD_URL
 
 
 class Settings(BaseSettings):
@@ -15,7 +27,7 @@ class Settings(BaseSettings):
     )
 
     NODE_PORT: int = 9090
-    COORDINATION_API_URL: str = "http://localhost:8000"
+    COORDINATION_API_URL: str = _default_coordination_url()
 
     # Max concurrent proxy connections (DoS protection)
     MAX_CONNECTIONS: int = 256
