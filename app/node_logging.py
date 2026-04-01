@@ -136,15 +136,24 @@ _STATUS_INTERVAL = 300  # 5 minutes
 def setup_cli_logging(log_level: str = "INFO") -> None:
     """Configure logging for CLI mode with structured console output.
 
-    Replaces the default basicConfig with our CLIFormatter.
+    Replaces existing StreamHandlers with our CLIFormatter while
+    preserving any file handlers (e.g. the GUI RotatingFileHandler).
     """
     root = logging.getLogger()
-    # Remove existing handlers
+    # Remove only stream handlers — preserve file handlers (GUI log persistence)
     for h in root.handlers[:]:
-        root.removeHandler(h)
+        if isinstance(h, logging.StreamHandler) and not isinstance(
+            h, logging.FileHandler
+        ):
+            root.removeHandler(h)
 
     level = getattr(logging, log_level.upper(), logging.INFO)
     root.setLevel(level)
+
+    # Update any remaining file handlers to the new level
+    for h in root.handlers:
+        if isinstance(h, logging.FileHandler):
+            h.setLevel(level)
 
     handler = logging.StreamHandler(sys.stdout)
     handler.setLevel(level)
