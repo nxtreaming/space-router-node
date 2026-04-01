@@ -89,18 +89,13 @@ class TestConfigHTTPWarning:
         try:
             with warnings.catch_warnings(record=True) as w:
                 warnings.simplefilter("always")
-                # Force re-evaluation by importing fresh
-                import importlib
-                import app.config
-                importlib.reload(app.config)
+                from app.config import load_settings
+                load_settings()
                 # Check if warning was issued
                 http_warnings = [x for x in w if "plain HTTP" in str(x.message)]
                 assert len(http_warnings) > 0
         finally:
             os.environ.pop("SR_COORDINATION_API_URL", None)
-            import importlib
-            import app.config
-            importlib.reload(app.config)
 
     def test_https_coordination_url_no_warning(self):
         """HTTPS Coordination API URL should not emit a warning."""
@@ -108,16 +103,12 @@ class TestConfigHTTPWarning:
         try:
             with warnings.catch_warnings(record=True) as w:
                 warnings.simplefilter("always")
-                import importlib
-                import app.config
-                importlib.reload(app.config)
+                from app.config import load_settings
+                load_settings()
                 http_warnings = [x for x in w if "plain HTTP" in str(x.message)]
                 assert len(http_warnings) == 0
         finally:
             os.environ.pop("SR_COORDINATION_API_URL", None)
-            import importlib
-            import app.config
-            importlib.reload(app.config)
 
     def test_localhost_http_no_warning(self):
         """localhost HTTP is acceptable for development — no warning."""
@@ -125,12 +116,9 @@ class TestConfigHTTPWarning:
         try:
             with warnings.catch_warnings(record=True) as w:
                 warnings.simplefilter("always")
-                import importlib
-                import app.config
-                importlib.reload(app.config)
+                from app.config import load_settings
+                load_settings()
                 http_warnings = [x for x in w if "plain HTTP" in str(x.message)]
                 assert len(http_warnings) == 0
         finally:
-            import importlib
-            import app.config
-            importlib.reload(app.config)
+            os.environ.pop("SR_COORDINATION_API_URL", None)
