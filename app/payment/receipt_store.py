@@ -34,27 +34,42 @@ logger = logging.getLogger(__name__)
 # poller can apply per-row exponential backoff and escalate after ~24h.
 # Distinct from ``sign_attempts`` (which only counts permanent failures
 # against the 2-try retry budget).
-_SCHEMA_VERSION = 4
+#
+# Schema v5 adds two columns to the settlement-hardening track (P3):
+#
+# - ``reconcile_block_number`` (nullable) — block height at which the
+#   reaper marked a row as ``claim_tx_hash="external"`` after seeing
+#   ``isNonceUsed`` flip to true. Used to defer trusting that decision
+#   until ``FINALITY_BLOCKS_FOR_RECONCILE`` blocks pass; otherwise a
+#   stale-fork RPC could yield a false positive (L4).
+# - ``claim_tx_pending`` (nullable) — the deterministic tx hash we
+#   computed locally before broadcasting the claim. Persisted BEFORE
+#   ``send_raw_transaction`` so a crash between broadcast and
+#   ``mark_claimed`` can be reconciled via ``isNonceUsed`` on restart
+#   instead of re-submitting the same nonces (L5).
+_SCHEMA_VERSION = 5
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signed_receipts (
-    request_uuid       TEXT PRIMARY KEY,
-    tunnel_request_id  TEXT,
-    client_address     TEXT NOT NULL,
-    node_address       TEXT NOT NULL,
-    data_amount        INTEGER NOT NULL,
-    total_price        INTEGER NOT NULL,
-    signature          TEXT,
-    created_at         INTEGER NOT NULL,
-    claimed_at         INTEGER,
-    claim_tx_hash      TEXT,
-    sign_attempts      INTEGER NOT NULL DEFAULT 0,
-    claim_attempts     INTEGER NOT NULL DEFAULT 0,
-    last_error_code    TEXT,
-    last_error_detail  TEXT,
-    last_attempt_at    INTEGER,
-    locked             INTEGER NOT NULL DEFAULT 0,
-    transient_attempts INTEGER NOT NULL DEFAULT 0
+    request_uuid            TEXT PRIMARY KEY,
+    tunnel_request_id       TEXT,
+    client_address          TEXT NOT NULL,
+    node_address            TEXT NOT NULL,
+    data_amount             INTEGER NOT NULL,
+    total_price             INTEGER NOT NULL,
+    signature               TEXT,
+    created_at              INTEGER NOT NULL,
+    claimed_at              INTEGER,
+    claim_tx_hash           TEXT,
+    sign_attempts           INTEGER NOT NULL DEFAULT 0,
+    claim_attempts          INTEGER NOT NULL DEFAULT 0,
+    last_error_code         TEXT,
+    last_error_detail       TEXT,
+    last_attempt_at         INTEGER,
+    locked                  INTEGER NOT NULL DEFAULT 0,
+    transient_attempts      INTEGER NOT NULL DEFAULT 0,
+    reconcile_block_number  INTEGER,
+    claim_tx_pending        TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_signed_receipts_unclaimed
@@ -84,6 +99,8 @@ class StoredReceipt:
     last_attempt_at: int | None = None
     locked: bool = False
     transient_attempts: int = 0
+    reconcile_block_number: int | None = None
+    claim_tx_pending: str | None = None
 
     @property
     def view(self) -> str:
@@ -223,6 +240,27 @@ class ReceiptStore:
                                 "ADD COLUMN transient_attempts "
                                 "INTEGER NOT NULL DEFAULT 0"
                             )
+                    if current < 5:
+                        # v4 → v5: settlement-hardening columns (P3).
+                        # Idempotent ALTER TABLE ADD COLUMN — mirrors
+                        # the v3→v4 leg so a half-finished migration
+                        # (concurrent writer scenario) is self-healing
+                        # rather than crashing on duplicate-column.
+                        existing = {
+                            row[1] for row in conn.execute(
+                                "PRAGMA table_info(signed_receipts)"
+                            )
+                        }
+                        v5_columns = [
+                            ("reconcile_block_number", "INTEGER"),
+                            ("claim_tx_pending", "TEXT"),
+                        ]
+                        for name, ddl in v5_columns:
+                            if name not in existing:
+                                conn.execute(
+                                    f"ALTER TABLE signed_receipts "
+                                    f"ADD COLUMN {name} {ddl}"
+                                )
                 # Persist the version bump. Read it back to verify the
                 # write actually stuck — a previous bug surfaced when a
                 # concurrent writer caused the pragma to silently fail
@@ -388,7 +426,8 @@ class ReceiptStore:
         "request_uuid, tunnel_request_id, client_address, node_address, "
         "data_amount, total_price, signature, created_at, claimed_at, "
         "claim_tx_hash, sign_attempts, claim_attempts, last_error_code, "
-        "last_error_detail, last_attempt_at, locked, transient_attempts"
+        "last_error_detail, last_attempt_at, locked, transient_attempts, "
+        "reconcile_block_number, claim_tx_pending"
     )
 
     @staticmethod
@@ -413,6 +452,8 @@ class ReceiptStore:
             last_attempt_at=int(r[14]) if r[14] is not None else None,
             locked=bool(r[15]),
             transient_attempts=int(r[16] or 0),
+            reconcile_block_number=int(r[17]) if r[17] is not None else None,
+            claim_tx_pending=r[18],
         )
 
     async def unclaimed(
@@ -941,6 +982,217 @@ class ReceiptStore:
                      ORDER BY last_attempt_at ASC
                     """,
                     (reasons.CLAIM_TX_TIMEOUT, cutoff),
+                ).fetchall()
+            return [self._row_to_stored(r) for r in rows]
+
+        return await asyncio.to_thread(_do)
+
+    # ------------------------------------------------------------------
+    # P3/L4 — stale-fork reconcile finality
+    # ------------------------------------------------------------------
+
+    async def mark_external_with_block(
+        self, request_uuids: list[str], block_number: int,
+    ) -> int:
+        """Mark a batch of timed-out rows as ``claim_tx_hash="external"``
+        and stamp the block height of the chain query that resolved them.
+
+        The block height is consulted later (see
+        :func:`list_pending_external_unfinalized`) to decide whether the
+        decision is past finality (trustworthy) or still inside the
+        soak window (must be re-verified next tick in case the RPC was
+        on a stale fork). Idempotent: a re-run with the same UUIDs
+        won't bump ``claimed_at`` again — the SQL is gated on
+        ``claimed_at IS NULL``.
+        """
+        if not request_uuids:
+            return 0
+        now = int(time.time())
+
+        def _do() -> int:
+            placeholders = ",".join("?" * len(request_uuids))
+            with self._connect() as conn:
+                cur = conn.execute(
+                    f"""
+                    UPDATE signed_receipts
+                       SET claimed_at             = ?,
+                           claim_tx_hash          = 'external',
+                           reconcile_block_number = ?
+                     WHERE request_uuid IN ({placeholders})
+                       AND claimed_at IS NULL
+                    """,
+                    [now, int(block_number), *request_uuids],
+                )
+                return cur.rowcount
+
+        return await asyncio.to_thread(_do)
+
+    async def list_pending_external_unfinalized(
+        self, current_block: int, finality_blocks: int, limit: int = 100,
+    ) -> list[StoredReceipt]:
+        """External-marked rows still inside the finality soak window.
+
+        Returns rows where ``claim_tx_hash="external"`` and
+        ``current_block - reconcile_block_number < finality_blocks``.
+        Once the difference crosses ``finality_blocks`` the row is
+        considered settled permanently — see L4 in the v1.5 plan.
+
+        Rows missing ``reconcile_block_number`` (legacy pre-v5 rows
+        that were marked external before this column existed) are
+        treated as past finality and excluded from re-checks.
+        """
+        soak_floor = int(current_block) - int(finality_blocks) + 1
+
+        def _do() -> list[StoredReceipt]:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT {self._STORED_COLUMNS}
+                      FROM signed_receipts
+                     WHERE claim_tx_hash = 'external'
+                       AND claimed_at IS NOT NULL
+                       AND reconcile_block_number IS NOT NULL
+                       AND reconcile_block_number >= ?
+                     ORDER BY reconcile_block_number ASC
+                     LIMIT ?
+                    """,
+                    (int(soak_floor), int(limit)),
+                ).fetchall()
+            return [self._row_to_stored(r) for r in rows]
+
+        return await asyncio.to_thread(_do)
+
+    async def revert_external_mark(self, request_uuid: str) -> bool:
+        """Undo an in-flight ``external`` mark when the chain disagrees.
+
+        Used when the reaper's finality recheck flips ``isNonceUsed``
+        back to ``false``. The row returns to the claim queue with
+        ``CLAIM_TX_TIMEOUT`` so the regular timeout-resolution loop
+        owns it again. ``claim_attempts`` is NOT incremented — the
+        operator didn't cause the stale-fork situation.
+        """
+        def _do() -> int:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    """
+                    UPDATE signed_receipts
+                       SET claimed_at             = NULL,
+                           claim_tx_hash          = NULL,
+                           reconcile_block_number = NULL,
+                           last_error_code        = ?,
+                           last_error_detail      = NULL,
+                           last_attempt_at        = ?
+                     WHERE request_uuid = ?
+                       AND claim_tx_hash = 'external'
+                       AND locked = 0
+                    """,
+                    (reasons.CLAIM_TX_TIMEOUT, int(time.time()), request_uuid),
+                )
+                return cur.rowcount
+
+        return (await asyncio.to_thread(_do)) > 0
+
+    # ------------------------------------------------------------------
+    # P3/L5 — claim-in-flight sentinel
+    # ------------------------------------------------------------------
+
+    async def set_claim_tx_pending(
+        self, request_uuids: list[str], tx_hash: str,
+    ) -> int:
+        """Stamp the deterministic tx hash on rows about to be broadcast.
+
+        Called BEFORE :func:`web3.eth.send_raw_transaction` so a crash
+        between broadcast and ``mark_claimed`` leaves a breadcrumb the
+        in-flight reconciler can resolve via ``isNonceUsed`` on
+        startup. Idempotent: only updates rows that aren't already
+        claimed or pending another tx.
+        """
+        if not request_uuids:
+            return 0
+
+        def _do() -> int:
+            placeholders = ",".join("?" * len(request_uuids))
+            with self._connect() as conn:
+                cur = conn.execute(
+                    f"""
+                    UPDATE signed_receipts
+                       SET claim_tx_pending = ?
+                     WHERE request_uuid IN ({placeholders})
+                       AND claimed_at IS NULL
+                       AND locked = 0
+                    """,
+                    [tx_hash, *request_uuids],
+                )
+                return cur.rowcount
+
+        return await asyncio.to_thread(_do)
+
+    async def clear_claim_tx_pending(self, request_uuid: str) -> bool:
+        """Drop the in-flight breadcrumb without touching anything else.
+
+        Used when the reconciler determined the on-chain nonce is NOT
+        used — the tx never landed, the row should re-enter the claim
+        queue with a fresh attempt budget.
+        """
+        def _do() -> int:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    """
+                    UPDATE signed_receipts
+                       SET claim_tx_pending = NULL
+                     WHERE request_uuid = ?
+                    """,
+                    (request_uuid,),
+                )
+                return cur.rowcount
+
+        return (await asyncio.to_thread(_do)) > 0
+
+    async def reset_claim_attempts(self, request_uuid: str) -> bool:
+        """Reset ``claim_attempts`` to zero for a single row.
+
+        Used by the in-flight reconciler when it determines a pending
+        tx was never broadcast — the failed-pre-broadcast row shouldn't
+        burn the operator's retry budget on the next claim run.
+        """
+        def _do() -> int:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    """
+                    UPDATE signed_receipts
+                       SET claim_attempts = 0
+                     WHERE request_uuid = ?
+                       AND claimed_at IS NULL
+                       AND locked = 0
+                    """,
+                    (request_uuid,),
+                )
+                return cur.rowcount
+
+        return (await asyncio.to_thread(_do)) > 0
+
+    async def list_inflight(self, limit: int = 100) -> list[StoredReceipt]:
+        """Rows with a pending broadcast that never confirmed.
+
+        Selects ``claim_tx_pending IS NOT NULL AND claimed_at IS NULL``.
+        Locked rows are excluded — once a row is terminal the
+        operator's intervention is required regardless of pending
+        breadcrumbs. The in-flight reconciler walks this set on daemon
+        startup.
+        """
+        def _do() -> list[StoredReceipt]:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT {self._STORED_COLUMNS}
+                      FROM signed_receipts
+                     WHERE claim_tx_pending IS NOT NULL
+                       AND claimed_at IS NULL
+                       AND locked = 0
+                     ORDER BY last_attempt_at ASC
+                     LIMIT ?
+                    """,
+                    (int(limit),),
                 ).fetchall()
             return [self._row_to_stored(r) for r in rows]
 
