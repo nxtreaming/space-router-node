@@ -31,6 +31,13 @@ SIGN_TIMEOUT = "SIGN_TIMEOUT"
 # It moves to ``failed_retryable`` so the operator sees it; not terminal —
 # manual ``unlock_for_retry`` resets the budget.
 SIGN_TRANSIENT_BUDGET_EXHAUSTED = "SIGN_TRANSIENT_BUDGET_EXHAUSTED"
+# Local pre-flight signature recovery (P3/L6) — the gateway-signed
+# receipt's EIP-712 recovered signer doesn't match
+# ``GATEWAY_PAYER_ADDRESS``. Terminal: a chain-side ``claimBatch`` would
+# revert atomically and poison the whole batch, so we drop the row
+# instead. Operator inspection only — there's no retry that can fix a
+# bad signature.
+SIGN_VERIFY_FAILED = "SIGN_VERIFY_FAILED"
 
 # --- Claim-side codes --------------------------------------------------------
 
@@ -49,6 +56,7 @@ SIGN_CODES = frozenset({
     SIGN_EXPIRED_NO_PENDING,
     SIGN_TIMEOUT,
     SIGN_TRANSIENT_BUDGET_EXHAUSTED,
+    SIGN_VERIFY_FAILED,
 })
 
 CLAIM_CODES = frozenset({
@@ -84,6 +92,11 @@ MESSAGES: dict[str, str] = {
         "Receipt repeatedly failed to sign (~24h of transient errors). "
         "Check connectivity to the coordination API; the operator may "
         "need to retry manually after the issue clears.",
+    SIGN_VERIFY_FAILED:
+        "The gateway's signature on this receipt did not verify locally "
+        "against the configured payer address. Submitting it would "
+        "revert the whole batch on-chain, so it has been dropped. "
+        "Contact support if this happens repeatedly.",
     CLAIM_REVERTED:
         "The on-chain claim transaction reverted.",
     CLAIM_RPC_UNREACHABLE:

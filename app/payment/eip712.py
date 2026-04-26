@@ -19,6 +19,14 @@ from eth_utils import to_bytes, to_checksum_address
 
 logger = logging.getLogger(__name__)
 
+# EIP-712 domain `name` and `version` baked into the on-chain
+# TokenPaymentEscrow during deployment (escrow-payment/test/shared/constants.ts).
+# These are the same across all current deployments; if a future
+# deployment changes them, this constant has to move too.
+ESCROW_DOMAIN_NAME = "TokenPaymentEscrow"
+ESCROW_DOMAIN_VERSION = "1"
+
+
 # EIP-712 types matching TokenPaymentEscrow.sol Receipt struct
 RECEIPT_EIP712_TYPES = {
     "EIP712Domain": [

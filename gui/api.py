@@ -512,83 +512,56 @@ def _claim_runner(only_uuid: str | None, include_retryable: bool) -> dict:
     """Background claim job.
 
     Serialised across CLI / GUI / double-clicks via a cross-platform
-    file lock on ``~/.spacerouter/claim.lock`` (``fcntl.flock`` on
-    POSIX, ``msvcrt.locking`` on Windows). If the lock is already held,
+    file lock on ``~/.spacerouter/claim.lock`` — see
+    :mod:`app.payment.claim_lock`. If the lock is already held,
     returns ``{noop: True}`` so the UI stays calm rather than showing
     an error when a second concurrent click comes in.
     """
-    import sys as _sys
-    from pathlib import Path
-
     from app.main import load_settings
     from app.payment.settlement import claim_all
+    from app.payment.claim_lock import acquire_claim_lock, ClaimLockHeld
     from app.identity import load_or_create_identity, KeystorePassphraseRequired
 
-    is_windows = _sys.platform == "win32"
-
     settings = load_settings()
-    lock_path = Path(settings.RECEIPT_STORE_PATH).expanduser().parent / "claim.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
 
-    fd = open(lock_path, "a+" if is_windows else "w")
     try:
-        try:
-            if is_windows:
-                import msvcrt
-                fd.seek(0)
-                msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (BlockingIOError, OSError):
-            return {"noop": True, "reason": "claim_in_progress"}
+        with acquire_claim_lock(settings):
+            # Use identity key as settlement key unless operator overrides.
+            settlement_key = os.environ.get("SR_SETTLEMENT_KEY", "")
+            if not settlement_key:
+                try:
+                    identity_key, _ = load_or_create_identity(
+                        settings.IDENTITY_KEY_PATH, settings.IDENTITY_PASSPHRASE,
+                    )
+                    settlement_key = (
+                        identity_key if identity_key.startswith("0x")
+                        else "0x" + identity_key
+                    )
+                except KeystorePassphraseRequired:
+                    return {
+                        "ok": False,
+                        "error": "Identity key is encrypted. Set a passphrase "
+                                 "and restart before claiming.",
+                    }
 
-        # Use identity key as settlement key unless operator overrides.
-        settlement_key = os.environ.get("SR_SETTLEMENT_KEY", "")
-        if not settlement_key:
             try:
-                identity_key, _ = load_or_create_identity(
-                    settings.IDENTITY_KEY_PATH, settings.IDENTITY_PASSPHRASE,
-                )
-                settlement_key = (
-                    identity_key if identity_key.startswith("0x")
-                    else "0x" + identity_key
-                )
-            except KeystorePassphraseRequired:
-                return {
-                    "ok": False,
-                    "error": "Identity key is encrypted. Set a passphrase "
-                             "and restart before claiming.",
-                }
+                results = _run_async(claim_all(
+                    settings, settlement_key,
+                    include_retryable=include_retryable,
+                    only_uuids=[only_uuid] if only_uuid else None,
+                ))
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc)}
 
-        try:
-            results = _run_async(claim_all(
-                settings, settlement_key,
-                include_retryable=include_retryable,
-                only_uuids=[only_uuid] if only_uuid else None,
-            ))
-        except ValueError as exc:
-            return {"ok": False, "error": str(exc)}
-
-        summary = {
-            "batches": len(results),
-            "submitted": sum(r.submitted for r in results),
-            "reconciled": sum(r.skipped_as_already_claimed for r in results),
-            "failed_batches": sum(1 for r in results if r.error),
-            "locked_after_failure": sum(r.locked_after_failure for r in results),
-            "tx_hashes": [r.tx_hash for r in results if r.tx_hash],
-            "reasons": [r.reason_code for r in results if r.reason_code],
-        }
-        return {"ok": True, "summary": summary}
-    finally:
-        try:
-            if is_windows:
-                import msvcrt
-                fd.seek(0)
-                msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
-        except Exception:
-            pass
-        fd.close()
+            summary = {
+                "batches": len(results),
+                "submitted": sum(r.submitted for r in results),
+                "reconciled": sum(r.skipped_as_already_claimed for r in results),
+                "failed_batches": sum(1 for r in results if r.error),
+                "locked_after_failure": sum(r.locked_after_failure for r in results),
+                "tx_hashes": [r.tx_hash for r in results if r.tx_hash],
+                "reasons": [r.reason_code for r in results if r.reason_code],
+            }
+            return {"ok": True, "summary": summary}
+    except ClaimLockHeld:
+        return {"noop": True, "reason": "claim_in_progress"}

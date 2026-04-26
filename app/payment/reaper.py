@@ -9,7 +9,10 @@ The reaper periodically walks those rows and calls
 ``isNonceUsed(client, uuid)`` on the escrow contract:
 
 * If the nonce IS used, the tx landed — mark the row claimed with a
-  synthetic ``tx_hash="external"``.
+  synthetic ``tx_hash="external"``. The block height of the resolving
+  query is recorded; subsequent reaper ticks revisit the row until
+  ``FINALITY_BLOCKS_FOR_RECONCILE`` has passed (P3/L4) so a stale-fork
+  RPC can't permanently mis-mark a row.
 * If the nonce is NOT used after ``_SETTLE_GRACE_SECONDS``, the tx
   was dropped from the mempool — clear the error so the next normal
   ``claim_all`` picks it up.
@@ -24,6 +27,7 @@ import asyncio
 import logging
 import os
 
+from app import constants
 from app.config import Settings
 from app.payment import reasons
 from app.payment.receipt_store import get_store
@@ -109,12 +113,17 @@ class ClaimReaper:
     async def tick(self) -> dict:
         """Single reaper pass. Returns a summary dict for tests / CLI.
 
-        Two passes:
+        Three passes:
 
         1. **Timeout resolution** — for rows stuck in ``CLAIM_TX_TIMEOUT``,
-           query ``isNonceUsed`` and either mark claimed or clear the
-           error.
-        2. **Reorg reconciliation** — for rows recently marked claimed
+           query ``isNonceUsed`` and either mark claimed (with the
+           current block height stamped) or clear the error.
+        2. **Finality recheck (P3/L4)** — for rows previously marked
+           ``external`` whose ``reconcile_block_number`` is still
+           inside the ``FINALITY_BLOCKS_FOR_RECONCILE`` soak window,
+           re-query ``isNonceUsed``. If it flipped back to false the
+           original RPC was on a stale fork; revert the mark.
+        3. **Reorg reconciliation** — for rows recently marked claimed
            with a real tx_hash, re-verify the nonce still shows used.
            A chain reorg that undid the tx is rare on Creditcoin but
            possible; if we detect it, undo the claim so the row
@@ -124,8 +133,9 @@ class ClaimReaper:
         await store.initialize()
 
         timeout_summary = await self._tick_timeouts(store)
+        finality_summary = await self._tick_finality_recheck(store)
         reorg_summary = await self._tick_reorgs(store)
-        return {**timeout_summary, **reorg_summary}
+        return {**timeout_summary, **finality_summary, **reorg_summary}
 
     async def _tick_timeouts(self, store) -> dict:
         rows = await store.list_timed_out_claims(
@@ -134,7 +144,7 @@ class ClaimReaper:
         if not rows:
             return {"checked": 0, "reconciled": 0, "cleared": 0}
 
-        def _check(rs) -> tuple[list[str], list[str]]:
+        def _check(rs) -> tuple[list[str], list[str], int | None]:
             from web3 import Web3
             from eth_utils import to_checksum_address
 
@@ -143,13 +153,22 @@ class ClaimReaper:
                 request_kwargs={"timeout": 10},
             ))
             if not w3.is_connected():
-                return [], []
+                return [], [], None
             contract = w3.eth.contract(
                 address=Web3.to_checksum_address(
                     self._settings.ESCROW_CONTRACT_ADDRESS,
                 ),
                 abi=_load_abi_once(),
             )
+            # Read the block height alongside isNonceUsed so the
+            # finality recheck pass can decide whether to trust the
+            # decision. We capture once per tick rather than per row —
+            # all UUIDs in this batch share the same "as of" block.
+            try:
+                block_at_check = int(w3.eth.block_number)
+            except Exception as e:
+                logger.debug("Reaper: block_number fetch failed: %s", e)
+                block_at_check = None
             landed: list[str] = []
             dropped: list[str] = []
             for sr in rs:
@@ -168,15 +187,28 @@ class ClaimReaper:
                     landed.append(sr.receipt.request_uuid)
                 else:
                     dropped.append(sr.receipt.request_uuid)
-            return landed, dropped
+            return landed, dropped, block_at_check
 
-        landed, dropped = await asyncio.to_thread(_check, rows)
+        landed, dropped, block_at_check = await asyncio.to_thread(_check, rows)
 
         reconciled = 0
         if landed:
-            reconciled = await store.mark_claimed(landed, tx_hash="external")
+            if block_at_check is None:
+                # No block height available — fall back to the legacy
+                # behaviour (no finality soak). Better than dropping
+                # the reconcile entirely.
+                reconciled = await store.mark_claimed(
+                    landed, tx_hash="external",
+                )
+            else:
+                reconciled = await store.mark_external_with_block(
+                    landed, block_at_check,
+                )
             logger.info(
-                "Reaper: reconciled %d timed-out claims as landed", reconciled,
+                "Reaper: reconciled %d timed-out claims as landed "
+                "(at block=%s, finality=%d)",
+                reconciled, block_at_check,
+                constants.FINALITY_BLOCKS_FOR_RECONCILE,
             )
 
         cleared = 0
@@ -190,6 +222,93 @@ class ClaimReaper:
             )
 
         return {"checked": len(rows), "reconciled": reconciled, "cleared": cleared}
+
+    async def _tick_finality_recheck(self, store) -> dict:
+        """Re-verify recently external-marked rows still inside the soak window.
+
+        L4 in the v1.5 plan: if the RPC was on a stale fork when we
+        marked a row external, ``isNonceUsed`` returned a false
+        positive. Until ``FINALITY_BLOCKS_FOR_RECONCILE`` blocks have
+        passed, we revisit the row and revert the mark if the chain
+        now disagrees.
+
+        Bounded by the same ``_REORG_BATCH_LIMIT`` cap as the reorg
+        pass to keep RPC load predictable.
+        """
+        # Need the current block first to compute the soak window.
+        def _block_number() -> int | None:
+            from web3 import Web3
+            w3 = Web3(Web3.HTTPProvider(
+                self._settings.ESCROW_CHAIN_RPC,
+                request_kwargs={"timeout": 10},
+            ))
+            if not w3.is_connected():
+                return None
+            try:
+                return int(w3.eth.block_number)
+            except Exception as e:
+                logger.debug("Reaper finality: block_number failed: %s", e)
+                return None
+
+        current_block = await asyncio.to_thread(_block_number)
+        if current_block is None:
+            return {"finality_checked": 0, "finality_reverted": 0}
+
+        finality_blocks = int(constants.FINALITY_BLOCKS_FOR_RECONCILE)
+        rows = await store.list_pending_external_unfinalized(
+            current_block=current_block,
+            finality_blocks=finality_blocks,
+            limit=_REORG_BATCH_LIMIT,
+        )
+        if not rows:
+            return {"finality_checked": 0, "finality_reverted": 0}
+
+        def _recheck(rs) -> list[str]:
+            from web3 import Web3
+            from eth_utils import to_checksum_address
+
+            w3 = Web3(Web3.HTTPProvider(
+                self._settings.ESCROW_CHAIN_RPC,
+                request_kwargs={"timeout": 10},
+            ))
+            if not w3.is_connected():
+                return []
+            contract = w3.eth.contract(
+                address=Web3.to_checksum_address(
+                    self._settings.ESCROW_CONTRACT_ADDRESS,
+                ),
+                abi=_load_abi_once(),
+            )
+            flipped: list[str] = []
+            for sr in rs:
+                try:
+                    used = contract.functions.isNonceUsed(
+                        to_checksum_address(sr.receipt.client_address),
+                        sr.receipt.request_uuid,
+                    ).call()
+                except Exception as e:
+                    logger.debug(
+                        "Reaper finality: isNonceUsed failed uuid=%s: %s",
+                        sr.receipt.request_uuid, e,
+                    )
+                    continue
+                if not used:
+                    flipped.append(sr.receipt.request_uuid)
+            return flipped
+
+        flipped = await asyncio.to_thread(_recheck, rows)
+        reverted = 0
+        for u in flipped:
+            if await store.revert_external_mark(u):
+                reverted += 1
+        if reverted:
+            logger.warning(
+                "Reaper: stale-fork detected — reverted %d external "
+                "marks (block %d, finality=%d). Rows return to "
+                "CLAIM_TX_TIMEOUT for the next tick to re-resolve.",
+                reverted, current_block, finality_blocks,
+            )
+        return {"finality_checked": len(rows), "finality_reverted": reverted}
 
     async def _tick_reorgs(self, store) -> dict:
         """Verify recently-claimed rows still show as settled on-chain.

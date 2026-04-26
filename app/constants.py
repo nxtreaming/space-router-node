@@ -45,3 +45,13 @@ REGISTER_MAX_RETRIES: int = 5
 # Lease duration (seconds) we ask the home router to keep the UPnP /
 # NAT-PMP mapping alive. 0 = permanent (some routers ignore that).
 UPNP_LEASE_DURATION: int = 3600
+
+# ── Settlement / on-chain ────────────────────────────────────────────
+
+# How many blocks past a reaper "isNonceUsed=false → mark external"
+# decision before we trust the result permanently. Below the threshold
+# the reaper revisits the row on its next tick and re-queries the chain
+# in case a stale RPC fork resolved (P3/L4). Creditcoin testnet has
+# ~5s block time, so 6 ≈ a 30s soak — comfortably past every routine
+# fork-tip wobble we've seen on seethis.
+FINALITY_BLOCKS_FOR_RECONCILE: int = 6
