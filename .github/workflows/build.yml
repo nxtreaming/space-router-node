@@ -461,7 +461,7 @@ jobs:
 
       # Build the CLI binary in the same job so we can embed it inside
       # SpaceRouter.app on macOS. Without this, users who install via
-      # the .dmg have no way to reach --claim / --receipts / --qa-inject.
+      # the .dmg have no way to reach --claim / --receipts.
       # The standalone CLI artifact is still published separately by the
       # `build` job above; this copy is additive.
       - name: Build embedded CLI binary (macOS)
