@@ -11,6 +11,7 @@ import ipaddress
 import logging
 from urllib.parse import urlparse
 
+from app import constants
 from app.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -372,7 +373,7 @@ async def handle_connect(
     # DNS-resolved SSRF check — prevent DNS rebinding attacks
     try:
         target_reader, target_writer = await _resolve_and_connect(
-            target_host, target_port, settings.REQUEST_TIMEOUT,
+            target_host, target_port, constants.REQUEST_TIMEOUT,
         )
     except _DNSRebindingError as exc:
         logger.warning("CONNECT blocked (DNS rebinding) — %s%s", exc, rid_tag)
@@ -395,8 +396,8 @@ async def handle_connect(
             client_writer,
             target_reader,
             target_writer,
-            settings.BUFFER_SIZE,
-            settings.RELAY_TIMEOUT,
+            constants.BUFFER_SIZE,
+            constants.RELAY_TIMEOUT,
         )
 
         # Leg 2: provider submits generated receipt to coord API after relay.
@@ -481,7 +482,7 @@ async def handle_http_forward(
     # DNS-resolved SSRF check — prevent DNS rebinding attacks
     try:
         target_reader, target_writer = await _resolve_and_connect(
-            host, port, settings.REQUEST_TIMEOUT,
+            host, port, constants.REQUEST_TIMEOUT,
         )
     except _DNSRebindingError as exc:
         logger.warning("HTTP forward blocked (DNS rebinding) — %s%s", exc, rid_tag)
@@ -514,7 +515,7 @@ async def handle_http_forward(
         if content_length > 0:
             remaining = content_length
             while remaining > 0:
-                chunk = await client_reader.read(min(remaining, settings.BUFFER_SIZE))
+                chunk = await client_reader.read(min(remaining, constants.BUFFER_SIZE))
                 if not chunk:
                     break
                 target_writer.write(chunk)
@@ -525,7 +526,7 @@ async def handle_http_forward(
         try:
             response_line = await asyncio.wait_for(
                 target_reader.readuntil(b"\r\n"),
-                timeout=settings.REQUEST_TIMEOUT,
+                timeout=constants.REQUEST_TIMEOUT,
             )
         except (asyncio.TimeoutError, asyncio.IncompleteReadError):
             client_writer.write(_gateway_timeout("Target server timed out", request_id))
@@ -562,7 +563,7 @@ async def handle_http_forward(
         if resp_content_length:
             remaining = int(resp_content_length)
             while remaining > 0:
-                chunk = await target_reader.read(min(remaining, settings.BUFFER_SIZE))
+                chunk = await target_reader.read(min(remaining, constants.BUFFER_SIZE))
                 if not chunk:
                     break
                 client_writer.write(chunk)
@@ -573,7 +574,7 @@ async def handle_http_forward(
                 try:
                     size_line = await asyncio.wait_for(
                         target_reader.readuntil(b"\r\n"),
-                        timeout=settings.REQUEST_TIMEOUT,
+                        timeout=constants.REQUEST_TIMEOUT,
                     )
                 except (asyncio.TimeoutError, asyncio.IncompleteReadError):
                     break
@@ -595,7 +596,7 @@ async def handle_http_forward(
         else:
             # No content-length or chunked: read until connection close
             while True:
-                chunk = await target_reader.read(settings.BUFFER_SIZE)
+                chunk = await target_reader.read(constants.BUFFER_SIZE)
                 if not chunk:
                     break
                 client_writer.write(chunk)
@@ -614,7 +615,7 @@ async def handle_http_forward(
 # ---------------------------------------------------------------------------
 
 # Global connection semaphore — initialized lazily on first use.
-# The limit comes from Settings.MAX_CONNECTIONS.
+# The limit comes from app.constants.MAX_CONNECTIONS.
 _connection_semaphore: asyncio.Semaphore | None = None
 _active_connections: int = 0
 
@@ -661,11 +662,11 @@ async def handle_client(
     global _active_connections
     peer = writer.get_extra_info("peername")
 
-    sem = _get_semaphore(settings.MAX_CONNECTIONS)
+    sem = _get_semaphore(constants.MAX_CONNECTIONS)
     if not sem._value:  # noqa: SLF001 — fast check without awaiting
         logger.warning(
             "Connection limit reached (%d) — rejecting %s",
-            settings.MAX_CONNECTIONS, peer,
+            constants.MAX_CONNECTIONS, peer,
         )
         try:
             writer.write(_service_unavailable())
@@ -685,7 +686,7 @@ async def handle_client(
         from app.node_logging import activity as _activity  # noqa: E402
         counted = False
         try:
-            result = await _read_request_head(reader, settings.REQUEST_TIMEOUT)
+            result = await _read_request_head(reader, constants.REQUEST_TIMEOUT)
             if result is None:
                 writer.write(_bad_request("Malformed request"))
                 await writer.drain()

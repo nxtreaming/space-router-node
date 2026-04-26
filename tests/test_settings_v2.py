@@ -29,9 +29,11 @@ class TestSchema:
         assert s.node.mtls_enabled is True
         assert s.node.log_level == "INFO"
         assert s.node.registration_mode == "auto"
+        assert s.node.referral_code is None
         assert s.wallet.staking_address is None
         assert s.wallet.identity_passphrase_set is False
         assert s.coordination.url.startswith("https://")
+        assert s.escrow.enabled is False
         assert s.escrow.contract_address is None
         assert s.claim.auto_claim_enabled is False
         assert s.claim.auto_claim_threshold_space_wei == "10000000000000000000"
@@ -158,15 +160,17 @@ SR_UPNP_ENABLED=false
 SR_MTLS_ENABLED=true
 SR_LOG_LEVEL=DEBUG
 SR_REGISTRATION_MODE=v2
+SR_REFERRAL_CODE=ALPHA-2026
 SR_STAKING_ADDRESS=0xC0A06CDdAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 SR_COLLECTION_ADDRESS=0xCd11ECbBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
 SR_IDENTITY_KEY_PATH=/custom/path/identity.key
 SR_IDENTITY_PASSPHRASE=correct horse battery staple
 SR_COORDINATION_API_URL=https://example.com/coord
+SR_PAYMENT_ENABLED=true
 SR_ESCROW_CONTRACT_ADDRESS=0xCCCC740e4e9175301a24FB6d22bA184b8ec07528
 SR_ESCROW_CHAIN_RPC=https://rpc.cc3-testnet.creditcoin.network
 SR_ESCROW_CHAIN_ID=102031
-SR_GATEWAY_PAYER_ADDRESS=0xGGGG740e4e9175301a24FB6d22bA184b8ec07528
+SR_GATEWAY_PAYER_ADDRESS=0xeEee740e4e9175301a24FB6d22bA184b8ec07528
 SR_NODE_RATE_PER_GB=42000000000000000000
 SR_RECEIPT_REAPER_GRACE_SECONDS=400
 SR_RECEIPT_REAPER_INTERVAL_SECONDS=600
@@ -203,11 +207,14 @@ class TestMigration:
         raw = json.loads(settings_path.read_text())
         assert "correct horse" not in json.dumps(raw)
 
+        assert s.node.referral_code == "ALPHA-2026"
+
         assert s.coordination.url == "https://example.com/coord"
+        assert s.escrow.enabled is True
         assert s.escrow.contract_address.lower().startswith("0xcccc")
         assert s.escrow.chain_rpc.startswith("https://rpc.cc3-testnet")
         assert s.escrow.chain_id == 102031
-        assert s.escrow.gateway_payer_address.lower().startswith("0xgggg")
+        assert s.escrow.gateway_payer_address.lower().startswith("0xeeee")
         assert s.escrow.leg2_rate_per_gb == "42000000000000000000"
 
         assert s.claim.batch_size == 25
@@ -352,3 +359,138 @@ class TestLoader:
 
         s = load_provider_settings(directory=tmp_path)
         assert s == Settings()
+
+
+# ── Field validators ─────────────────────────────────────────────────
+
+
+_GOOD_ADDR = "0x" + "ab" * 20
+_GOOD_ADDR_2 = "0x" + "cd" * 20
+
+
+class TestWalletAddressValidator:
+    def test_good_addresses_are_normalised(self):
+        # Mixed-case hex body is fine; the validator lowercases the body
+        # but expects the ``0x`` prefix verbatim (per app.wallet's regex).
+        mixed = "0xAbCdAbCdAbCdAbCdAbCdAbCdAbCdAbCdAbCdAbCd"
+        s = Settings(
+            wallet=WalletSection(
+                staking_address=mixed,
+                collection_address=_GOOD_ADDR_2,
+            )
+        )
+        assert s.wallet.staking_address == mixed.lower()
+        assert s.wallet.collection_address == _GOOD_ADDR_2.lower()
+
+    def test_empty_string_passes(self):
+        s = Settings(wallet=WalletSection(staking_address=""))
+        assert s.wallet.staking_address == ""
+
+    def test_missing_0x_is_accepted_by_underlying_validator(self):
+        # ``app.wallet.validate_wallet_address`` accepts bare 40-hex too;
+        # keep that contract here so existing config doesn't break.
+        bare = "ab" * 20
+        s = Settings(wallet=WalletSection(staking_address=bare))
+        assert s.wallet.staking_address == "0x" + "ab" * 20
+
+    def test_too_short_address_rejected(self):
+        with pytest.raises(Exception):  # noqa: B017 — pydantic.ValidationError or ValueError
+            Settings(wallet=WalletSection(staking_address="0x" + "ab" * 19))
+
+    def test_non_hex_address_rejected(self):
+        with pytest.raises(Exception):  # noqa: B017
+            Settings(wallet=WalletSection(staking_address="0x" + "zz" * 20))
+
+    def test_escrow_addresses_validated_too(self):
+        with pytest.raises(Exception):  # noqa: B017
+            Settings(escrow=EscrowSection(contract_address="not-an-addr"))
+        with pytest.raises(Exception):  # noqa: B017
+            Settings(
+                escrow=EscrowSection(gateway_payer_address="0x" + "qq" * 20)
+            )
+
+    def test_good_escrow_addresses_normalised(self):
+        s = Settings(
+            escrow=EscrowSection(
+                contract_address=_GOOD_ADDR,
+                gateway_payer_address=_GOOD_ADDR_2,
+            )
+        )
+        assert s.escrow.contract_address == _GOOD_ADDR.lower()
+        assert s.escrow.gateway_payer_address == _GOOD_ADDR_2.lower()
+
+
+class TestUrlValidator:
+    def test_https_url_ok(self):
+        s = Settings(coordination=CoordinationSection(url="https://x.example/"))
+        assert s.coordination.url == "https://x.example/"
+
+    def test_http_url_ok_on_test_variant(self):
+        s = Settings(
+            build_variant="test",
+            coordination=CoordinationSection(url="http://localhost:8000"),
+        )
+        assert s.coordination.url == "http://localhost:8000"
+
+    def test_http_url_rejected_on_production(self):
+        with pytest.raises(Exception, match="https://"):  # noqa: B017
+            Settings(
+                build_variant="production",
+                coordination=CoordinationSection(url="http://example.com"),
+            )
+
+    def test_http_url_rejected_on_staging(self):
+        with pytest.raises(Exception, match="https://"):  # noqa: B017
+            Settings(
+                build_variant="staging",
+                coordination=CoordinationSection(url="http://staging.example.com"),
+            )
+
+    def test_garbage_scheme_rejected(self):
+        with pytest.raises(Exception, match="http"):  # noqa: B017
+            Settings(coordination=CoordinationSection(url="ftp://nope"))
+
+    def test_chain_rpc_https_required_in_production(self):
+        with pytest.raises(Exception, match="https://"):  # noqa: B017
+            Settings(
+                build_variant="production",
+                escrow=EscrowSection(chain_rpc="http://rpc.example.com"),
+            )
+
+    def test_chain_rpc_http_allowed_in_test(self):
+        s = Settings(
+            build_variant="test",
+            escrow=EscrowSection(chain_rpc="http://localhost:8545"),
+        )
+        assert s.escrow.chain_rpc == "http://localhost:8545"
+
+
+class TestNewSchemaFields:
+    def test_referral_code_round_trips(self, tmp_path):
+        from app.settings_v2 import NodeSection
+        s = Settings(node=NodeSection(referral_code="DAVE-2026"))
+        path = tmp_path / "settings.json"
+        s.save(path)
+        loaded = Settings.load(path)
+        assert loaded.node.referral_code == "DAVE-2026"
+
+    def test_escrow_enabled_round_trips(self, tmp_path):
+        s = Settings(escrow=EscrowSection(enabled=True))
+        path = tmp_path / "settings.json"
+        s.save(path)
+        loaded = Settings.load(path)
+        assert loaded.escrow.enabled is True
+
+    def test_payment_enabled_env_maps_to_escrow_enabled(self, tmp_path):
+        env_path = tmp_path / "spacerouter.env"
+        env_path.write_text("SR_PAYMENT_ENABLED=true\n")
+        settings_path = tmp_path / "settings.json"
+        s = Settings.migrate_from_env_file(env_path, settings_path)
+        assert s.escrow.enabled is True
+
+    def test_referral_code_env_maps_to_node_section(self, tmp_path):
+        env_path = tmp_path / "spacerouter.env"
+        env_path.write_text("SR_REFERRAL_CODE=BONUS-X\n")
+        settings_path = tmp_path / "settings.json"
+        s = Settings.migrate_from_env_file(env_path, settings_path)
+        assert s.node.referral_code == "BONUS-X"

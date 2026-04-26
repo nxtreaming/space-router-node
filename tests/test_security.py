@@ -311,8 +311,11 @@ class TestKeyPermissions:
 
 class TestErrorSanitization:
     @pytest.mark.asyncio
-    async def test_bad_gateway_does_not_leak_target(self, settings):
+    async def test_bad_gateway_does_not_leak_target(self, settings, monkeypatch):
         """502 error should NOT reveal the target host:port."""
+        # The 30-second default REQUEST_TIMEOUT (now an app.constants value)
+        # is too long for this test's 10s outer wait — shorten it.
+        monkeypatch.setattr("app.constants.REQUEST_TIMEOUT", 5.0)
         home, home_port = await _start_home_node(settings)
         try:
             reader, writer = await asyncio.open_connection(

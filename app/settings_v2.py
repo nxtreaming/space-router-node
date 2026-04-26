@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import dotenv_values
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,32 @@ SCHEMA_VERSION = 1
 
 class _Section(BaseModel):
     model_config = ConfigDict(extra="ignore")
+
+
+def _validate_evm_address(value: str | None) -> str | None:
+    """Pydantic validator helper — defer to ``app.wallet`` for the rules.
+
+    Imported lazily inside the function body to avoid module-import cycles
+    (``app.wallet`` is light today but the rule keeps it that way as the
+    codebase grows). Returns the canonical lowercase ``0x``-prefixed form.
+    Raises ``ValueError`` for invalid addresses; Pydantic surfaces that as
+    a structured validation error.
+    """
+    if value is None or value == "":
+        return value
+    from app.wallet import validate_wallet_address
+    return validate_wallet_address(value)
+
+
+def _validate_http_url(value: str | None) -> str | None:
+    """Reject anything that doesn't start with http:// or https://."""
+    if value is None or value == "":
+        return value
+    if not (value.startswith("http://") or value.startswith("https://")):
+        raise ValueError(
+            f"URL must start with http:// or https://, got {value!r}"
+        )
+    return value
 
 
 class NodeSection(_Section):
@@ -46,6 +72,7 @@ class NodeSection(_Section):
     mtls_enabled: bool = True
     log_level: str = "INFO"
     registration_mode: str = "auto"
+    referral_code: str | None = None
 
 
 class WalletSection(_Section):
@@ -54,18 +81,39 @@ class WalletSection(_Section):
     settlement_key_path: str = "~/.spacerouter/identity.key"
     identity_passphrase_set: bool = False
 
+    @field_validator("staking_address", "collection_address")
+    @classmethod
+    def _check_addr(cls, v: str | None) -> str | None:
+        return _validate_evm_address(v)
+
 
 class CoordinationSection(_Section):
     url: str = "https://spacerouter-coordination-api-test.fly.dev"
 
+    @field_validator("url")
+    @classmethod
+    def _check_url(cls, v: str | None) -> str | None:
+        return _validate_http_url(v)
+
 
 class EscrowSection(_Section):
+    enabled: bool = False
     contract_address: str | None = None
     chain_rpc: str | None = None
     chain_id: int | None = None
     gateway_payer_address: str | None = None
     leg2_rate_per_gb: str | None = None  # wei as string
     synced_from_coord_at: str | None = None  # ISO8601
+
+    @field_validator("contract_address", "gateway_payer_address")
+    @classmethod
+    def _check_addr(cls, v: str | None) -> str | None:
+        return _validate_evm_address(v)
+
+    @field_validator("chain_rpc")
+    @classmethod
+    def _check_rpc(cls, v: str | None) -> str | None:
+        return _validate_http_url(v)
 
 
 class ClaimSection(_Section):
@@ -107,6 +155,33 @@ class Settings(BaseModel):
     escrow: EscrowSection = Field(default_factory=EscrowSection)
     claim: ClaimSection = Field(default_factory=ClaimSection)
     receipts: ReceiptsSection = Field(default_factory=ReceiptsSection)
+
+    # ── Cross-field validation ───────────────────────────────────────
+
+    @model_validator(mode="after")
+    def _enforce_https_outside_test(self) -> "Settings":
+        """Production / staging builds must not talk to plaintext HTTP.
+
+        On test builds we tolerate ``http://`` so QA can point at a local
+        coordination API or RPC node without rolling certs. Any other
+        variant ("production", "staging", anything custom) requires
+        ``https://`` for both the coordination API and the chain RPC.
+
+        Empty values are allowed — those are "not set yet" and get
+        caught later by the wizard / pre-flight checks.
+        """
+        if self.build_variant == "test":
+            return self
+        for label, value in (
+            ("coordination.url", self.coordination.url),
+            ("escrow.chain_rpc", self.escrow.chain_rpc),
+        ):
+            if value and not value.startswith("https://"):
+                raise ValueError(
+                    f"{label} must use https:// on build_variant={self.build_variant!r} "
+                    f"(got {value!r}). Plaintext is only allowed in test builds."
+                )
+        return self
 
     # ── Load / save ──────────────────────────────────────────────────
 
@@ -278,6 +353,8 @@ class Settings(BaseModel):
             node["log_level"] = v
         if (v := take("SR_REGISTRATION_MODE")) is not None:
             node["registration_mode"] = v
+        if (v := take("SR_REFERRAL_CODE")) is not None:
+            node["referral_code"] = v
 
         # ── wallet ───────────────────────────────────────────────────
         if (v := take("SR_STAKING_ADDRESS")) is not None:
@@ -296,6 +373,8 @@ class Settings(BaseModel):
             coordination["url"] = v
 
         # ── escrow ───────────────────────────────────────────────────
+        if (v := take("SR_PAYMENT_ENABLED")) is not None:
+            escrow["enabled"] = _parse_bool(v)
         if (v := take("SR_ESCROW_CONTRACT_ADDRESS")) is not None:
             escrow["contract_address"] = v
         if (v := take("SR_ESCROW_CHAIN_RPC")) is not None:

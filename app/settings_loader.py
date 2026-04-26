@@ -48,10 +48,23 @@ def env_path(directory: Path | None = None) -> Path:
 def load_provider_settings(directory: Path | None = None) -> Settings:
     """Resolve provider settings using the full Track P0 chain.
 
-    *directory* defaults to ``~/.spacerouter``. The GUI (``gui/config_store.py``)
-    passes its platform-native config dir explicitly.
+    *directory* defaults to ``~/.spacerouter``. With v1.5's path
+    unification both GUI and CLI now agree on this location, so callers
+    rarely need to override.
     """
     directory = directory or _spacerouter_dir()
+
+    # Step 0 — one-shot copy of legacy macOS Application Support data.
+    # No-op on Linux/Windows or when the sentinel says we already did it.
+    # Done BEFORE we look for settings.json so the migrated file ends up
+    # exactly where load() expects it.
+    try:
+        from app.legacy_migration import maybe_migrate_legacy_macos
+        maybe_migrate_legacy_macos(directory)
+    except Exception:  # noqa: BLE001
+        # Best-effort: never let a migration glitch block startup.
+        logger.warning("legacy macOS migration skipped due to error", exc_info=True)
+
     s_path = settings_path(directory)
     e_path = env_path(directory)
 
