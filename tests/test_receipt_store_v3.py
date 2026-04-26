@@ -32,13 +32,18 @@ def store(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_fresh_db_is_v3(store, tmp_path):
+async def test_fresh_db_is_at_current_version(store, tmp_path):
+    """Schema version follows ``_SCHEMA_VERSION`` (currently v4 — added
+    transient_attempts in P4). Fresh DB must land on the current
+    version so callers don't re-run no-op migrations."""
+    from app.payment.receipt_store import _SCHEMA_VERSION
     await store.initialize()
     with sqlite3.connect(tmp_path / "receipts.db") as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == _SCHEMA_VERSION
         cols = {row[1] for row in conn.execute("PRAGMA table_info(signed_receipts)")}
     assert {"sign_attempts", "claim_attempts", "last_error_code",
-            "last_error_detail", "last_attempt_at", "locked"} <= cols
+            "last_error_detail", "last_attempt_at", "locked",
+            "transient_attempts"} <= cols
 
 
 @pytest.mark.asyncio
@@ -77,8 +82,13 @@ async def test_partial_v2_to_v3_migration_is_self_healing(tmp_path):
     store = ReceiptStore(db_path)
     await store.initialize()
 
+    from app.payment.receipt_store import _SCHEMA_VERSION
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == _SCHEMA_VERSION
+        # The v3→v4 leg is also self-healing — transient_attempts must
+        # be present after the migration runs against the v3 partial.
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(signed_receipts)")}
+    assert "transient_attempts" in cols
 
 
 @pytest.mark.asyncio
@@ -117,13 +127,14 @@ async def test_v2_to_v3_migration_preserves_rows(tmp_path):
     store = ReceiptStore(db_path)
     await store.initialize()
 
+    from app.payment.receipt_store import _SCHEMA_VERSION
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == _SCHEMA_VERSION
         row = conn.execute(
             "SELECT request_uuid, signature, sign_attempts, claim_attempts, "
-            "last_error_code, locked FROM signed_receipts"
+            "last_error_code, locked, transient_attempts FROM signed_receipts"
         ).fetchone()
-    assert row == ("u1", "0xsigned", 0, 0, None, 0)
+    assert row == ("u1", "0xsigned", 0, 0, None, 0, 0)
 
 
 @pytest.mark.asyncio
