@@ -25,9 +25,40 @@ if ($BasePort -eq 0) { $BasePort = 19090 }
 $PortBindingPort = $BasePort
 $ShutdownPort = $BasePort + 1
 
+# The daemon enforces a single-instance lock at ~/.spacerouter/daemon.lock.
+# That's the right behaviour for real operators (we don't want two daemons
+# fighting over the same receipts.db), but the smoke test runs two daemon
+# instances back-to-back on the same host — Test-PortBinding then
+# Test-CleanShutdown — so we explicitly tear the lock down between cases.
+# The path is derived from app/paths.py::config_dir() and ignores
+# SR_RECEIPT_STORE_PATH (settings_from_provider_settings rebuilds it from
+# config_dir), so per-test path overrides do NOT decouple the lock.
+$script:DaemonLockPath = Join-Path $env:USERPROFILE ".spacerouter\daemon.lock"
+
 function Log($msg) { Write-Host "  [INFO]  $msg" }
 function Pass($msg) { Write-Host "  [PASS]  $msg"; $script:Pass++ }
 function Fail($msg) { Write-Host "  [FAIL]  $msg"; $script:Fail++ }
+
+# Stop a daemon process, wait for it to fully exit, then remove the
+# daemon.lock file so the next sub-test can acquire it. The msvcrt lock
+# releases when the handle is closed at process death, but the file
+# itself sticks around with the prior PID inside it — and on Windows
+# the OS sometimes lags a beat between TerminateProcess and the kernel
+# closing the handle, which is exactly the window where the stale-PID
+# branch in _acquire_daemon_lock can mis-fire under CI load. Explicit
+# delete after Wait removes the ambiguity.
+function Stop-DaemonAndClearLock {
+    param([System.Diagnostics.Process]$Proc, [int]$WaitMs = 10000)
+    if ($null -eq $Proc) { return }
+    try {
+        if (-not $Proc.HasExited) {
+            Stop-Process -Id $Proc.Id -Force -ErrorAction SilentlyContinue
+        }
+        $Proc.WaitForExit($WaitMs) | Out-Null
+    }
+    catch { }
+    Remove-Item -Force -ErrorAction SilentlyContinue $script:DaemonLockPath
+}
 
 # Reliable TCP port check using TcpClient (Test-NetConnection is unreliable on CI runners)
 function Test-TcpPort {
@@ -146,11 +177,6 @@ function Test-VersionFlag {
 function Test-PortBinding {
     # Use a dedicated port so TIME_WAIT state doesn't affect other tests
     $env:SR_NODE_PORT = "$PortBindingPort"
-    # Separate receipts-store path per sub-test so the daemon-lock's
-    # TerminateProcess-lag on Windows can't cause false "another instance"
-    # failures in the next sub-test. Real operators run one daemon per
-    # store; only CI hits two in succession.
-    $env:SR_RECEIPT_STORE_PATH = "$env:TEMP\sr-smoke-portbinding\receipts.db"
     Log "Testing port binding on port $($env:SR_NODE_PORT)..."
 
     $proc = Start-Process -FilePath $Binary -PassThru -NoNewWindow
@@ -161,15 +187,15 @@ function Test-PortBinding {
 
     if ($proc.HasExited) {
         Fail "Binary exited prematurely with code $($proc.ExitCode)"
+        # Even on premature exit, drop the lock file so the next test
+        # isn't blocked by a stale-PID daemon.lock entry.
+        Remove-Item -Force -ErrorAction SilentlyContinue $script:DaemonLockPath
         return
     }
 
-    # Clean up
-    try {
-        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-        $proc.WaitForExit(5000) | Out-Null
-    }
-    catch { }
+    # Clean up: stop the daemon, wait for full exit, drop the lock file
+    # so Test-CleanShutdown's daemon can acquire it.
+    Stop-DaemonAndClearLock -Proc $proc -WaitMs 5000
 
     if ($listening) {
         Pass "Binary is listening on port $($env:SR_NODE_PORT)"
@@ -183,9 +209,6 @@ function Test-PortBinding {
 function Test-CleanShutdown {
     # Use a different port than Test-PortBinding to avoid TIME_WAIT conflicts
     $env:SR_NODE_PORT = "$ShutdownPort"
-    # Separate receipts-store so the daemon-lock from Test-PortBinding's
-    # killed binary can't block this one. See note above.
-    $env:SR_RECEIPT_STORE_PATH = "$env:TEMP\sr-smoke-shutdown\receipts.db"
     Log "Testing clean shutdown on port $($env:SR_NODE_PORT)..."
 
     $proc = Start-Process -FilePath $Binary -PassThru -NoNewWindow
@@ -212,6 +235,10 @@ function Test-CleanShutdown {
 
     # Wait up to 10 seconds for exit
     $exited = $proc.WaitForExit(10000)
+
+    # Always tidy the lock file — if the test fails, the next CI run on
+    # a recycled runner image shouldn't inherit a stuck lock.
+    Remove-Item -Force -ErrorAction SilentlyContinue $script:DaemonLockPath
 
     if ($exited) {
         Pass "Process stopped successfully (exit code $($proc.ExitCode))"

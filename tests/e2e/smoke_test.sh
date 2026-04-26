@@ -25,6 +25,17 @@ log()  { echo "  [INFO]  $*"; }
 pass() { echo "  [PASS]  $*"; PASS=$((PASS + 1)); }
 fail() { echo "  [FAIL]  $*"; FAIL=$((FAIL + 1)); }
 
+# The daemon enforces a single-instance lock at ~/.spacerouter/daemon.lock
+# (see app/main.py::_acquire_daemon_lock). It's keyed off RECEIPT_STORE_PATH's
+# parent directory, but settings_from_provider_settings rebuilds that path
+# from app/paths.py::config_dir(), so SR_RECEIPT_STORE_PATH overrides are
+# silently ignored. The smoke test runs two daemon instances back-to-back
+# (test_port_binding then test_clean_shutdown), so we explicitly drop the
+# lock file between them. POSIX flock releases on process death, but
+# clearing the on-disk PID line makes the test deterministic and mirrors
+# the Windows path.
+DAEMON_LOCK_PATH="${HOME}/.spacerouter/daemon.lock"
+
 # Start a mock coordination API that responds to POST /nodes and PATCH requests
 start_mock_api() {
     local MOCK_PORT=19099
@@ -114,10 +125,6 @@ test_version_flag() {
 test_port_binding() {
     # Use a dedicated port so TIME_WAIT state doesn't affect other tests
     export SR_NODE_PORT="$PORT_BINDING_PORT"
-    # Separate receipts-store per sub-test so the daemon-lock can't carry
-    # across. Real operators run one daemon per store; only CI hits two
-    # in succession.
-    export SR_RECEIPT_STORE_PATH="${TMPDIR:-/tmp}/sr-smoke-portbinding/receipts.db"
     log "Testing port binding on port $SR_NODE_PORT..."
 
     "$BINARY" &
@@ -152,9 +159,11 @@ test_port_binding() {
         sleep 1
     done
 
-    # Clean up
+    # Clean up: stop the daemon, wait for it to actually exit, then
+    # remove the lock file so test_clean_shutdown's daemon can acquire it.
     kill "$PID" 2>/dev/null || true
     wait "$PID" 2>/dev/null || true
+    rm -f "$DAEMON_LOCK_PATH"
 
     if [ -n "$LISTENING" ]; then
         pass "Binary is listening on port $SR_NODE_PORT"
@@ -167,8 +176,6 @@ test_port_binding() {
 test_clean_shutdown() {
     # Use a different port than test_port_binding to avoid TIME_WAIT conflicts
     export SR_NODE_PORT="$SHUTDOWN_PORT"
-    # Separate receipts-store from port-binding (see comment there).
-    export SR_RECEIPT_STORE_PATH="${TMPDIR:-/tmp}/sr-smoke-shutdown/receipts.db"
     log "Testing clean shutdown via SIGTERM on port $SR_NODE_PORT..."
 
     "$BINARY" &
@@ -205,6 +212,9 @@ test_clean_shutdown() {
         if ! kill -0 "$PID" 2>/dev/null; then
             wait "$PID" 2>/dev/null
             EXIT_CODE=$?
+            # Drop the lock file regardless of result so a recycled
+            # runner image can't inherit a stuck daemon.lock.
+            rm -f "$DAEMON_LOCK_PATH"
             if [ "$EXIT_CODE" -eq 0 ] || [ "$EXIT_CODE" -eq 143 ]; then
                 pass "Clean shutdown (exit code $EXIT_CODE)"
             else
@@ -218,6 +228,7 @@ test_clean_shutdown() {
     # Force kill if still running
     kill -9 "$PID" 2>/dev/null || true
     wait "$PID" 2>/dev/null || true
+    rm -f "$DAEMON_LOCK_PATH"
     fail "Binary did not exit within 10 seconds after SIGTERM"
 }
 
