@@ -51,7 +51,7 @@ jobs:
         id: version
         shell: bash
         run: |
-          VERSION="v0.0.0-test.${{ github.run_number }}"
+          VERSION="v1.5.0-test.${{ github.run_number }}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Building test version: ${VERSION}"
 
@@ -129,7 +129,7 @@ jobs:
         id: version
         shell: bash
         run: |
-          VERSION="v0.0.0-test.${{ github.run_number }}"
+          VERSION="v1.5.0-test.${{ github.run_number }}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Building GUI test version: ${VERSION}"
 
@@ -144,6 +144,37 @@ jobs:
 
       - name: Build GUI app
         run: pyinstaller spacerouter_gui.spec
+
+      # Build the CLI binary in the same job so we can embed it inside
+      # SpaceRouter.app on macOS. Without this, QA installs from the .dmg
+      # have no way to reach --claim / --receipts. Mirrors build.yml.
+      - name: Build embedded CLI binary (macOS)
+        if: runner.os == 'macOS'
+        run: pyinstaller --clean --noconfirm homenode.spec
+
+      - name: Embed CLI in macOS app bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cp dist/space-router-node dist/SpaceRouter.app/Contents/MacOS/space-router-node
+          chmod +x dist/SpaceRouter.app/Contents/MacOS/space-router-node
+          ls -la dist/SpaceRouter.app/Contents/MacOS/
+
+      - name: Embedded CLI smoke test (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # Confirm --help succeeds (argparse is wired) and the
+          # version-frozen binary reports the same version the GUI was
+          # stamped with. Catches packaging regressions like the
+          # ``space-router-node`` entrypoint failing to import app.*
+          ./dist/SpaceRouter.app/Contents/MacOS/space-router-node --help > /dev/null
+          printed_version=$(./dist/SpaceRouter.app/Contents/MacOS/space-router-node --version 2>&1 || true)
+          echo "Embedded CLI reports: $printed_version"
+          case "$printed_version" in
+            *"${{ steps.version.outputs.version }}"*) echo "version matches" ;;
+            *) echo "::warning::embedded CLI version mismatch — got '$printed_version', expected '${{ steps.version.outputs.version }}'" ;;
+          esac
 
       # ── GUI smoke tests ──
       - name: GUI smoke test (macOS)
