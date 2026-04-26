@@ -27,6 +27,10 @@ SIGN_REJECTED_UNKNOWN_REQUEST = "SIGN_REJECTED_UNKNOWN_REQUEST"
 SIGN_REJECTED_CLOCK_SKEW = "SIGN_REJECTED_CLOCK_SKEW"
 SIGN_EXPIRED_NO_PENDING = "SIGN_EXPIRED_NO_PENDING"
 SIGN_TIMEOUT = "SIGN_TIMEOUT"
+# Escalation when a row spent ~24h hitting transient errors (429/5xx/timeout).
+# It moves to ``failed_retryable`` so the operator sees it; not terminal —
+# manual ``unlock_for_retry`` resets the budget.
+SIGN_TRANSIENT_BUDGET_EXHAUSTED = "SIGN_TRANSIENT_BUDGET_EXHAUSTED"
 
 # --- Claim-side codes --------------------------------------------------------
 
@@ -44,6 +48,7 @@ SIGN_CODES = frozenset({
     SIGN_REJECTED_CLOCK_SKEW,
     SIGN_EXPIRED_NO_PENDING,
     SIGN_TIMEOUT,
+    SIGN_TRANSIENT_BUDGET_EXHAUSTED,
 })
 
 CLAIM_CODES = frozenset({
@@ -75,6 +80,10 @@ MESSAGES: dict[str, str] = {
     SIGN_EXPIRED_NO_PENDING:
         "The gateway never recorded this relay. Receipt expired in "
         "the signing queue (typically 24h). No action required.",
+    SIGN_TRANSIENT_BUDGET_EXHAUSTED:
+        "Receipt repeatedly failed to sign (~24h of transient errors). "
+        "Check connectivity to the coordination API; the operator may "
+        "need to retry manually after the issue clears.",
     CLAIM_REVERTED:
         "The on-chain claim transaction reverted.",
     CLAIM_RPC_UNREACHABLE:

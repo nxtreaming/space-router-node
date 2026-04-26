@@ -28,26 +28,33 @@ logger = logging.getLogger(__name__)
 # last_error_code, last_error_detail, last_attempt_at, locked. These
 # support the non-blocking "Claim outstanding" UX and the 2-try cap with
 # a terminal lock after repeated failure.
-_SCHEMA_VERSION = 3
+#
+# Schema v4 adds ``transient_attempts`` to the submitter resilience track
+# (P4) — counts consecutive 429 / 5xx / timeout / DNS failures so the
+# poller can apply per-row exponential backoff and escalate after ~24h.
+# Distinct from ``sign_attempts`` (which only counts permanent failures
+# against the 2-try retry budget).
+_SCHEMA_VERSION = 4
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signed_receipts (
-    request_uuid      TEXT PRIMARY KEY,
-    tunnel_request_id TEXT,
-    client_address    TEXT NOT NULL,
-    node_address      TEXT NOT NULL,
-    data_amount       INTEGER NOT NULL,
-    total_price       INTEGER NOT NULL,
-    signature         TEXT,
-    created_at        INTEGER NOT NULL,
-    claimed_at        INTEGER,
-    claim_tx_hash     TEXT,
-    sign_attempts     INTEGER NOT NULL DEFAULT 0,
-    claim_attempts    INTEGER NOT NULL DEFAULT 0,
-    last_error_code   TEXT,
-    last_error_detail TEXT,
-    last_attempt_at   INTEGER,
-    locked            INTEGER NOT NULL DEFAULT 0
+    request_uuid       TEXT PRIMARY KEY,
+    tunnel_request_id  TEXT,
+    client_address     TEXT NOT NULL,
+    node_address       TEXT NOT NULL,
+    data_amount        INTEGER NOT NULL,
+    total_price        INTEGER NOT NULL,
+    signature          TEXT,
+    created_at         INTEGER NOT NULL,
+    claimed_at         INTEGER,
+    claim_tx_hash      TEXT,
+    sign_attempts      INTEGER NOT NULL DEFAULT 0,
+    claim_attempts     INTEGER NOT NULL DEFAULT 0,
+    last_error_code    TEXT,
+    last_error_detail  TEXT,
+    last_attempt_at    INTEGER,
+    locked             INTEGER NOT NULL DEFAULT 0,
+    transient_attempts INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_signed_receipts_unclaimed
@@ -76,6 +83,7 @@ class StoredReceipt:
     last_error_detail: str | None = None
     last_attempt_at: int | None = None
     locked: bool = False
+    transient_attempts: int = 0
 
     @property
     def view(self) -> str:
@@ -200,6 +208,21 @@ class ReceiptStore:
                             "WHERE last_error_code IS NOT NULL "
                             "AND claimed_at IS NULL"
                         )
+                    if current < 4:
+                        # v3 → v4: per-row transient backoff counter for
+                        # the receipt submitter (P4). Idempotent: only
+                        # add the column if it isn't already present.
+                        existing = {
+                            row[1] for row in conn.execute(
+                                "PRAGMA table_info(signed_receipts)"
+                            )
+                        }
+                        if "transient_attempts" not in existing:
+                            conn.execute(
+                                "ALTER TABLE signed_receipts "
+                                "ADD COLUMN transient_attempts "
+                                "INTEGER NOT NULL DEFAULT 0"
+                            )
                 # Persist the version bump. Read it back to verify the
                 # write actually stuck — a previous bug surfaced when a
                 # concurrent writer caused the pragma to silently fail
@@ -249,13 +272,20 @@ class ReceiptStore:
         await asyncio.to_thread(_do)
 
     async def mark_signed(self, request_uuid: str, signature: str) -> bool:
-        """Fill in the signature for an unsigned row. Returns True if updated."""
+        """Fill in the signature for an unsigned row. Returns True if updated.
+
+        Also resets ``transient_attempts`` so a row that previously hit
+        429/5xx storms but eventually got signed starts fresh on any
+        future failures (e.g. claim-side flakes never see leftover
+        sign-side counter state).
+        """
         def _do() -> int:
             with self._connect() as conn:
                 cur = conn.execute(
                     """
                     UPDATE signed_receipts
-                       SET signature = ?
+                       SET signature = ?,
+                           transient_attempts = 0
                      WHERE request_uuid = ?
                        AND signature IS NULL
                     """,
@@ -265,6 +295,63 @@ class ReceiptStore:
 
         n = await asyncio.to_thread(_do)
         return n > 0
+
+    async def mark_transient_attempt(self, request_uuid: str) -> int:
+        """Bump the per-row transient retry counter and stamp last_attempt_at.
+
+        Used by the submitter when the coord API returns 429 / 5xx /
+        network-timeout / DNS error. Caller decides backoff via
+        :func:`transient_backoff_seconds`. Returns the new
+        ``transient_attempts`` value, or 0 if the row was not updated
+        (already claimed, locked, or signed).
+
+        Does NOT touch ``last_error_code`` — that field is reserved for
+        terminal codes; transient retries should not surface as
+        failed_retryable until the budget is exhausted.
+        """
+        now = int(time.time())
+
+        def _do() -> int | None:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    """
+                    UPDATE signed_receipts
+                       SET transient_attempts = transient_attempts + 1,
+                           last_attempt_at    = ?
+                     WHERE request_uuid = ?
+                       AND claimed_at IS NULL
+                       AND signature IS NULL
+                       AND locked = 0
+                    """,
+                    (now, request_uuid),
+                )
+                if cur.rowcount == 0:
+                    return None
+                row = conn.execute(
+                    "SELECT transient_attempts FROM signed_receipts "
+                    "WHERE request_uuid = ?",
+                    (request_uuid,),
+                ).fetchone()
+                return int(row[0]) if row else 0
+
+        result = await asyncio.to_thread(_do)
+        return int(result or 0)
+
+    async def reset_transient_attempts(self, request_uuid: str) -> bool:
+        """Clear ``transient_attempts`` without otherwise modifying the row."""
+        def _do() -> int:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    """
+                    UPDATE signed_receipts
+                       SET transient_attempts = 0
+                     WHERE request_uuid = ?
+                    """,
+                    (request_uuid,),
+                )
+                return cur.rowcount
+
+        return (await asyncio.to_thread(_do)) > 0
 
     async def store(self, receipt: Receipt, signature: str) -> None:
         """Backward-compatible: store a receipt that's already signed."""
@@ -301,7 +388,7 @@ class ReceiptStore:
         "request_uuid, tunnel_request_id, client_address, node_address, "
         "data_amount, total_price, signature, created_at, claimed_at, "
         "claim_tx_hash, sign_attempts, claim_attempts, last_error_code, "
-        "last_error_detail, last_attempt_at, locked"
+        "last_error_detail, last_attempt_at, locked, transient_attempts"
     )
 
     @staticmethod
@@ -325,6 +412,7 @@ class ReceiptStore:
             last_error_detail=r[13],
             last_attempt_at=int(r[14]) if r[14] is not None else None,
             locked=bool(r[15]),
+            transient_attempts=int(r[16] or 0),
         )
 
     async def unclaimed(
@@ -423,6 +511,87 @@ class ReceiptStore:
                     "SELECT COUNT(*) FROM signed_receipts WHERE signature IS NULL"
                 ).fetchone()
             return int(row[0] or 0)
+
+        return await asyncio.to_thread(_do)
+
+    async def count_unsigned_ready(self, now: int | None = None) -> int:
+        """Count rows that are unsigned, not locked, no terminal error, and
+        whose transient backoff window has elapsed.
+
+        Used by the receipt poller to gate its outbound GETs — when every
+        outstanding row is still in its 429/5xx backoff window, the
+        poller skips the tick rather than burning a request the coord
+        API will rate-limit again.
+        """
+        if now is None:
+            now = int(time.time())
+
+        def _do() -> int:
+            with self._connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                      FROM signed_receipts
+                     WHERE signature IS NULL
+                       AND claimed_at IS NULL
+                       AND locked = 0
+                       AND (last_error_code IS NULL OR last_error_code = '')
+                       AND (
+                           last_attempt_at IS NULL
+                        OR transient_attempts = 0
+                        OR ? >= last_attempt_at + MIN(
+                               60 * (1 << MIN(transient_attempts, 16)),
+                               3600
+                           )
+                       )
+                    """,
+                    (int(now),),
+                ).fetchone()
+            return int(row[0] or 0)
+
+        return await asyncio.to_thread(_do)
+
+    async def escalate_transient_budget_exhausted(
+        self, threshold: int, code: str, detail: str | None = None,
+    ) -> list[str]:
+        """Move pending_sign rows past the transient budget into
+        ``failed_retryable``.
+
+        Called by the poller every tick. Sets ``last_error_code`` to a
+        sign-side code so the row appears in the failed-retryable
+        bucket; preserves ``transient_attempts`` for diagnostics.
+        Returns the list of UUIDs that escalated this call.
+        """
+        now = int(time.time())
+
+        def _do() -> list[str]:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT request_uuid FROM signed_receipts
+                     WHERE signature IS NULL
+                       AND claimed_at IS NULL
+                       AND locked = 0
+                       AND (last_error_code IS NULL OR last_error_code = '')
+                       AND transient_attempts >= ?
+                    """,
+                    (int(threshold),),
+                ).fetchall()
+                if not rows:
+                    return []
+                uuids = [r[0] for r in rows]
+                placeholders = ",".join("?" * len(uuids))
+                conn.execute(
+                    f"""
+                    UPDATE signed_receipts
+                       SET last_error_code   = ?,
+                           last_error_detail = ?,
+                           last_attempt_at   = ?
+                     WHERE request_uuid IN ({placeholders})
+                    """,
+                    [code, detail, now, *uuids],
+                )
+                return uuids
 
         return await asyncio.to_thread(_do)
 
