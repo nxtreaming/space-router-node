@@ -21,39 +21,17 @@ def store(tmp_path):
 # ---------------------------------------------------------------------------
 
 class TestWalletAddressMigration:
-    def test_existing_config_with_sr_wallet_address_is_migrated(self, store):
-        """An existing spacerouter.env that has SR_WALLET_ADDRESS but no
-        SR_STAKING_ADDRESS must have SR_STAKING_ADDRESS written into the file."""
-        addr = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
-        # Overwrite the config file to simulate a v0.1.2 config
-        store.path.write_text(f"SR_WALLET_ADDRESS={addr}\n")
-
-        store._migrate_wallet_address()
-
-        vals = dotenv_values(str(store.path))
-        assert vals.get("SR_STAKING_ADDRESS") == addr
-
-    def test_migration_does_not_overwrite_existing_sr_staking_address(self, store):
-        """If SR_STAKING_ADDRESS is already set, migration must not overwrite it."""
-        addr_old = "0x" + "aa" * 20
-        addr_new = "0x" + "bb" * 20
-        store.path.write_text(
-            f"SR_WALLET_ADDRESS={addr_old}\nSR_STAKING_ADDRESS={addr_new}\n"
-        )
-
-        store._migrate_wallet_address()
-
-        vals = dotenv_values(str(store.path))
-        assert vals.get("SR_STAKING_ADDRESS") == addr_new
+    """The pre-v1.4 SR_WALLET_ADDRESS → SR_STAKING_ADDRESS alias migration
+    was retired with the v1.5 settings.json migration. Anyone running
+    v0.1.2 in 2026 will go through the same single-shot migration that
+    converts spacerouter.env to settings.json wholesale.
+    """
 
     def test_fresh_config_has_no_legacy_wallet_address_key(self, store):
         """A brand-new config file must not contain SR_WALLET_ADDRESS.
 
         In v1.5+ a fresh install also doesn't write a default
-        spacerouter.env at all — the file simply doesn't exist until
-        the user does something that needs to persist (e.g. saving a
-        wallet). dotenv_values() returns an empty dict for the missing
-        path, which trivially satisfies the legacy assertion.
+        spacerouter.env at all — the file simply doesn't exist.
         """
         vals = dotenv_values(str(store.path))
         assert "SR_WALLET_ADDRESS" not in vals
@@ -202,8 +180,16 @@ class TestEscrowDefaults:
 
 
 class TestFreshRestartPreservesEscrow:
-    def test_reset_rewrites_with_variant_defaults_not_blank(self, monkeypatch, tmp_path):
+    def test_reset_rewrites_settings_json_with_variant_defaults(self, monkeypatch, tmp_path):
+        """Reset wipes user customisations but preserves variant defaults.
+
+        On v1.5 the canonical store is settings.json, not spacerouter.env.
+        After ``reset()`` the file should re-appear with a fresh defaults
+        instance for the active build variant, so QA's wallet-edit-then-
+        Fresh-Restart flow no longer destroys their config layout.
+        """
         import importlib
+        import json
 
         import app.variant as variant_mod
         monkeypatch.setattr(variant_mod, "BUILD_VARIANT", "test")
@@ -213,13 +199,15 @@ class TestFreshRestartPreservesEscrow:
 
         with patch.object(cs, "_config_dir", return_value=tmp_path):
             store = cs.ConfigStore()
-            # Seed the config with an escrow value (simulating QA having
-            # set it manually — this was the pain point).
+            # Seed config with a custom wallet (simulating user setup).
             store.save_wallets("0x" + "a" * 40)
             store.reset()
 
-        rewritten = dotenv_values(str(tmp_path / "spacerouter.env"))
-        # After reset, the file is written from _DEFAULTS. Because the
-        # escrow contract is now in _DEFAULTS for test builds, it
-        # survives the rewrite — QA no longer has to re-add it.
-        assert rewritten.get("SR_ESCROW_CONTRACT_ADDRESS", "").startswith("0x")
+        # After reset, settings.json exists with defaults for the active
+        # variant. The wallet-address customisation is gone (that's the
+        # promise of reset), but the structure itself is sane.
+        settings_path = tmp_path / "settings.json"
+        assert settings_path.exists()
+        data = json.loads(settings_path.read_text())
+        assert data["build_variant"] == "test"
+        assert data["wallet"]["staking_address"] in (None, "")

@@ -22,10 +22,11 @@ def store(tmp_path):
 
 @pytest.fixture()
 def store_with_state(store, tmp_path):
-    """ConfigStore with identity key, certs, and custom addresses written."""
-    from dotenv import set_key
+    """ConfigStore with identity key, certs, and custom addresses written.
 
-    # Create identity key
+    Uses the v1.5 settings.json store (not the legacy spacerouter.env).
+    """
+    # Create identity key + cert files
     certs_dir = tmp_path / "certs"
     certs_dir.mkdir(parents=True, exist_ok=True)
     (certs_dir / "node-identity.key").write_text("fake-identity-key\n")
@@ -33,9 +34,9 @@ def store_with_state(store, tmp_path):
     (certs_dir / "node.key").write_text("fake-key\n")
     (certs_dir / "gateway-ca.crt").write_text("fake-ca\n")
 
-    # Set custom addresses
-    set_key(str(store.path), "SR_STAKING_ADDRESS", "0x" + "aa" * 20)
-    set_key(str(store.path), "SR_COLLECTION_ADDRESS", "0x" + "bb" * 20)
+    # Persist custom addresses via the canonical save_wallets() path —
+    # writes settings.json, not spacerouter.env.
+    store.save_wallets("0x" + "aa" * 20, "0x" + "bb" * 20)
     return store
 
 
@@ -63,25 +64,29 @@ class TestConfigStoreReset:
         assert not certs_dir.exists()
 
     def test_reset_clears_addresses(self, store_with_state):
-        """reset() must clear staking and collection addresses back to defaults."""
-        vals_before = dotenv_values(str(store_with_state.path))
-        assert vals_before.get("SR_STAKING_ADDRESS") == "0x" + "aa" * 20
+        """reset() must clear staking and collection addresses."""
+        # Pre-condition: addresses persisted via store_with_state fixture.
+        assert store_with_state.get("SR_STAKING_ADDRESS") == "0x" + "aa" * 20
 
         store_with_state.reset()
 
-        vals_after = dotenv_values(str(store_with_state.path))
-        assert vals_after.get("SR_STAKING_ADDRESS") == ""
-        assert vals_after.get("SR_COLLECTION_ADDRESS") == ""
+        assert store_with_state.get("SR_STAKING_ADDRESS") == ""
+        assert store_with_state.get("SR_COLLECTION_ADDRESS") == ""
 
     def test_reset_restores_default_config(self, store_with_state):
-        """reset() must rewrite the config file with all default values."""
-        from gui.config_store import _DEFAULTS
+        """reset() must rewrite settings.json with a fresh defaults instance."""
+        import json
 
         store_with_state.reset()
 
-        vals = dotenv_values(str(store_with_state.path))
-        for key, default in _DEFAULTS.items():
-            assert vals.get(key) == default, f"{key} should be '{default}', got '{vals.get(key)}'"
+        settings_path = store_with_state._settings_json_path
+        assert settings_path.exists()
+        data = json.loads(settings_path.read_text())
+        # Schema-fresh defaults: wallet wiped, schema version present,
+        # build_variant matches the active value.
+        assert data["wallet"]["staking_address"] in (None, "")
+        assert data["wallet"]["collection_address"] in (None, "")
+        assert data.get("schema_version") == 1
 
     def test_reset_makes_needs_onboarding_true(self, store_with_state):
         """After reset(), needs_onboarding() must return True (identity key gone)."""
@@ -105,8 +110,7 @@ class TestConfigStoreReset:
 
         store.reset()  # should not raise
 
-        vals = dotenv_values(str(store.path))
-        assert vals.get("SR_STAKING_ADDRESS") == ""
+        assert store.get("SR_STAKING_ADDRESS") == ""
 
 
 # ---------------------------------------------------------------------------

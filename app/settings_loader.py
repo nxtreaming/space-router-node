@@ -60,7 +60,11 @@ def load_provider_settings(directory: Path | None = None) -> Settings:
     # exactly where load() expects it.
     try:
         from app.legacy_migration import maybe_migrate_legacy_macos
-        maybe_migrate_legacy_macos(directory)
+        moved = maybe_migrate_legacy_macos(directory)
+        if moved:
+            logger.info("legacy macOS migration: migrated to %s", directory)
+        else:
+            logger.debug("legacy macOS migration: skipped (not applicable)")
     except Exception:  # noqa: BLE001
         # Best-effort: never let a migration glitch block startup.
         logger.warning("legacy macOS migration skipped due to error", exc_info=True)
@@ -90,7 +94,23 @@ def load_provider_settings(directory: Path | None = None) -> Settings:
         logger.info("settings loaded from: %s (seeded from environment)", s_path)
         return s
 
-    # Step 4 — no config anywhere. Return defaults; first-run wizard will
-    # create the file when it has values to persist.
-    logger.info("settings loaded from: <defaults> (no settings.json yet)")
-    return Settings()
+    # Step 4 — no config anywhere. Persist a defaults-only ``settings.json``
+    # so the next launch is JSON-driven (and so the daemon's first-run
+    # log clearly shows where canonical config lives). The pre-Phase-1
+    # behaviour was to return defaults without writing — that left the
+    # macOS test build's ``~/.spacerouter/`` empty after a cold start
+    # (only ``daemon.lock`` was created). See v1.5.0-test.80 E2E report.
+    s = Settings()
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        s.save(s_path)
+        logger.info("settings loaded from: %s (cold-start defaults persisted)", s_path)
+    except OSError as e:
+        # Best-effort: if disk is read-only or perms refuse, fall back
+        # to in-memory defaults rather than blocking startup.
+        logger.warning(
+            "could not persist cold-start settings.json at %s: %s — using defaults in memory",
+            s_path,
+            e,
+        )
+    return s

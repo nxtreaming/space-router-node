@@ -1,15 +1,25 @@
 """Persistent configuration storage for the SpaceRouter GUI.
 
-Reads/writes a spacerouter.env file in a platform-appropriate location.
+Reads / writes ``~/.spacerouter/settings.json`` (the v1.5 canonical
+config store; see ``app/settings_v2.py``). The legacy
+``spacerouter.env`` file path is still recognised for one-shot
+migration of pre-v1.5 installs but is never written to from this
+module.
+
+External callers (`gui/api.py`, etc.) keep using the SR_-prefixed
+key names they always have — `get("SR_STAKING_ADDRESS")`,
+`save_wallets(...)`, etc. — and a small translation layer maps those
+keys onto the structured settings.json fields under the hood.
 """
 
 import os
 import sys
 from pathlib import Path
 
-from dotenv import dotenv_values, set_key
+from dotenv import dotenv_values
 
 from app.identity import write_identity_key
+from app.settings_v2 import Settings as _SettingsV2
 from app.variant import BUILD_VARIANT
 from app.wallet import validate_wallet_address
 
@@ -97,43 +107,95 @@ def _config_dir() -> Path:
     return config_dir()
 
 
+# Mapping from legacy SR_* env-key names (still used by external
+# callers in gui/api.py) to (section_name, field_name) tuples in the
+# v1.5 settings_v2 schema. Keys without a mapping (notably
+# SR_IDENTITY_PASSPHRASE and SR_IDENTITY_KEY_PATH) are handled
+# separately because they're either env-only secrets or auto-derived
+# from config_dir().
+_SR_KEY_TO_FIELD: dict[str, tuple[str, str]] = {
+    "SR_COORDINATION_API_URL": ("coordination", "url"),
+    "SR_STAKING_ADDRESS": ("wallet", "staking_address"),
+    "SR_COLLECTION_ADDRESS": ("wallet", "collection_address"),
+    "SR_NODE_PORT": ("node", "port"),
+    "SR_UPNP_ENABLED": ("node", "upnp_enabled"),
+    "SR_PUBLIC_IP": ("node", "public_ip"),
+    "SR_PUBLIC_PORT": ("node", "public_port"),
+    "SR_MTLS_ENABLED": ("node", "mtls_enabled"),
+    "SR_LOG_LEVEL": ("node", "log_level"),
+    "SR_REGISTRATION_MODE": ("node", "registration_mode"),
+    "SR_NODE_LABEL": ("node", "label"),
+    "SR_REFERRAL_CODE": ("node", "referral_code"),
+    "SR_ESCROW_CONTRACT_ADDRESS": ("escrow", "contract_address"),
+    "SR_ESCROW_CHAIN_RPC": ("escrow", "chain_rpc"),
+    "SR_ESCROW_CHAIN_ID": ("escrow", "chain_id"),
+}
+
+
+def _stringify(value: object) -> str:
+    """Translate a settings.json value into the SR_*-shaped string the
+    legacy GUI callers expect."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _coerce_for_field(value, annot):
+    """Coerce a raw GUI input (almost always ``str``) into the type the
+    settings_v2 schema expects. Tolerant: empty string → ``None`` for
+    optional fields; ``"true"``/``"false"`` (any case) → ``bool``;
+    digit strings → ``int`` for int fields.
+    """
+    # Optional fields show up as a typing.Union/Optional in the model
+    # field annotation. Strings that look empty are taken to mean "unset".
+    if isinstance(value, str) and value == "":
+        return None
+    target_str = repr(annot)
+    if "bool" in target_str and not isinstance(value, bool):
+        if isinstance(value, str):
+            return value.strip().lower() in ("true", "1", "yes", "on")
+        return bool(value)
+    if "int" in target_str and not isinstance(value, int):
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value)
+    return value
+
+
 class ConfigStore:
-    """Manage spacerouter.env configuration file."""
+    """Manage settings.json (the v1.5 canonical config store).
+
+    A small SR_* translation layer keeps external callers in
+    ``gui/api.py`` working unchanged — they continue to use
+    ``get("SR_STAKING_ADDRESS")`` etc. and the store maps those to
+    the structured fields under the hood.
+    """
 
     def __init__(self) -> None:
         self._dir = _config_dir()
-        self._path = self._dir / "spacerouter.env"
+        self._path = self._dir / "spacerouter.env"  # legacy, migration-only
         self._settings_json_path = self._dir / "settings.json"
         self._ensure_file()
         # Track P0: opportunistic forward-migration. Idempotent — bails
         # immediately if settings.json already exists. Failures are logged
-        # but never raised; the legacy env-file flow remains usable.
+        # but never raised.
         self.migrate_to_settings_json()
 
     def migrate_to_settings_json(self) -> "object | None":
-        """Migrate this GUI's spacerouter.env into a sibling settings.json.
+        """Migrate an existing v1.4 ``spacerouter.env`` to ``settings.json``.
 
         Idempotent. Returns the loaded :py:class:`app.settings_v2.Settings`
         when something happens, ``None`` when settings.json already exists
         (so callers don't need to special-case the no-op path).
 
-        Now that ``_ensure_file()`` no longer auto-creates a default
-        spacerouter.env, the only time this fires is when an existing
-        v1.4-or-earlier user has a real env file on disk. The migration
-        renames it to ``.migrated.bak`` immediately so we don't keep two
-        sources of truth.
+        After migration the env file is renamed to ``.migrated.bak`` so
+        we don't keep two sources of truth.
         """
-        try:
-            from app.settings_v2 import Settings as _SettingsV2
-        except ImportError:
-            return None
-
         try:
             return _SettingsV2.migrate_from_env_file(
                 self._path,
                 self._settings_json_path,
-                # The env-file is now considered legacy. Rename to .bak
-                # right after the migration so the GUI stops touching it.
                 rename_after=True,
             )
         except Exception as e:  # noqa: BLE001
@@ -152,32 +214,61 @@ class ConfigStore:
         spacerouter.env from v1.4 still get migrated through
         :py:meth:`migrate_to_settings_json`, which then renames the env
         file to ``.migrated.bak``.
-
-        Pre-v1.5 this method seeded a default env file on first launch,
-        which scattered defaults all over disk before the user had even
-        chosen settings — see the v1.5 plan's "nuclear ensure_file fix".
         """
         self._dir.mkdir(parents=True, exist_ok=True)
-        if self._path.exists():
-            self._migrate_wallet_address()
 
-    def _migrate_wallet_address(self) -> None:
-        """Migrate SR_WALLET_ADDRESS → SR_STAKING_ADDRESS for existing configs."""
-        vals = dotenv_values(self._path)
-        if vals.get("SR_WALLET_ADDRESS") and not vals.get("SR_STAKING_ADDRESS"):
-            set_key(str(self._path), "SR_STAKING_ADDRESS", vals["SR_WALLET_ADDRESS"])
+    def _load_settings_v2(self) -> "_SettingsV2":
+        """Load settings.json (or a defaults instance if it doesn't exist)."""
+        if self._settings_json_path.exists():
+            return _SettingsV2.load(self._settings_json_path)
+        return _SettingsV2(build_variant=BUILD_VARIANT)
+
+    def _save_settings_v2(self, settings: "_SettingsV2") -> None:
+        settings.save(self._settings_json_path)
+
+    def _set_field(self, sr_key: str, value) -> None:
+        """Update one settings.json field via the SR_* legacy key alias."""
+        mapping = _SR_KEY_TO_FIELD.get(sr_key)
+        if mapping is None:
+            raise KeyError(f"No settings.json mapping for {sr_key!r}")
+        section_name, field_name = mapping
+        s = self._load_settings_v2()
+        section = getattr(s, section_name)
+        # Type-coerce strings → bool/int per the schema field type.
+        annot = type(section).model_fields[field_name].annotation
+        coerced = _coerce_for_field(value, annot)
+        setattr(section, field_name, coerced)
+        self._save_settings_v2(s)
 
     @property
     def path(self) -> Path:
-        return self._path
+        # External callers occasionally treat this as a file path for
+        # set_key()-style writes. Now points at settings.json so any
+        # remaining direct writes hit the canonical store. No external
+        # caller should be using this any more — flagged for removal.
+        return self._settings_json_path
 
     def load(self) -> dict[str, str | None]:
-        """Return all config values from the env file."""
-        return dotenv_values(self._path)
+        """Return all known SR_*-shaped values, derived from settings.json.
+
+        Kept for backwards-compat with ``cs.load()`` callers; new code
+        should use ``_load_settings_v2()`` directly.
+        """
+        s = self._load_settings_v2()
+        out: dict[str, str | None] = {}
+        for sr_key, (section_name, field_name) in _SR_KEY_TO_FIELD.items():
+            section = getattr(s, section_name)
+            out[sr_key] = _stringify(getattr(section, field_name))
+        return out
 
     def get(self, key: str, default: str = "") -> str:
-        vals = self.load()
-        return vals.get(key) or default
+        if key in _SR_KEY_TO_FIELD:
+            return self.load().get(key) or default
+        # Unmapped keys: secrets like SR_IDENTITY_PASSPHRASE live in env;
+        # auto-derived paths (SR_IDENTITY_KEY_PATH etc.) come from
+        # ``app.config.load_settings()``. For raw env reads we fall
+        # through; this also keeps ``cs.get("SR_BUILD_VARIANT")`` working.
+        return os.environ.get(key, default)
 
     def save_wallets(self, staking_address: str, collection_address: str = "") -> tuple[str, str]:
         """Validate and persist staking and collection addresses.
@@ -185,13 +276,15 @@ class ConfigStore:
         Returns ``(normalised_staking, normalised_collection)``.
         """
         normalised_staking = validate_wallet_address(staking_address)
-        set_key(str(self._path), "SR_STAKING_ADDRESS", normalised_staking)
-
         if collection_address.strip():
             normalised_collection = validate_wallet_address(collection_address)
         else:
             normalised_collection = normalised_staking
-        set_key(str(self._path), "SR_COLLECTION_ADDRESS", normalised_collection)
+
+        s = self._load_settings_v2()
+        s.wallet.staking_address = normalised_staking
+        s.wallet.collection_address = normalised_collection
+        self._save_settings_v2(s)
 
         return normalised_staking, normalised_collection
 
@@ -203,7 +296,7 @@ class ConfigStore:
         env = ENVIRONMENTS.get(env_key)
         if not env:
             raise ValueError(f"Unknown environment: {env_key}")
-        set_key(str(self._path), "SR_COORDINATION_API_URL", env["url"])
+        self._set_field("SR_COORDINATION_API_URL", env["url"])
         return env["url"]
 
     def get_environment(self) -> str:
@@ -216,9 +309,7 @@ class ConfigStore:
 
     def needs_onboarding(self) -> bool:
         """True if the identity key file has not been created yet."""
-        key_path = self.get("SR_IDENTITY_KEY_PATH") or str(
-            self._dir / "certs" / "node-identity.key"
-        )
+        key_path = str(self._dir / "certs" / "node-identity.key")
         return not os.path.isfile(key_path)
 
     def save_onboarding(
@@ -230,7 +321,9 @@ class ConfigStore:
     ) -> None:
         """Persist onboarding choices and optionally pre-write an imported identity key.
 
-        - *passphrase*: written as SR_IDENTITY_PASSPHRASE (may be empty).
+        - *passphrase*: written to ``os.environ['SR_IDENTITY_PASSPHRASE']``
+          (passphrases never land in settings.json — only the boolean
+          ``wallet.identity_passphrase_set`` flag does).
         - *staking*: staking wallet address; empty → uses identity address at runtime.
         - *collection*: collection wallet address; empty → uses staking address.
         - *identity_key_hex*: if provided, the raw private key is written to the
@@ -241,22 +334,27 @@ class ConfigStore:
         if collection:
             collection = validate_wallet_address(collection)
 
-        set_key(str(self._path), "SR_IDENTITY_PASSPHRASE", passphrase)
+        s = self._load_settings_v2()
+        s.wallet.identity_passphrase_set = bool(passphrase)
         if staking:
-            set_key(str(self._path), "SR_STAKING_ADDRESS", staking)
+            s.wallet.staking_address = staking
         if collection:
-            set_key(str(self._path), "SR_COLLECTION_ADDRESS", collection)
+            s.wallet.collection_address = collection
+        self._save_settings_v2(s)
+
+        if passphrase:
+            os.environ["SR_IDENTITY_PASSPHRASE"] = passphrase
 
         if identity_key_hex:
-            key_path = self.get("SR_IDENTITY_KEY_PATH") or str(
-                self._dir / "certs" / "node-identity.key"
-            )
+            key_path = str(self._dir / "certs" / "node-identity.key")
             write_identity_key(key_path, identity_key_hex, passphrase)
 
     def save_settings(self, coordination_api_url: str, mtls_enabled: bool) -> None:
         """Persist advanced settings (coordination API URL and mTLS toggle)."""
-        set_key(str(self._path), "SR_COORDINATION_API_URL", coordination_api_url)
-        set_key(str(self._path), "SR_MTLS_ENABLED", str(mtls_enabled).lower())
+        s = self._load_settings_v2()
+        s.coordination.url = coordination_api_url
+        s.node.mtls_enabled = bool(mtls_enabled)
+        self._save_settings_v2(s)
 
     def save_network_mode(self, mode: str, public_host: str = "", port: str = "") -> None:
         """Persist network mode settings.
@@ -267,14 +365,16 @@ class ConfigStore:
             port: remote/advertised port for tunnel mode (e.g. '21781').
                   The node always listens on SR_NODE_PORT (9090) locally.
         """
+        s = self._load_settings_v2()
         if mode == "upnp":
-            set_key(str(self._path), "SR_UPNP_ENABLED", "true")
-            set_key(str(self._path), "SR_PUBLIC_IP", "")
-            set_key(str(self._path), "SR_PUBLIC_PORT", "")
+            s.node.upnp_enabled = True
+            s.node.public_ip = None
+            s.node.public_port = None
         elif mode == "tunnel":
-            set_key(str(self._path), "SR_UPNP_ENABLED", "false")
-            set_key(str(self._path), "SR_PUBLIC_IP", public_host)
-            set_key(str(self._path), "SR_PUBLIC_PORT", port or "")
+            s.node.upnp_enabled = False
+            s.node.public_ip = public_host or None
+            s.node.public_port = int(port) if port else None
+        self._save_settings_v2(s)
 
     def get_network_mode(self) -> dict:
         """Return current network mode settings."""
@@ -291,9 +391,7 @@ class ConfigStore:
         import shutil
 
         # Delete identity key file
-        key_path = self.get("SR_IDENTITY_KEY_PATH") or str(
-            self._dir / "certs" / "node-identity.key"
-        )
+        key_path = str(self._dir / "certs" / "node-identity.key")
         if os.path.isfile(key_path):
             os.remove(key_path)
 
@@ -302,9 +400,12 @@ class ConfigStore:
         if certs_dir.is_dir():
             shutil.rmtree(certs_dir)
 
-        # Rewrite config with defaults
-        lines = [f"{k}={v}" for k, v in _DEFAULTS.items()]
-        self._path.write_text("\n".join(lines) + "\n")
+        # Reset settings.json to a fresh defaults instance for the
+        # current build variant. Anything previously persisted (wallet,
+        # coord URL, etc.) is wiped intentionally — that's what reset
+        # promises.
+        defaults = _SettingsV2(build_variant=BUILD_VARIANT)
+        self._save_settings_v2(defaults)
 
     def apply_to_env(self) -> None:
         """Load all config values into os.environ so pydantic-settings picks them up."""
