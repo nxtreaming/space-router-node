@@ -42,42 +42,38 @@ def api(mock_config, mock_node):
 class TestReferralSaveGuard:
     """Verify that the referral code is only persisted when none already exists."""
 
-    @patch("gui.api.set_key")
-    def test_referral_saved_when_none_exists(self, mock_set_key, api, mock_config):
+    def test_referral_saved_when_none_exists(self, api, mock_config):
         mock_config.get.return_value = ""
 
         result = api.save_onboarding_and_start(referral_code="partner-1")
 
         assert result == {"ok": True}
-        mock_set_key.assert_called_once_with(
-            str(mock_config.path), "SR_REFERRAL_CODE", "partner-1"
+        mock_config._set_field.assert_called_once_with(
+            "SR_REFERRAL_CODE", "partner-1"
         )
 
-    @patch("gui.api.set_key")
-    def test_referral_not_overwritten_when_exists(self, mock_set_key, api, mock_config):
+    def test_referral_not_overwritten_when_exists(self, api, mock_config):
         mock_config.get.return_value = "original-code"
 
         result = api.save_onboarding_and_start(referral_code="new-code")
 
         assert result == {"ok": True}
-        mock_set_key.assert_not_called()
+        mock_config._set_field.assert_not_called()
 
-    @patch("gui.api.set_key")
-    def test_empty_referral_does_not_write(self, mock_set_key, api, mock_config):
+    def test_empty_referral_does_not_write(self, api, mock_config):
         mock_config.get.return_value = ""
 
         result = api.save_onboarding_and_start(referral_code="")
 
         assert result == {"ok": True}
-        mock_set_key.assert_not_called()
+        mock_config._set_field.assert_not_called()
 
-    @patch("gui.api.set_key")
-    def test_referral_saved_on_fresh_setup(self, mock_set_key, api, mock_config):
+    def test_referral_saved_on_fresh_setup(self, api, mock_config):
         mock_config.get.return_value = ""
 
         result = api.save_onboarding_and_start(referral_code="first-code")
 
         assert result == {"ok": True}
-        mock_set_key.assert_called_once_with(
-            str(mock_config.path), "SR_REFERRAL_CODE", "first-code"
+        mock_config._set_field.assert_called_once_with(
+            "SR_REFERRAL_CODE", "first-code"
         )

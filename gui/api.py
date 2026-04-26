@@ -7,7 +7,6 @@ import threading
 import time
 import uuid as uuid_mod
 
-from dotenv import set_key
 
 from app.variant import BUILD_VARIANT
 from app.version import __version__
@@ -124,7 +123,7 @@ class Api:
             return {"ok": False, "error": str(exc)}
 
         if referral_code and not self._config.get("SR_REFERRAL_CODE"):
-            set_key(str(self._config.path), "SR_REFERRAL_CODE", referral_code)
+            self._config._set_field("SR_REFERRAL_CODE", referral_code)
 
         self._config.apply_to_env()
 
