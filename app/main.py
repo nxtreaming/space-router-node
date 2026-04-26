@@ -23,6 +23,7 @@ from dotenv import get_key, set_key
 
 # Light imports only — heavy libraries (httpx, cryptography, web3, etc.)
 # are deferred to first use inside _run() / _phase_*() to keep CLI startup fast.
+from app import constants
 from app.config import load_settings, _default_coordination_url
 from app.identity import KeystorePassphraseRequired, load_or_create_identity, write_identity_key
 from app.state import NodeState, NodeStateMachine
@@ -360,7 +361,7 @@ async def _phase_init(ctx: _NodeContext) -> None:
         from app.upnp import setup_upnp_mapping
 
         ctx.upnp_endpoint = await setup_upnp_mapping(
-            s.NODE_PORT, lease_duration=s.UPNP_LEASE_DURATION,
+            s.NODE_PORT, lease_duration=constants.UPNP_LEASE_DURATION,
         )
         if ctx.upnp_endpoint:
             logger.info("UPnP mapping active: %s:%d", ctx.upnp_endpoint[0], ctx.upnp_endpoint[1])
@@ -446,7 +447,7 @@ async def _phase_bind(ctx: _NodeContext) -> None:
     # Use SO_REUSEADDR to avoid "address already in use" after restart
     server = await asyncio.start_server(
         handler,
-        host=s.BIND_ADDRESS,
+        host=constants.BIND_ADDRESS,
         port=s.NODE_PORT,
         ssl=ctx.ssl_ctx,
         reuse_address=True,
@@ -718,7 +719,7 @@ async def _rebind_server_mtls(ctx: _NodeContext) -> None:
         await ctx.server.wait_closed()
     handler = functools.partial(handle_client, settings=s)
     ctx.server = await asyncio.start_server(
-        handler, host=s.BIND_ADDRESS, port=s.NODE_PORT, ssl=ctx.ssl_ctx,
+        handler, host=constants.BIND_ADDRESS, port=s.NODE_PORT, ssl=ctx.ssl_ctx,
         reuse_address=True,
     )
 
@@ -1499,19 +1500,19 @@ async def _run(
                 )
 
             # Start UPnP renewal
-            if ctx.upnp_endpoint and s.UPNP_LEASE_DURATION > 0:
+            if ctx.upnp_endpoint and constants.UPNP_LEASE_DURATION > 0:
                 from app.upnp import renew_upnp_mapping
 
                 async def _renew_tick() -> bool:
                     return await renew_upnp_mapping(
                         s.NODE_PORT, ctx.upnp_endpoint[1],
-                        s.UPNP_LEASE_DURATION,
+                        constants.UPNP_LEASE_DURATION,
                     )
 
                 renewal_task = asyncio.create_task(
                     _upnp_renewal_loop(
                         _renew_tick,
-                        long_interval=max(s.UPNP_LEASE_DURATION // 2, 60),
+                        long_interval=max(constants.UPNP_LEASE_DURATION // 2, 60),
                         short_interval=60,
                     )
                 )
@@ -1597,7 +1598,7 @@ async def _run(
                                 from app.upnp import setup_upnp_mapping
                                 upnp_result = await setup_upnp_mapping(
                                     ctx.s.NODE_PORT,
-                                    lease_duration=ctx.s.UPNP_LEASE_DURATION,
+                                    lease_duration=constants.UPNP_LEASE_DURATION,
                                 )
                                 if upnp_result:
                                     ctx.upnp_endpoint = upnp_result
@@ -1618,16 +1619,16 @@ async def _run(
                         logger.info("Reconnected successfully")
 
                         # Recreate background tasks
-                        if ctx.upnp_endpoint and s.UPNP_LEASE_DURATION > 0:
+                        if ctx.upnp_endpoint and constants.UPNP_LEASE_DURATION > 0:
                             from app.upnp import renew_upnp_mapping
 
                             async def _renew_loop() -> None:
-                                interval = max(s.UPNP_LEASE_DURATION // 2, 60)
+                                interval = max(constants.UPNP_LEASE_DURATION // 2, 60)
                                 while True:
                                     await asyncio.sleep(interval)
                                     ok = await renew_upnp_mapping(
                                         s.NODE_PORT, ctx.upnp_endpoint[1],
-                                        s.UPNP_LEASE_DURATION,
+                                        constants.UPNP_LEASE_DURATION,
                                     )
                                     if ok:
                                         logger.debug("UPnP lease renewed")

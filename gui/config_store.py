@@ -103,15 +103,62 @@ class ConfigStore:
     def __init__(self) -> None:
         self._dir = _config_dir()
         self._path = self._dir / "spacerouter.env"
+        self._settings_json_path = self._dir / "settings.json"
         self._ensure_file()
+        # Track P0: opportunistic forward-migration. Idempotent — bails
+        # immediately if settings.json already exists. Failures are logged
+        # but never raised; the legacy env-file flow remains usable.
+        self.migrate_to_settings_json()
+
+    def migrate_to_settings_json(self) -> "object | None":
+        """Migrate this GUI's spacerouter.env into a sibling settings.json.
+
+        Idempotent. Returns the loaded :py:class:`app.settings_v2.Settings`
+        when something happens, ``None`` when settings.json already exists
+        (so callers don't need to special-case the no-op path).
+
+        Now that ``_ensure_file()`` no longer auto-creates a default
+        spacerouter.env, the only time this fires is when an existing
+        v1.4-or-earlier user has a real env file on disk. The migration
+        renames it to ``.migrated.bak`` immediately so we don't keep two
+        sources of truth.
+        """
+        try:
+            from app.settings_v2 import Settings as _SettingsV2
+        except ImportError:
+            return None
+
+        try:
+            return _SettingsV2.migrate_from_env_file(
+                self._path,
+                self._settings_json_path,
+                # The env-file is now considered legacy. Rename to .bak
+                # right after the migration so the GUI stops touching it.
+                rename_after=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            import logging
+            logging.getLogger(__name__).warning(
+                "settings.json migration skipped due to error: %s", e
+            )
+            return None
 
     def _ensure_file(self) -> None:
-        """Create config dir and file with defaults if they don't exist."""
+        """Create config dir; never write a default spacerouter.env.
+
+        Brand-new installs land here with no env file and no settings.json
+        — that's fine. The first-run wizard (CLI) or onboarding flow
+        (GUI) writes settings.json directly. Operators with an existing
+        spacerouter.env from v1.4 still get migrated through
+        :py:meth:`migrate_to_settings_json`, which then renames the env
+        file to ``.migrated.bak``.
+
+        Pre-v1.5 this method seeded a default env file on first launch,
+        which scattered defaults all over disk before the user had even
+        chosen settings — see the v1.5 plan's "nuclear ensure_file fix".
+        """
         self._dir.mkdir(parents=True, exist_ok=True)
-        if not self._path.exists():
-            lines = [f"{k}={v}" for k, v in _DEFAULTS.items()]
-            self._path.write_text("\n".join(lines) + "\n")
-        else:
+        if self._path.exists():
             self._migrate_wallet_address()
 
     def _migrate_wallet_address(self) -> None:
@@ -264,6 +311,21 @@ class ConfigStore:
         for key, value in self.load().items():
             if value:
                 os.environ[key] = value
+
+        # Track P0 belt-and-suspenders: ALSO export SR_BUILD_VARIANT from
+        # the persisted settings.json (when present). The macOS rotation
+        # bug was caused by this env var being unstable across launchers
+        # (Finder vs shell). Persisting + re-exporting locks it down for
+        # any code path still doing ``os.environ.get("SR_BUILD_VARIANT")``.
+        # Once the env-var sweep lands in a future PR, this block goes away.
+        try:
+            from app.settings_v2 import Settings as _SettingsV2
+            if self._settings_json_path.exists():
+                bv = _SettingsV2.load(self._settings_json_path).build_variant
+                os.environ["SR_BUILD_VARIANT"] = bv
+        except Exception:  # noqa: BLE001
+            # Best-effort; never block startup on this.
+            pass
 
         # Point TLS cert + identity key paths to the writable config directory.
         # The default relative paths ("certs/...") resolve inside the PyInstaller

@@ -47,9 +47,50 @@ class TestWalletAddressMigration:
         assert vals.get("SR_STAKING_ADDRESS") == addr_new
 
     def test_fresh_config_has_no_legacy_wallet_address_key(self, store):
-        """A brand-new config file must not contain SR_WALLET_ADDRESS."""
+        """A brand-new config file must not contain SR_WALLET_ADDRESS.
+
+        In v1.5+ a fresh install also doesn't write a default
+        spacerouter.env at all — the file simply doesn't exist until
+        the user does something that needs to persist (e.g. saving a
+        wallet). dotenv_values() returns an empty dict for the missing
+        path, which trivially satisfies the legacy assertion.
+        """
         vals = dotenv_values(str(store.path))
         assert "SR_WALLET_ADDRESS" not in vals
+
+
+class TestEnsureFileNoLongerWritesDefaults:
+    """Nuclear ensure_file fix (v1.5 plan): a brand-new install must NOT
+    pre-create spacerouter.env with defaults. The wizard / GUI onboarding
+    is responsible for the first persistent write — to settings.json,
+    not the env file. Pre-v1.5 behaviour scattered defaults to disk
+    before the user had picked anything.
+    """
+
+    def test_brand_new_install_has_no_env_file(self, store):
+        # ``store`` was just constructed against a fresh tmp_path; the
+        # constructor must not have written anything.
+        assert not store.path.exists()
+
+    def test_brand_new_install_has_no_settings_json_either(self, store):
+        # Migration only fires when an env file exists; otherwise we
+        # leave the dir empty for the wizard to populate.
+        assert not (store._dir / "settings.json").exists()
+
+    def test_existing_env_file_is_migrated_and_renamed(self, tmp_path):
+        """Existing v1.4 spacerouter.env → settings.json + .migrated.bak."""
+        from unittest.mock import patch
+
+        env_path = tmp_path / "spacerouter.env"
+        env_path.write_text("SR_NODE_PORT=4321\n")
+
+        with patch("gui.config_store._config_dir", return_value=tmp_path):
+            from gui.config_store import ConfigStore
+            ConfigStore()  # __init__ runs the migration
+
+        assert (tmp_path / "settings.json").exists()
+        assert (tmp_path / "spacerouter.env.migrated.bak").exists()
+        assert not env_path.exists()
 
 
 # ---------------------------------------------------------------------------

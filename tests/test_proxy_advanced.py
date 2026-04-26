@@ -526,8 +526,11 @@ class TestProtocolAttacks:
 
 class TestTimeouts:
     @pytest.mark.asyncio
-    async def test_target_response_timeout(self, settings):
+    async def test_target_response_timeout(self, settings, monkeypatch):
         """Target that never responds → 504 Gateway Timeout."""
+        # REQUEST_TIMEOUT is now an app.constants knob; force a short value
+        # so this test's 10s outer wait finishes well after the proxy's 504.
+        monkeypatch.setattr("app.constants.REQUEST_TIMEOUT", 5.0)
 
         async def slow_target(reader, writer):
             # Read the request line to satisfy the proxy
@@ -572,9 +575,11 @@ class TestTimeouts:
             await target.wait_closed()
 
     @pytest.mark.asyncio
-    async def test_relay_timeout_on_idle_tunnel(self, settings):
+    async def test_relay_timeout_on_idle_tunnel(self, settings, monkeypatch):
         """CONNECT tunnel that goes idle should eventually close."""
-        settings.RELAY_TIMEOUT = 2.0  # Force short timeout for test
+        # RELAY_TIMEOUT is now a hardcoded constant, not a Pydantic field;
+        # monkeypatch the module-level value for this test.
+        monkeypatch.setattr("app.constants.RELAY_TIMEOUT", 2.0)
 
         async def idle_target(reader, writer):
             # Accept connection but do nothing

@@ -63,9 +63,9 @@ class TestConnectionLimit:
         assert b"connection limit reached" in resp
 
     @pytest.mark.asyncio
-    async def test_connections_within_limit_accepted(self, settings):
+    async def test_connections_within_limit_accepted(self, settings, monkeypatch):
         """Connections under MAX_CONNECTIONS are accepted normally."""
-        settings.MAX_CONNECTIONS = 5
+        monkeypatch.setattr("app.constants.MAX_CONNECTIONS", 5)
         server, port = await _start_server(settings)
         try:
             ctx = _client_ssl_context()
@@ -87,9 +87,9 @@ class TestConnectionLimit:
             await server.wait_closed()
 
     @pytest.mark.asyncio
-    async def test_excess_connections_get_503(self, settings):
+    async def test_excess_connections_get_503(self, settings, monkeypatch):
         """When MAX_CONNECTIONS is exceeded, new connections get 503."""
-        settings.MAX_CONNECTIONS = 2
+        monkeypatch.setattr("app.constants.MAX_CONNECTIONS", 2)
 
         # Start a target that holds connections open
         hold = asyncio.Event()
@@ -148,9 +148,9 @@ class TestConnectionLimit:
             await target.wait_closed()
 
     @pytest.mark.asyncio
-    async def test_connections_freed_after_completion(self, settings):
+    async def test_connections_freed_after_completion(self, settings, monkeypatch):
         """After a connection completes, the slot is freed for new ones."""
-        settings.MAX_CONNECTIONS = 1
+        monkeypatch.setattr("app.constants.MAX_CONNECTIONS", 1)
         server, port = await _start_server(settings)
         try:
             ctx = _client_ssl_context()
