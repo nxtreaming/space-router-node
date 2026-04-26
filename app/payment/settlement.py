@@ -7,6 +7,22 @@ insufficient balance / whose nonce is already used / whose node is not
 registered — so we mark a batch as claimed only if the tx confirms.
 
 Web3 calls run in ``asyncio.to_thread`` (web3.py is sync).
+
+Two hardening behaviours from P3 (v1.5 plan):
+
+- **L5: claim-in-flight sentinel.** Before broadcasting we compute the
+  raw tx hash deterministically (``account.sign_transaction`` produces
+  a hash without needing the chain) and persist it as
+  ``claim_tx_pending`` on every UUID in the batch. A crash between
+  broadcast and ``mark_claimed`` no longer creates a re-claim revert
+  loop — :mod:`app.payment.inflight_reconciler` resolves the row via
+  ``isNonceUsed`` on the next daemon startup.
+- **L6: per-receipt local sig verify.** Before submission we recover
+  the signer of each receipt's EIP-712 signature locally and drop any
+  row whose recovered signer doesn't match
+  ``settings.GATEWAY_PAYER_ADDRESS``. Otherwise one corrupt signature
+  reverts the whole batch atomically and burns ``claim_attempts`` on
+  every other row in it.
 """
 
 from __future__ import annotations
@@ -19,6 +35,12 @@ from pathlib import Path
 
 from app.config import Settings
 from app.payment import reasons
+from app.payment.eip712 import (
+    ESCROW_DOMAIN_NAME,
+    ESCROW_DOMAIN_VERSION,
+    EIP712Domain,
+    recover_receipt_signer,
+)
 from app.payment.receipt_store import ReceiptStore, StoredReceipt, get_store
 
 logger = logging.getLogger(__name__)
@@ -35,6 +57,7 @@ class ClaimResult:
     reason_code: str | None = None
     skipped_as_already_claimed: int = 0
     locked_after_failure: int = 0
+    sig_verify_dropped: int = 0
 
 
 def _load_abi() -> list[dict]:
@@ -201,6 +224,95 @@ async def _reconcile_already_claimed(
     return marked
 
 
+def _verify_signatures_locally(
+    settings: Settings, batch: list[StoredReceipt],
+) -> tuple[list[StoredReceipt], list[str]]:
+    """Pre-flight EIP-712 signer recovery against ``GATEWAY_PAYER_ADDRESS``.
+
+    Returns ``(kept, dropped_uuids)``. Any receipt whose recovered
+    signer doesn't match the configured gateway payer is excluded from
+    the returned batch; its UUID is in ``dropped_uuids`` for the
+    caller to mark ``failed_terminal``/``SIGN_VERIFY_FAILED``.
+
+    If ``GATEWAY_PAYER_ADDRESS`` is unset (older configs / dev fixtures
+    that haven't fetched the coord ``/config``), this function is a
+    no-op — verifying against an empty address would reject every row.
+    The settlement still works because the on-chain ``claimBatch``
+    enforces the same check; we'd just lose the per-receipt isolation.
+    """
+    payer = (settings.GATEWAY_PAYER_ADDRESS or "").strip()
+    if not payer:
+        return list(batch), []
+
+    from eth_utils import to_checksum_address
+    try:
+        expected = to_checksum_address(payer)
+    except Exception:
+        # Bad config — log and skip rather than dropping all rows.
+        logger.warning(
+            "GATEWAY_PAYER_ADDRESS=%r is not a valid address; skipping "
+            "local signature verification for this batch.", payer,
+        )
+        return list(batch), []
+
+    domain = EIP712Domain(
+        name=ESCROW_DOMAIN_NAME,
+        version=ESCROW_DOMAIN_VERSION,
+        chain_id=int(settings.ESCROW_CHAIN_ID),
+        verifying_contract=settings.ESCROW_CONTRACT_ADDRESS,
+    )
+
+    kept: list[StoredReceipt] = []
+    dropped: list[str] = []
+    for sr in batch:
+        sig = sr.signature
+        if not sig:
+            # Should never reach _submit_batch unsigned, but be defensive.
+            dropped.append(sr.receipt.request_uuid)
+            continue
+        try:
+            recovered = recover_receipt_signer(sr.receipt, sig, domain)
+        except Exception as e:
+            logger.debug(
+                "Local sig recovery raised for uuid=%s: %s",
+                sr.receipt.request_uuid, e,
+            )
+            dropped.append(sr.receipt.request_uuid)
+            continue
+        if to_checksum_address(recovered) != expected:
+            dropped.append(sr.receipt.request_uuid)
+        else:
+            kept.append(sr)
+    return kept, dropped
+
+
+async def _drop_corrupt_signatures(
+    store: ReceiptStore, dropped_uuids: list[str],
+) -> None:
+    """Mark each corrupt-sig UUID terminal with ``SIGN_VERIFY_FAILED``.
+
+    A receipt whose locally-recovered signer doesn't match the
+    configured gateway payer can never settle on-chain — the contract
+    runs the same recovery and would revert the whole batch atomically.
+    There's no retry that fixes this, so we move the row to
+    ``failed_terminal`` immediately.
+
+    We stamp the failure code via :func:`mark_claim_failed` (so
+    ``last_error_code`` and ``last_attempt_at`` are consistent with
+    other terminal outcomes) and then call :func:`lock` to set
+    ``locked=1`` regardless of the attempt counter. The reason code is
+    a sign-side code, not a chain-side one, so the existing
+    ``counts_against_retry_budget`` rule wouldn't lock it on its own
+    after a single occurrence.
+    """
+    for u in dropped_uuids:
+        await store.mark_claim_failed(
+            [u], reasons.SIGN_VERIFY_FAILED,
+            "Local EIP-712 recovery did not match GATEWAY_PAYER_ADDRESS.",
+        )
+        await store.lock(u)
+
+
 async def _submit_batch(
     settings: Settings,
     settlement_key: str,
@@ -214,8 +326,39 @@ async def _submit_batch(
     Failures always propagate to the store: ``CLAIM_REVERTED`` /
     ``CLAIM_TX_TIMEOUT`` increment ``claim_attempts`` and may lock rows
     at the attempt cap; ``CLAIM_RPC_UNREACHABLE`` is silent (transient).
+
+    Two pre-flight steps before the chain is touched (P3/L5+L6):
+
+    - ``_verify_signatures_locally`` drops any receipt whose
+      gateway-signed signature doesn't recover to
+      ``GATEWAY_PAYER_ADDRESS``. Otherwise one corrupt sig reverts the
+      whole batch atomically and burns ``claim_attempts`` on every
+      other row.
+    - ``set_claim_tx_pending`` persists the deterministic tx hash on
+      every UUID before broadcast so a crash mid-flight is recoverable
+      via :mod:`app.payment.inflight_reconciler`.
     """
-    def _do() -> ClaimResult:
+    # L6 — local signature verify before submission.
+    kept_batch, dropped_uuids = _verify_signatures_locally(settings, batch)
+    if dropped_uuids:
+        logger.info(
+            "Settlement: dropped %d/%d receipt(s) from batch — local "
+            "EIP-712 recovery did not match GATEWAY_PAYER_ADDRESS. "
+            "Submitting %d remaining.",
+            len(dropped_uuids), len(batch), len(kept_batch),
+        )
+        await _drop_corrupt_signatures(store, dropped_uuids)
+
+    if not kept_batch:
+        # All receipts in this batch had corrupt sigs — return a
+        # synthetic empty result so the caller advances. No chain tx.
+        return ClaimResult(
+            submitted=0, tx_hash=None, gas_used=None,
+            sig_verify_dropped=len(dropped_uuids),
+        )
+
+    def _build_and_sign() -> tuple:
+        """Build tx, sign locally, return (tx_hash_hex, signed, w3_state)."""
         from web3 import Web3
         from eth_account import Account
 
@@ -223,11 +366,7 @@ async def _submit_batch(
             settings.ESCROW_CHAIN_RPC, request_kwargs={"timeout": 30},
         ))
         if not w3.is_connected():
-            return ClaimResult(
-                submitted=len(batch), tx_hash=None, gas_used=None,
-                error=f"RPC unreachable: {settings.ESCROW_CHAIN_RPC}",
-                reason_code=reasons.CLAIM_RPC_UNREACHABLE,
-            )
+            return None, None, None, None  # type: ignore[return-value]
 
         contract = w3.eth.contract(
             address=Web3.to_checksum_address(settings.ESCROW_CONTRACT_ADDRESS),
@@ -235,8 +374,8 @@ async def _submit_batch(
         )
         account = Account.from_key(settlement_key)
 
-        receipts_tuples = [_to_contract_tuple(sr) for sr in batch]
-        signatures = [bytes.fromhex(sr.signature.removeprefix("0x")) for sr in batch]
+        receipts_tuples = [_to_contract_tuple(sr) for sr in kept_batch]
+        signatures = [bytes.fromhex(sr.signature.removeprefix("0x")) for sr in kept_batch]
 
         GAS_CAP = 12_000_000
         try:
@@ -245,11 +384,13 @@ async def _submit_batch(
             ).estimate_gas({"from": account.address})
             gas_limit = min(int(gas_estimate * 1.2), GAS_CAP)
         except Exception as e:
-            gas_limit = min(350_000 * len(batch), GAS_CAP)
+            gas_limit = min(350_000 * len(kept_batch), GAS_CAP)
             logger.warning("Gas estimation failed (%s); falling back to %d", e, gas_limit)
 
         nonce = w3.eth.get_transaction_count(account.address)
-        tx = contract.functions.claimBatch(receipts_tuples, signatures).build_transaction({
+        tx = contract.functions.claimBatch(
+            receipts_tuples, signatures,
+        ).build_transaction({
             "from": account.address,
             "nonce": nonce,
             "gas": gas_limit,
@@ -257,46 +398,82 @@ async def _submit_batch(
             "chainId": settings.ESCROW_CHAIN_ID,
         })
         signed = account.sign_transaction(tx)
+        # eth_account exposes the deterministic tx hash before broadcast
+        # so we can persist it as the in-flight breadcrumb.
+        try:
+            tx_hash_hex = signed.hash.hex()
+        except AttributeError:
+            # Older eth_account uses tx_hash; use as fallback.
+            tx_hash_hex = signed.tx_hash.hex()  # type: ignore[attr-defined]
+        if not tx_hash_hex.startswith("0x"):
+            tx_hash_hex = "0x" + tx_hash_hex
+        return w3, signed, tx_hash_hex, gas_limit
+
+    built = await asyncio.to_thread(_build_and_sign)
+    w3, signed, tx_hash_hex, _gas_limit = built
+    if w3 is None:
+        result = ClaimResult(
+            submitted=len(kept_batch), tx_hash=None, gas_used=None,
+            error=f"RPC unreachable: {settings.ESCROW_CHAIN_RPC}",
+            reason_code=reasons.CLAIM_RPC_UNREACHABLE,
+            sig_verify_dropped=len(dropped_uuids),
+        )
+        kept_uuids = [sr.receipt.request_uuid for sr in kept_batch]
+        await store.mark_claim_failed(
+            kept_uuids, result.reason_code, result.error,
+        )
+        return result
+
+    kept_uuids = [sr.receipt.request_uuid for sr in kept_batch]
+    # L5 — persist the breadcrumb BEFORE broadcast so a crash here is
+    # recoverable. mark_claim_failed for any RPC issue happens after.
+    await store.set_claim_tx_pending(kept_uuids, tx_hash_hex)
+
+    def _broadcast_and_wait() -> ClaimResult:
         try:
             tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
         except Exception as e:
-            # Pre-confirmation failures (malformed tx, connection drop during
-            # broadcast) — treat as transient RPC issue.
             return ClaimResult(
-                submitted=len(batch), tx_hash=None, gas_used=None,
+                submitted=len(kept_batch), tx_hash=None, gas_used=None,
                 error=f"broadcast failed: {e}",
                 reason_code=reasons.CLAIM_RPC_UNREACHABLE,
+                sig_verify_dropped=len(dropped_uuids),
             )
 
         tx_hex = tx_hash.hex()
+        if not tx_hex.startswith("0x"):
+            tx_hex = "0x" + tx_hex
         try:
             rcpt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
         except Exception as e:
-            # The tx may still land — timeout is ambiguous. Store the
-            # hash and let the reaper resolve via isNonceUsed on the
-            # next tick.
             return ClaimResult(
-                submitted=len(batch), tx_hash=tx_hex, gas_used=None,
+                submitted=len(kept_batch), tx_hash=tx_hex, gas_used=None,
                 error=f"tx wait timed out: {e}",
                 reason_code=reasons.CLAIM_TX_TIMEOUT,
+                sig_verify_dropped=len(dropped_uuids),
             )
 
         if rcpt.status != 1:
             return ClaimResult(
-                submitted=len(batch), tx_hash=tx_hex,
+                submitted=len(kept_batch), tx_hash=tx_hex,
                 gas_used=rcpt.gasUsed, error="tx reverted",
                 reason_code=reasons.CLAIM_REVERTED,
+                sig_verify_dropped=len(dropped_uuids),
             )
 
         return ClaimResult(
-            submitted=len(batch), tx_hash=tx_hex, gas_used=rcpt.gasUsed,
+            submitted=len(kept_batch), tx_hash=tx_hex, gas_used=rcpt.gasUsed,
+            sig_verify_dropped=len(dropped_uuids),
         )
 
-    result = await asyncio.to_thread(_do)
-    uuids = [sr.receipt.request_uuid for sr in batch]
+    result = await asyncio.to_thread(_broadcast_and_wait)
 
     if result.tx_hash and not result.error:
-        marked = await store.mark_claimed(uuids, result.tx_hash)
+        marked = await store.mark_claimed(kept_uuids, result.tx_hash)
+        # mark_claimed leaves claim_tx_pending populated; clear it now
+        # for tidiness so the in-flight reconciler sees a clean state.
+        for u in kept_uuids:
+            await store.clear_claim_tx_pending(u)
         logger.info(
             "Settled %d receipts in tx %s (gas=%s)",
             marked, result.tx_hash, result.gas_used,
@@ -304,17 +481,23 @@ async def _submit_batch(
         return result
 
     if result.reason_code:
-        # Record the failure on every row in the batch. mark_claim_failed
-        # handles the "transient doesn't count" rule internally.
         detail = result.tx_hash or result.error
-        await store.mark_claim_failed(uuids, result.reason_code, detail)
+        await store.mark_claim_failed(kept_uuids, result.reason_code, detail)
+
+        # On a confirmed terminal failure the breadcrumb is no longer
+        # useful — the row is back in the claim queue (or locked).
+        # On CLAIM_TX_TIMEOUT the breadcrumb stays so the in-flight
+        # reconciler can resolve it on next startup if the daemon
+        # crashes before the reaper does.
+        if result.reason_code in (
+            reasons.CLAIM_REVERTED, reasons.CLAIM_RPC_UNREACHABLE,
+        ):
+            for u in kept_uuids:
+                await store.clear_claim_tx_pending(u)
 
         if reasons.counts_against_retry_budget(result.reason_code):
-            # Count how many of these rows are now locked — the caller
-            # surfaces this in the CLI summary so the user sees exactly
-            # what just became terminal.
             locked_now = 0
-            for u in uuids:
+            for u in kept_uuids:
                 sr = await store.get_by_uuid(u)
                 if sr and sr.locked:
                     locked_now += 1
