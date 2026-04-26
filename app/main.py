@@ -537,6 +537,23 @@ async def _init_receipt_submitter(ctx: _NodeContext) -> None:
     await poller.start()
     ctx.receipt_poller = poller
 
+    # P3/L5 — one-shot reconciliation of any tx that was broadcast
+    # but didn't reach mark_claimed before the previous run crashed.
+    # Runs before the reaper starts so the recurring reaper tick
+    # doesn't redo work the reconciler already handled. Best-effort
+    # — failure here just logs; the reaper picks up anything left.
+    try:
+        from app.payment.inflight_reconciler import reconcile_inflight
+        recon = await reconcile_inflight(ctx.s)
+        if recon["checked"]:
+            logger.info(
+                "Startup reconcile: %d in-flight row(s) — settled %d, "
+                "cleared %d.",
+                recon["checked"], recon["marked_claimed"], recon["cleared"],
+            )
+    except Exception:
+        logger.exception("Startup in-flight reconcile failed; continuing")
+
     # Reaper resolves stuck CLAIM_TX_TIMEOUT rows by re-querying the chain.
     # Only runs when escrow RPC + contract are configured — safe on dev
     # setups that don't have on-chain settlement enabled.
@@ -2274,14 +2291,29 @@ async def _cmd_claim(
             )
             sys.exit(0)
 
+    # P3/L3 — share the GUI's claim.lock so a CLI claim and a GUI
+    # claim can't double-submit the same nonces. Stale-lock recovery
+    # is inherited from the OS primitive; if a previous holder crashed,
+    # the lock will be free.
+    from app.payment.claim_lock import acquire_claim_lock, ClaimLockHeld
+
     try:
-        results = await claim_all(
-            s, settlement_key_hex,
-            include_retryable=include_retryable,
-            only_uuids=[only_uuid] if only_uuid else None,
+        with acquire_claim_lock(s):
+            try:
+                results = await claim_all(
+                    s, settlement_key_hex,
+                    include_retryable=include_retryable,
+                    only_uuids=[only_uuid] if only_uuid else None,
+                )
+            except ValueError as e:
+                print(f"Cannot claim: {e}", file=sys.stderr)
+                sys.exit(1)
+    except ClaimLockHeld:
+        print(
+            "another claim is in progress (GUI or CLI). Wait for it to "
+            "finish or close the GUI.",
+            file=sys.stderr,
         )
-    except ValueError as e:
-        print(f"Cannot claim: {e}", file=sys.stderr)
         sys.exit(1)
 
     if not results:
