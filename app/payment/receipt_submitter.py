@@ -29,15 +29,17 @@ import hashlib
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from eth_account import Account
 from eth_account.messages import encode_defunct
 
 from app.config import Settings
+from app.paths import config_dir
 from app.payment import reasons
 from app.payment.eip712 import Receipt, address_to_bytes32
+from app.payment.poller_cursor import PollerCursor
 from app.payment.receipt_store import get_store
 
 logger = logging.getLogger(__name__)
@@ -58,6 +60,160 @@ POLL_CURSOR_BUFFER_SECONDS = 60
 # On start, back the cursor up by this much — catches anything signed
 # between the node's previous shutdown and this startup.
 POLL_INITIAL_LOOKBACK_HOURS = 24
+
+# Per-row exponential backoff for transient sign-side failures (L1).
+# Effective wait = min(60 * 2^transient_attempts, 3600). Cap at 1h so a
+# row that hits a permanent-but-transient-looking storm still re-tries
+# every hour rather than disappearing into a multi-day backoff. Kept in
+# sync with the SQL expression in
+# :func:`ReceiptStore.count_unsigned_ready` — change both together.
+TRANSIENT_BACKOFF_BASE_SECONDS = 60
+TRANSIENT_BACKOFF_CAP_SECONDS = 3600
+
+# Total transient-failure budget before a row escalates from
+# pending_sign → failed_retryable with SIGN_TRANSIENT_BUDGET_EXHAUSTED.
+# 14 attempts at exponential backoff with the 1h cap covers ~24h:
+# 60 + 120 + 240 + 480 + 960 + 1800(cap) + 3600 + 3600 + 3600 + 3600 +
+# 3600 + 3600 + 3600 + 3600 ≈ 31000s ≈ 8.6h of pure backoff plus
+# whatever wall-clock the operator was offline. Operators see one WARN
+# per escalation.
+TRANSIENT_BUDGET_ATTEMPTS = 14
+
+# L9: a run of this many consecutive timestamp-expired rejections inside
+# CLOCK_SKEW_ESCALATION_WINDOW_SECONDS escalates from quiet WARN-per-row
+# (operator-friendly NTP nudge) to one ERROR-level "system clock out of
+# sync" message. Reset on any successful sign.
+CLOCK_SKEW_ESCALATION_THRESHOLD = 3
+CLOCK_SKEW_ESCALATION_WINDOW_SECONDS = 300
+
+
+def transient_backoff_seconds(transient_attempts: int) -> int:
+    """Mirror of the SQL expression in
+    :meth:`ReceiptStore.count_unsigned_ready`.
+
+    For ``transient_attempts == 0`` this returns 60 (the first retry
+    waits one minute), but the gate in ``count_unsigned_ready`` lets
+    rows with 0 attempts retry immediately. The function is exposed
+    here for tests and future TUI surfaces.
+    """
+    if transient_attempts <= 0:
+        return TRANSIENT_BACKOFF_BASE_SECONDS
+    # ``min(transient_attempts, 16)`` matches the SQL guard against
+    # 1<<N overflowing at very high counters.
+    shift = min(int(transient_attempts), 16)
+    return min(
+        TRANSIENT_BACKOFF_BASE_SECONDS * (1 << shift),
+        TRANSIENT_BACKOFF_CAP_SECONDS,
+    )
+
+
+def _is_transient_status(status_code: int) -> bool:
+    """429 + any 5xx are transient at the submitter layer."""
+    return status_code == 429 or 500 <= status_code <= 599
+
+
+# L9 — module-level clock-skew tracker. Module-level because the
+# submitter is created per-relay and we want the counter to span
+# instances. The poller's clock-skew arrivals (via
+# /rejected-receipts) also feed this counter, so shared state is the
+# simplest correct option. Tests use ``reset_clock_skew_state``.
+_clock_skew_state: dict = {
+    "consecutive_failures": 0,
+    "last_error_at": None,
+    "last_seconds_diff": None,
+    "in_drift": False,
+    "last_escalation_at": None,
+}
+
+
+def get_clock_skew_state() -> dict:
+    """Return a copy of the current clock-skew state.
+
+    Stable shape: ``{"in_drift": bool, "consecutive_failures": int,
+    "last_error_at": iso str | None, "last_seconds_diff": int | None}``.
+    Future TUI / GUI surfaces read this; no UI work in this PR.
+    """
+    return {
+        "in_drift": bool(_clock_skew_state["in_drift"]),
+        "consecutive_failures": int(_clock_skew_state["consecutive_failures"]),
+        "last_error_at": (
+            _clock_skew_state["last_error_at"].isoformat()
+            if _clock_skew_state["last_error_at"] is not None
+            else None
+        ),
+        "last_seconds_diff": _clock_skew_state["last_seconds_diff"],
+    }
+
+
+def reset_clock_skew_state() -> None:
+    """Clear the module-level clock-skew counter.
+
+    Called on any successful sign and from tests.
+    """
+    _clock_skew_state["consecutive_failures"] = 0
+    _clock_skew_state["last_error_at"] = None
+    _clock_skew_state["last_seconds_diff"] = None
+    _clock_skew_state["in_drift"] = False
+    _clock_skew_state["last_escalation_at"] = None
+
+
+def _extract_seconds_diff(detail: str) -> int | None:
+    """Best-effort parse of the seconds-of-drift from a coord API reply.
+
+    Coord API formats the rejection as "Timestamp expired. Must be
+    within Ns. Got drift Ms." — we look for the largest integer that
+    looks like a seconds value. None on parse failure; the operator
+    still sees the raw detail in the log.
+    """
+    if not detail:
+        return None
+    import re
+    nums = re.findall(r"-?\d+", detail)
+    if not nums:
+        return None
+    try:
+        # Coord normally puts the drift as the last integer in the message.
+        return int(nums[-1])
+    except (TypeError, ValueError):
+        return None
+
+
+def _record_clock_skew_event(detail: str) -> None:
+    """Bump the consecutive-failure counter and escalate if past threshold."""
+    now = datetime.now(timezone.utc)
+    state = _clock_skew_state
+    state["consecutive_failures"] = int(state["consecutive_failures"]) + 1
+    state["last_error_at"] = now
+    diff = _extract_seconds_diff(detail or "")
+    if diff is not None:
+        state["last_seconds_diff"] = diff
+
+    if state["consecutive_failures"] < CLOCK_SKEW_ESCALATION_THRESHOLD:
+        return
+
+    last_esc = state.get("last_escalation_at")
+    window = timedelta(seconds=CLOCK_SKEW_ESCALATION_WINDOW_SECONDS)
+
+    # First-time escalation: always log + flip in_drift on.
+    # Subsequent escalations: only log again if we've left the window
+    # since the last ERROR (avoids spamming the operator's log).
+    fresh_window = (
+        last_esc is None or (now - last_esc) > window
+    )
+
+    state["in_drift"] = True
+    if fresh_window:
+        diff_text = (
+            f" Coord API timestamp differs by {state['last_seconds_diff']} seconds."
+            if state["last_seconds_diff"] is not None
+            else ""
+        )
+        logger.error(
+            "System clock appears out of sync — check NTP.%s "
+            "This will block all receipt submission until fixed.",
+            diff_text,
+        )
+        state["last_escalation_at"] = now
 
 
 def _build_receipt(
@@ -203,8 +359,14 @@ class ReceiptSubmitter:
             async with httpx.AsyncClient(timeout=SUBMIT_TIMEOUT_SECONDS) as client:
                 resp = await client.post(url, json=payload)
         except httpx.RequestError as exc:
+            # Network / timeout / DNS — pure transient. Bump the per-row
+            # backoff counter so the poller's retry path doesn't busy-wait
+            # against an outage.
             logger.debug("Leg 2 submit network error uuid=%s: %s — poller will retry",
                          receipt.request_uuid, exc)
+            await _record_transient_attempt(
+                self._settings, receipt.request_uuid,
+            )
             return
 
         if resp.status_code == 200:
@@ -216,6 +378,8 @@ class ReceiptSubmitter:
                 try:
                     store = get_store(self._settings.RECEIPT_STORE_PATH)
                     await store.mark_signed(receipt.request_uuid, body["signature"])
+                    # Successful sign clears clock-skew + transient state.
+                    reset_clock_skew_state()
                     logger.info(
                         "Leg 2 receipt signed synchronously uuid=%s amount=%d",
                         receipt.request_uuid, receipt.data_amount,
@@ -238,6 +402,7 @@ class ReceiptSubmitter:
             except Exception:
                 detail = (resp.text or "")[:200]
             if "timestamp" in detail.lower() and "expire" in detail.lower():
+                _record_clock_skew_event(detail)
                 await _record_clock_skew(
                     self._settings, receipt.request_uuid, detail,
                 )
@@ -254,11 +419,34 @@ class ReceiptSubmitter:
             await _record_sign_rejection(
                 self._settings, receipt.request_uuid, resp,
             )
+        elif _is_transient_status(resp.status_code):
+            # 429 / 5xx → transient. Increment the per-row backoff
+            # counter so the poller doesn't hot-loop.
+            logger.debug(
+                "Leg 2 submit transient %d uuid=%s — backing off per-row",
+                resp.status_code, receipt.request_uuid,
+            )
+            await _record_transient_attempt(
+                self._settings, receipt.request_uuid,
+            )
         else:
             logger.debug(
                 "Leg 2 submit got %d uuid=%s — poller will retry",
                 resp.status_code, receipt.request_uuid,
             )
+
+
+async def _record_transient_attempt(
+    settings: Settings, request_uuid: str,
+) -> None:
+    """Bump per-row transient backoff counter. No exception escapes."""
+    try:
+        store = get_store(settings.RECEIPT_STORE_PATH)
+        await store.mark_transient_attempt(request_uuid)
+    except Exception:
+        logger.exception(
+            "Failed to record transient sign attempt uuid=%s", request_uuid,
+        )
 
 
 async def _record_clock_skew(
@@ -333,6 +521,7 @@ class ReceiptPoller:
         node_id: str,
         identity_key: str,
         node_wallet_address: str,
+        cursor_store: PollerCursor | None = None,
     ) -> None:
         self._settings = settings
         self._node_id = node_id
@@ -341,18 +530,55 @@ class ReceiptPoller:
         self._cursor: datetime | None = None
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        # Tests inject a custom PollerCursor (e.g. pointed at tmp_path).
+        # Production uses the canonical config dir.
+        self._cursor_store = cursor_store or PollerCursor(config_dir())
 
     async def start(self) -> None:
         if self._task is not None:
             return
-        # Initial cursor = now - 24h so first tick picks up anything signed
-        # while the node was offline. mark_signed is idempotent, so
-        # re-fetching already-stored rows is safe.
-        from datetime import timedelta
-        self._cursor = datetime.now(timezone.utc) - timedelta(hours=POLL_INITIAL_LOOKBACK_HOURS)
+        # L2 + L8: durable cursor with 24h floor.
+        #
+        # If we have a saved cursor:
+        #   effective = min(saved - 1h guard, now - 24h)
+        # The guard absorbs in-flight rows the previous run's last tick
+        # may have missed; the 24h floor protects against losing
+        # signed-receipts retention if the saved cursor is older than
+        # the gateway's 24h retention window.
+        # If we don't have a saved cursor (true first-run): fall back to
+        # the legacy "now - 24h" lookback.
+        now_utc = datetime.now(timezone.utc)
+        floor = now_utc - timedelta(hours=POLL_INITIAL_LOOKBACK_HOURS)
+        try:
+            saved = self._cursor_store.load()
+        except Exception:
+            logger.exception("poller cursor load failed; using 24h fallback")
+            saved = None
+        if saved is None:
+            self._cursor = floor
+            logger.info(
+                "Leg 2 receipt poller started (interval=%ds, "
+                "cursor=initial-24h-lookback)",
+                POLL_INTERVAL_SECONDS,
+            )
+        else:
+            # Plan says cursor = min(saved-1h, now-24h). ``min`` picks
+            # the EARLIER timestamp:
+            #   - saved older than 23h → saved-1h is earlier → use it
+            #     (look back as far as the saved cursor + 1h guard)
+            #   - saved within last 23h → now-24h is earlier → use it
+            #     (the 24h floor still applies because we never want a
+            #     cursor more recent than 24h ago, in case poller fell
+            #     behind during the previous run).
+            saved_with_guard = saved - timedelta(hours=1)
+            self._cursor = min(saved_with_guard, floor)
+            logger.info(
+                "Leg 2 receipt poller started (interval=%ds, "
+                "cursor=%s, source=durable)",
+                POLL_INTERVAL_SECONDS, self._cursor.isoformat(),
+            )
         self._stop.clear()
         self._task = asyncio.create_task(self._loop())
-        logger.info("Leg 2 receipt poller started (interval=%ds)", POLL_INTERVAL_SECONDS)
 
     async def stop(self) -> None:
         self._stop.set()
@@ -376,9 +602,39 @@ class ReceiptPoller:
         store = get_store(self._settings.RECEIPT_STORE_PATH)
         await store.initialize()
 
-        # Only poll when we have unsigned receipts waiting — saves API calls.
+        # L1 escalation pass: any row past the transient-failure budget
+        # gets moved to failed_retryable so it surfaces in the UI rather
+        # than retrying every tick forever.
+        try:
+            escalated = await store.escalate_transient_budget_exhausted(
+                threshold=TRANSIENT_BUDGET_ATTEMPTS,
+                code=reasons.SIGN_TRANSIENT_BUDGET_EXHAUSTED,
+                detail=(
+                    f"~24h of transient submit failures "
+                    f"(>= {TRANSIENT_BUDGET_ATTEMPTS} attempts)."
+                ),
+            )
+            for uuid_ in escalated:
+                logger.warning(
+                    "Leg 2 receipt uuid=%s escalated to failed_retryable: "
+                    "%s — sustained transient errors talking to coord API.",
+                    uuid_, reasons.SIGN_TRANSIENT_BUDGET_EXHAUSTED,
+                )
+        except Exception:
+            logger.exception("Transient-budget escalation pass failed")
+
+        # Only poll when we have unsigned receipts waiting AND at least
+        # one is past its per-row backoff window. Saves API calls during
+        # 429 / 5xx storms — every row in backoff means no work to do.
         unsigned_count = await store.count_unsigned()
         if unsigned_count == 0:
+            return
+        ready = await store.count_unsigned_ready()
+        if ready == 0:
+            logger.debug(
+                "Leg 2 poller skipped — %d unsigned rows still in transient backoff",
+                unsigned_count,
+            )
             return
 
         # Also pull any async rejections the coord API has queued. Runs on
@@ -413,26 +669,47 @@ class ReceiptPoller:
             return
 
         newest_cursor = self._cursor
+        latest_signed_at: datetime | None = None
+        any_signed = False
         for r in rows:
             try:
                 created = datetime.fromisoformat(r["created_at"].replace("Z", "+00:00"))
             except Exception:
                 created = None
             try:
-                await store.mark_signed(r["request_uuid"], r["signature"])
+                updated = await store.mark_signed(r["request_uuid"], r["signature"])
             except Exception:
                 logger.exception("Failed to mark receipt signed uuid=%s",
                                  r.get("request_uuid"))
+                updated = False
+            if updated:
+                any_signed = True
             if created and (newest_cursor is None or created > newest_cursor):
                 newest_cursor = created
+            if created and (latest_signed_at is None or created > latest_signed_at):
+                latest_signed_at = created
 
         if newest_cursor is not None:
             # Roll back the cursor by POLL_CURSOR_BUFFER_SECONDS so a row
             # inserted with an older timestamp (clock skew, late sync-path
             # commit) gets picked up on the next tick. mark_signed's
             # WHERE signature IS NULL guard makes duplicates a no-op.
-            from datetime import timedelta
             self._cursor = newest_cursor - timedelta(seconds=POLL_CURSOR_BUFFER_SECONDS)
+
+        # L2 + L8: persist the cursor to disk on any tick that actually
+        # picked up a signed receipt. Mid-tick crashes can lose at most
+        # the rows from the in-flight tick — never the cumulative
+        # progress across the daemon's lifetime.
+        if any_signed and latest_signed_at is not None:
+            try:
+                self._cursor_store.save(latest_signed_at)
+            except Exception:
+                logger.exception("Failed to persist poller cursor")
+
+        # Successful sign clears the clock-skew counter — the operator
+        # may have fixed NTP since the last error.
+        if any_signed:
+            reset_clock_skew_state()
 
         logger.debug("Leg 2 poller: updated %d signatures from coord API", len(rows))
 
