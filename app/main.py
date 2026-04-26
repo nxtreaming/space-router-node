@@ -1345,6 +1345,43 @@ async def _run(
         create_server_ssl_context, ensure_certificates,
     )
 
+    # ── Trust-on-first-use sync of escrow config from coord ──
+    # Track P2: on first launch, fetch `/config` once, persist the gateway
+    # rate / payer into ``settings.json``. Subsequent launches see the
+    # ``synced_from_coord_at`` stamp and skip the network call. Drift is
+    # handled gateway-side via ``SIGN_REJECTED_PRICE_CAP`` rejection
+    # messages (which include the expected rate). HTTP failures here are
+    # WARN-only — they never block daemon startup.
+    #
+    # We do this BEFORE ``load_settings()`` builds the legacy ``Settings``
+    # shape so the rate populated below is visible via ``s.NODE_RATE_PER_GB``
+    # downstream (in ``_phase_register`` → ``_init_receipt_submitter``).
+    # When ``settings_override`` is supplied (GUI subprocess path, tests),
+    # we skip the sync entirely — the override is the source of truth.
+    if settings_override is None:
+        try:
+            from app.escrow_config_sync import sync_escrow_config_from_coord
+            from app.settings_loader import load_provider_settings, settings_path
+            s_path = settings_path()
+            v2_before = load_provider_settings()
+            had_stamp = bool(v2_before.escrow.synced_from_coord_at)
+            had_rate = bool(v2_before.escrow.leg2_rate_per_gb)
+            v2_after = sync_escrow_config_from_coord(v2_before)
+            # Persist only if the sync actually populated something new.
+            # ``sync_escrow_config_from_coord`` returns the same instance
+            # on the no-op paths; we detect a real change by comparing
+            # the relevant fields against the pre-sync snapshot.
+            now_has_stamp = bool(v2_after.escrow.synced_from_coord_at)
+            now_has_rate = bool(v2_after.escrow.leg2_rate_per_gb)
+            if (now_has_stamp and not had_stamp) or (now_has_rate and not had_rate):
+                v2_after.save(s_path)
+        except Exception:
+            # Never let escrow sync block the daemon. Logged inside the
+            # function for the expected error paths; a true blow-up here
+            # (e.g. settings.json gone read-only) gets swallowed with a
+            # warning so the rest of startup still happens.
+            logger.warning("escrow config sync failed unexpectedly — continuing", exc_info=True)
+
     s = settings_override or load_settings()
 
     # Configure logging from settings (updates both logger and handler levels)
