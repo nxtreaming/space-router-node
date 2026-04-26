@@ -1,0 +1,83 @@
+"""Top-level provider settings loader.
+
+Resolution order (Track P0 of the v1.5 stabilization plan):
+
+1. If ``settings.json`` exists → load and return it.
+2. Else if ``spacerouter.env`` exists → migrate it to ``settings.json``,
+   rename the env file to a ``.migrated.bak`` so we never re-migrate.
+3. Else → fall back to env-var resolution via the legacy ``app.config``
+   path, then **save** the resolved values as ``settings.json`` so the
+   next launch is JSON-driven.
+
+This is deliberately a thin wrapper. The full env-var sweep across
+``app/main.py``, ``gui/api.py``, etc. is a follow-up track (P5/P10);
+this module only adds the new entry point + the migration glue.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from pathlib import Path
+
+from app.settings_v2 import Settings
+
+logger = logging.getLogger(__name__)
+
+
+def _spacerouter_dir() -> Path:
+    """Return the user's ``~/.spacerouter`` directory.
+
+    We use ``Path.home() / ".spacerouter"`` regardless of platform — this
+    matches the schema's ``settlement_key_path`` default. The GUI uses a
+    different (platform-native) location for its existing
+    ``spacerouter.env``; that path is passed in explicitly via
+    :py:func:`load_provider_settings_from`.
+    """
+    return Path.home() / ".spacerouter"
+
+
+def settings_path(directory: Path | None = None) -> Path:
+    return (directory or _spacerouter_dir()) / "settings.json"
+
+
+def env_path(directory: Path | None = None) -> Path:
+    return (directory or _spacerouter_dir()) / "spacerouter.env"
+
+
+def load_provider_settings(directory: Path | None = None) -> Settings:
+    """Resolve provider settings using the full Track P0 chain.
+
+    *directory* defaults to ``~/.spacerouter``. The GUI (``gui/config_store.py``)
+    passes its platform-native config dir explicitly.
+    """
+    directory = directory or _spacerouter_dir()
+    s_path = settings_path(directory)
+    e_path = env_path(directory)
+
+    # Step 1 — JSON exists, just load it.
+    if s_path.exists():
+        s = Settings.load(s_path)
+        logger.info("settings loaded from: %s", s_path)
+        return s
+
+    # Step 2 — legacy env file exists, migrate.
+    if e_path.exists():
+        s = Settings.migrate_from_env_file(e_path, s_path)
+        logger.info("settings loaded from: %s (migrated from %s)", s_path, e_path)
+        return s
+
+    # Step 3 — last-resort env-var resolution. Build a Settings from
+    # whatever ``SR_*`` vars are in os.environ, persist it, and use it.
+    env_vars = {k: v for k, v in os.environ.items() if k.startswith("SR_")}
+    if env_vars:
+        s = Settings.from_env_mapping(env_vars)
+        directory.mkdir(parents=True, exist_ok=True)
+        s.save(s_path)
+        logger.info("settings loaded from: %s (seeded from environment)", s_path)
+        return s
+
+    # Step 4 — no config anywhere. Return defaults; first-run wizard will
+    # create the file when it has values to persist.
+    logger.info("settings loaded from: <defaults> (no settings.json yet)")
+    return Settings()

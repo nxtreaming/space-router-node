@@ -103,7 +103,44 @@ class ConfigStore:
     def __init__(self) -> None:
         self._dir = _config_dir()
         self._path = self._dir / "spacerouter.env"
+        self._settings_json_path = self._dir / "settings.json"
         self._ensure_file()
+        # Track P0: opportunistic forward-migration. Idempotent — bails
+        # immediately if settings.json already exists. Failures are logged
+        # but never raised; the legacy env-file flow remains usable.
+        self.migrate_to_settings_json()
+
+    def migrate_to_settings_json(self) -> "object | None":
+        """Migrate this GUI's spacerouter.env into a sibling settings.json.
+
+        Idempotent. Returns the loaded :py:class:`app.settings_v2.Settings`
+        when something happens, ``None`` when settings.json already exists
+        (so callers don't need to special-case the no-op path).
+
+        We deliberately keep ``save_wallets()`` / ``save_environment()`` /
+        etc. writing to ``spacerouter.env`` for now — the field-by-field
+        sweep of GUI consumers is a follow-up track. This method only
+        bootstraps the new file so downstream daemon code can read it.
+        """
+        try:
+            from app.settings_v2 import Settings as _SettingsV2
+        except ImportError:
+            return None
+
+        try:
+            return _SettingsV2.migrate_from_env_file(
+                self._path,
+                self._settings_json_path,
+                # GUI keeps writing spacerouter.env until the per-field
+                # sweep lands, so we MUST NOT rename it during transition.
+                rename_after=False,
+            )
+        except Exception as e:  # noqa: BLE001
+            import logging
+            logging.getLogger(__name__).warning(
+                "settings.json migration skipped due to error: %s", e
+            )
+            return None
 
     def _ensure_file(self) -> None:
         """Create config dir and file with defaults if they don't exist."""
@@ -264,6 +301,21 @@ class ConfigStore:
         for key, value in self.load().items():
             if value:
                 os.environ[key] = value
+
+        # Track P0 belt-and-suspenders: ALSO export SR_BUILD_VARIANT from
+        # the persisted settings.json (when present). The macOS rotation
+        # bug was caused by this env var being unstable across launchers
+        # (Finder vs shell). Persisting + re-exporting locks it down for
+        # any code path still doing ``os.environ.get("SR_BUILD_VARIANT")``.
+        # Once the env-var sweep lands in a future PR, this block goes away.
+        try:
+            from app.settings_v2 import Settings as _SettingsV2
+            if self._settings_json_path.exists():
+                bv = _SettingsV2.load(self._settings_json_path).build_variant
+                os.environ["SR_BUILD_VARIANT"] = bv
+        except Exception:  # noqa: BLE001
+            # Best-effort; never block startup on this.
+            pass
 
         # Point TLS cert + identity key paths to the writable config directory.
         # The default relative paths ("certs/...") resolve inside the PyInstaller
