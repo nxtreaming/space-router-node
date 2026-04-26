@@ -165,6 +165,16 @@ class Settings(BaseSettings):
     GATEWAY_PAYER_ADDRESS: str = ""         # Gateway's EOA — payer in escrow
     CLAIM_BATCH_SIZE: int = 50              # Max receipts per claimBatch tx
 
+    # ── Auto-claim (P10) ──────────────────────────────────────────────
+    # Optional background monitor that fires claim_all() when claimable
+    # receipts cross either threshold (OR semantics). Default OFF — operators
+    # opt in via settings.json. See app/payment/auto_claim.py.
+    AUTO_CLAIM_ENABLED: bool = False
+    # Stored as str to survive >2^53 wei amounts JSON-side; coerced to int
+    # at consumption time inside the monitor.
+    AUTO_CLAIM_THRESHOLD_SPACE_WEI: str = "10000000000000000000"  # 10 SPACE
+    AUTO_CLAIM_THRESHOLD_COUNT: int = 10
+
     @field_validator("REGISTRATION_MODE")
     @classmethod
     def _validate_registration_mode(cls, v: str) -> str:
@@ -232,6 +242,9 @@ def _settings_from_provider_settings(new) -> Settings:
         ESCROW_CHAIN_ID=_coerce_int(new.escrow.chain_id, default=102031),
         GATEWAY_PAYER_ADDRESS=new.escrow.gateway_payer_address or "",
         CLAIM_BATCH_SIZE=new.claim.batch_size,
+        AUTO_CLAIM_ENABLED=new.claim.auto_claim_enabled,
+        AUTO_CLAIM_THRESHOLD_SPACE_WEI=new.claim.auto_claim_threshold_space_wei,
+        AUTO_CLAIM_THRESHOLD_COUNT=new.claim.auto_claim_threshold_count,
     )
 
 

@@ -346,6 +346,7 @@ class _NodeContext:
         self.version_check = None  # VersionCheckResult | None
         self.receipt_poller = None  # ReceiptPoller | None
         self.claim_reaper = None  # ClaimReaper | None
+        self.auto_claim_monitor = None  # AutoClaimMonitor | None
 
 
 async def _phase_init(ctx: _NodeContext) -> None:
@@ -563,11 +564,29 @@ async def _init_receipt_submitter(ctx: _NodeContext) -> None:
         await reaper.start()
         ctx.claim_reaper = reaper
 
+    # P10 — optional auto-claim monitor. Default OFF; only spins up when
+    # the operator opted in via settings.json. Same lifecycle as the
+    # reaper: start now, stop on daemon shutdown. Reuses the daemon's
+    # already-resolved identity key as the settlement key (matching the
+    # CLI ``--claim`` default), so the monitor never has to re-prompt
+    # for a passphrase from a background task.
+    from app.payment.auto_claim import AutoClaimMonitor
+    settlement_key_hex = os.environ.get("SR_SETTLEMENT_KEY", "") or (
+        ctx.identity_key if ctx.identity_key.startswith("0x")
+        else ("0x" + ctx.identity_key if ctx.identity_key else "")
+    )
+    auto_claim = AutoClaimMonitor(
+        settings=ctx.s, settlement_key_hex=settlement_key_hex or None,
+    )
+    if auto_claim.enabled:
+        await auto_claim.start()
+        ctx.auto_claim_monitor = auto_claim
+
     logger.info(
         "Leg 2 submitter ready — payer=%s node_wallet=%s rate=%d/GB "
-        "(poller every 10s, reaper enabled=%s)",
+        "(poller every 10s, reaper enabled=%s, auto-claim enabled=%s)",
         gateway_payer, node_wallet[:12] + "...",
-        ctx.s.NODE_RATE_PER_GB, reaper.enabled,
+        ctx.s.NODE_RATE_PER_GB, reaper.enabled, auto_claim.enabled,
     )
 
     # Sanity checks for Leg 2 config — ERROR-log only, never fail
@@ -1749,6 +1768,13 @@ async def _run(
                     await ctx.claim_reaper.stop()
                 except Exception:
                     logger.debug("Claim reaper stop errored", exc_info=True)
+
+            # Stop auto-claim monitor (P10)
+            if ctx.auto_claim_monitor is not None:
+                try:
+                    await ctx.auto_claim_monitor.stop()
+                except Exception:
+                    logger.debug("Auto-claim monitor stop errored", exc_info=True)
 
             # Remove UPnP mapping
             if ctx.upnp_endpoint:
