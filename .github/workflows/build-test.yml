@@ -51,7 +51,7 @@ jobs:
         id: version
         shell: bash
         run: |
-          VERSION="v0.0.0-test.${{ github.run_number }}"
+          VERSION="v1.5.0-test.${{ github.run_number }}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Building test version: ${VERSION}"
 
@@ -129,7 +129,7 @@ jobs:
         id: version
         shell: bash
         run: |
-          VERSION="v0.0.0-test.${{ github.run_number }}"
+          VERSION="v1.5.0-test.${{ github.run_number }}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Building GUI test version: ${VERSION}"
 
