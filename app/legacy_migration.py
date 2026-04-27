@@ -75,14 +75,33 @@ def _read_persisted_variant(legacy_dir: Path) -> str | None:
         return None
 
 
+def _active_build_variant() -> str | None:
+    """Return the active BUILD_VARIANT, or None if the variant module
+    isn't importable (defensive — should never happen in production)."""
+    try:
+        from app.variant import BUILD_VARIANT
+        return BUILD_VARIANT
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _pick_legacy_dir(candidates: list[Path]) -> Path | None:
     """Pick which of the candidates we want to migrate from.
 
-    Strategy:
+    Strategy (in order):
+
     1. Drop entries that don't exist or are empty.
     2. If exactly one remains, use it.
-    3. If more than one, prefer non-``-Test`` (production) and warn
-       about the other. Operator can run a manual copy if needed.
+    3. If more than one, prefer the dir matching the active
+       ``BUILD_VARIANT`` — ``SpaceRouter`` for production, ``SpaceRouter-Test``
+       for test. This is the right call: a test build picking up a stale
+       prod-variant App Support dir was the v1.5.0-test.85 footgun where
+       the daemon migrated prod settings (with a prod coord URL!) into a
+       fresh test install.
+    4. Fall back to non-``-Test`` (production) if BUILD_VARIANT didn't
+       help — preserves pre-fix behaviour as the safe default.
+
+    The unchosen dir gets a WARN so the operator can resolve manually.
     """
     populated = [p for p in candidates if p.exists() and not _is_dir_empty(p)]
     if not populated:
@@ -90,14 +109,28 @@ def _pick_legacy_dir(candidates: list[Path]) -> Path | None:
     if len(populated) == 1:
         return populated[0]
 
-    prod = next((p for p in populated if not p.name.endswith("-Test")), None)
-    chosen = prod or populated[0]
+    chosen: Path | None = None
+    variant = _active_build_variant()
+    if variant == "test":
+        chosen = next((p for p in populated if p.name.endswith("-Test")), None)
+    elif variant in ("production", "prod"):
+        chosen = next((p for p in populated if not p.name.endswith("-Test")), None)
+
+    # Fall back to "production wins" if the variant lookup didn't
+    # produce a match (unknown variant, or only the wrong dir exists).
+    if chosen is None:
+        chosen = next((p for p in populated if not p.name.endswith("-Test")), None)
+    if chosen is None:
+        chosen = populated[0]
+
     others = [p for p in populated if p != chosen]
     for other in others:
         logger.warning(
-            "Multiple legacy macOS config dirs found. Migrating %s; "
-            "ignoring %s — re-run with that path manually if you want it.",
+            "Multiple legacy macOS config dirs found. Migrating %s "
+            "(matches build_variant=%r); ignoring %s — re-run with that "
+            "path manually if you want it.",
             chosen,
+            variant,
             other,
         )
     return chosen
