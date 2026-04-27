@@ -139,9 +139,11 @@ def test_aborts_when_target_already_populated(fake_macos, caplog):
     assert "Skipping auto-migration" in caplog.text
 
 
-def test_picks_prod_over_test_when_both_exist(fake_macos, caplog):
+def test_picks_prod_when_variant_is_production(fake_macos, monkeypatch, caplog):
+    """Build variant = production → SpaceRouter (non-Test) wins."""
     _seed_legacy(fake_macos["prod"], files={"who.txt": "prod"})
     _seed_legacy(fake_macos["test"], files={"who.txt": "test"})
+    monkeypatch.setattr("app.variant.BUILD_VARIANT", "production")
 
     target = fake_macos["target"]
 
@@ -152,6 +154,41 @@ def test_picks_prod_over_test_when_both_exist(fake_macos, caplog):
     assert (target / "who.txt").read_text() == "prod"
     assert "ignoring" in caplog.text
     assert "SpaceRouter-Test" in caplog.text
+
+
+def test_picks_test_when_variant_is_test(fake_macos, monkeypatch, caplog):
+    """Build variant = test → SpaceRouter-Test wins. This was the
+    v1.5.0-test.85 footgun: the migrator picked the prod dir (with a prod
+    coord URL inside its spacerouter.env) and stamped it into a fresh
+    test install, sending the test build at production coord. Lock the
+    variant-match behaviour in."""
+    _seed_legacy(fake_macos["prod"], files={"who.txt": "prod"})
+    _seed_legacy(fake_macos["test"], files={"who.txt": "test"})
+    monkeypatch.setattr("app.variant.BUILD_VARIANT", "test")
+
+    target = fake_macos["target"]
+
+    with caplog.at_level("WARNING", logger="app.legacy_migration"):
+        moved = legacy_migration.maybe_migrate_legacy_macos(target)
+
+    assert moved is True
+    assert (target / "who.txt").read_text() == "test"
+    assert "ignoring" in caplog.text
+    assert "build_variant='test'" in caplog.text
+
+
+def test_picks_prod_when_variant_unknown(fake_macos, monkeypatch, caplog):
+    """Unknown variant → falls back to "production wins" (pre-fix
+    behaviour) so we don't surprise users with an arbitrary pick."""
+    _seed_legacy(fake_macos["prod"], files={"who.txt": "prod"})
+    _seed_legacy(fake_macos["test"], files={"who.txt": "test"})
+    monkeypatch.setattr("app.variant.BUILD_VARIANT", "something-weird")
+
+    target = fake_macos["target"]
+    moved = legacy_migration.maybe_migrate_legacy_macos(target)
+
+    assert moved is True
+    assert (target / "who.txt").read_text() == "prod"
 
 
 def test_uses_only_test_dir_when_prod_missing(fake_macos):
