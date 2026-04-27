@@ -21,15 +21,15 @@ The Home Node:
 ## Quick start
 
 ```bash
-# Install dependencies
 pip install -r requirements.txt
-
-# Configure the Coordination API URL (required for production)
-export SR_COORDINATION_API_URL=https://spacerouter-coordination-api.fly.dev
-
-# Run — first-time setup wizard starts automatically in a terminal
 python -m app.main
 ```
+
+On first launch the daemon creates `~/.spacerouter/settings.json` with safe
+defaults, syncs the Leg 2 rate from the Coordination API (trust-on-first-use),
+and generates a node identity key. The only thing you typically need to set
+yourself is your **staking address** — via the GUI or by editing
+`settings.json` directly. No environment variables are required.
 
 On first run in an interactive terminal the wizard will prompt for:
 1. **Identity key** — generate a new one (recommended) or import an existing hex private key
@@ -40,6 +40,23 @@ On first run in an interactive terminal the wizard will prompt for:
 In non-interactive / headless environments (CI, service startup) the wizard is skipped and the identity key is auto-generated (cryptographically random) and encrypted at rest with `SR_IDENTITY_PASSPHRASE` if set (plaintext by default).
 
 ## Configuration
+
+As of v1.5, the canonical configuration store is **`~/.spacerouter/settings.json`**
+on Linux, macOS, and Windows. The daemon auto-creates it on first launch with
+safe defaults; the file is rewritten atomically and validated by a Pydantic
+schema on load. Top-level sections:
+
+- `node` — port, log level, mTLS, UPnP
+- `wallet` — `staking_address`, `collection_address`, `settlement_key_path`
+- `coordination` — `url` (Coordination API)
+- `escrow` — `leg2_rate_per_gb`, `synced_from_coord_at` (synced from coord)
+- `claim` — auto-claim toggle and thresholds (see below)
+- `receipts` — retry caps and reaper intervals
+
+Pre-v1.5 installs configured the daemon via `SR_*` environment variables. Those
+are still honored: a legacy `~/.spacerouter/spacerouter.env` is auto-migrated
+to JSON on first v1.5 launch (and renamed to `.migrated.bak`). After migration
+the JSON file is the source of truth.
 
 | Environment Variable | Default | Description |
 |---|---|---|
@@ -78,6 +95,25 @@ If a plaintext key file exists and `SR_IDENTITY_PASSPHRASE` is later configured,
 
 > **Note:** When the wizard saves a passphrase, it is written in plaintext to `.env` as `SR_IDENTITY_PASSPHRASE`. This means the encrypted key and its passphrase are co-located on the filesystem; passphrase encryption primarily protects against accidental key file exposure, not against an adversary with full filesystem access.
 
+## Optional auto-claim
+
+By default the daemon stores signed Leg 2 receipts locally and you submit them
+on-chain manually via `--claim`. To have claims fire automatically, set
+`claim.auto_claim_enabled` to `true` in `settings.json`. The monitor uses
+**OR semantics**: a batch is submitted as soon as **either** threshold is
+crossed (default: 10 SPACE accumulated **or** 10 unsubmitted receipts; set a
+threshold to `0` to disable that side). Auto-claim is **off by default**.
+
+## Claiming receipts manually
+
+```bash
+python -m app.main --claim
+```
+
+On macOS, the same CLI ships inside the GUI bundle, so you don't need a source
+install: `/Applications/SpaceRouter.app/Contents/MacOS/space-router-node --claim`.
+Useful flags: `--include-retryable`, `--uuid <UUID>`, `--receipts` (list).
+
 ## macOS launchd service
 
 Install as a system service that starts at boot:
@@ -102,9 +138,10 @@ pytest tests/ -v
 
 The Home Node communicates with two components:
 
-**Coordination API** (registration):
+**Coordination API** (registration + config sync):
 - `POST /nodes` — register on startup
 - `PATCH /nodes/{id}/status` — set status to `offline` on shutdown
+- `GET /config` — fetch escrow contract address, chain RPC, Leg 2 rate (trust-on-first-use)
 
 **Proxy Gateway** (inbound proxy traffic):
 - Accepts TLS TCP connections on `SR_NODE_PORT`
@@ -113,3 +150,30 @@ The Home Node communicates with two components:
 - Strips all `X-SpaceRouter-*` and `Proxy-Authorization` headers before forwarding to targets
 
 Full component contracts and protocol specifications are maintained separately; contact the maintainers for access.
+
+## FAQ
+
+**Why is my Node ID different than yesterday?** In v1.5 the identity key
+path is sticky across restarts, so this shouldn't happen on a stable install.
+If it does, either the key file at `wallet.settlement_key_path` was moved /
+deleted, or `BUILD_VARIANT` flipped (e.g. you swapped a `test` build for a
+`production` build) and the daemon is now looking in a different directory.
+Check the startup log for `build_variant=` to confirm.
+
+**Where's my config?** `~/.spacerouter/settings.json` on Linux, macOS, and
+Windows. Auto-created on first launch.
+
+**How do I set my rate?** You don't. The Leg 2 rate syncs from the
+Coordination API's `/config` endpoint on first launch and is frozen into
+`settings.json` with a `synced_from_coord_at` timestamp. Providers and the
+gateway must agree on the rate or settlements won't verify.
+
+**Can I run two daemons on the same machine?** No. The daemon takes an
+exclusive lock at `~/.spacerouter/daemon.lock` on startup; a second instance
+will refuse to start. This is intentional — two daemons sharing one identity
+key would race on receipt-claim submissions and corrupt the local SQLite
+store. If you need multiple nodes on one box, use separate user accounts.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
