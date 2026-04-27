@@ -54,8 +54,12 @@ def load_provider_settings(directory: Path | None = None) -> Settings:
     """
     directory = directory or _spacerouter_dir()
 
-    # Step 0 — one-shot copy of legacy macOS Application Support data.
-    # No-op on Linux/Windows or when the sentinel says we already did it.
+    # Step 0 — one-shot copy of legacy per-platform config dirs.
+    # macOS pulls from ~/Library/Application Support/SpaceRouter[-Test]/.
+    # Linux pulls from ~/.config/spacerouter/ (XDG default).
+    # Windows v1.4 already used ~/.spacerouter, so no migration there.
+    # Both calls are no-ops on the wrong platform or when the relevant
+    # sentinel says we already did it.
     # Done BEFORE we look for settings.json so the migrated file ends up
     # exactly where load() expects it.
     try:
@@ -68,6 +72,19 @@ def load_provider_settings(directory: Path | None = None) -> Settings:
     except Exception:  # noqa: BLE001
         # Best-effort: never let a migration glitch block startup.
         logger.warning("legacy macOS migration skipped due to error", exc_info=True)
+
+    try:
+        from app.legacy_migration import maybe_migrate_legacy_linux
+        moved = maybe_migrate_legacy_linux(directory)
+        if moved:
+            logger.info("legacy Linux XDG migration: migrated to %s", directory)
+        else:
+            logger.debug("legacy Linux XDG migration: skipped (not applicable)")
+    except Exception:  # noqa: BLE001
+        # Best-effort: never let a migration glitch block startup.
+        logger.warning(
+            "legacy Linux XDG migration skipped due to error", exc_info=True
+        )
 
     s_path = settings_path(directory)
     e_path = env_path(directory)
