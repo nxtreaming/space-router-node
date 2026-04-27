@@ -98,12 +98,47 @@ jobs:
           SR_NODE_PORT: "19090"
           SR_WALLET_ADDRESS: "0x0000000000000000000000000000000000000001"
 
+      # Build Linux packages (.deb and .rpm) via nfpm — mirrors build.yml's
+      # release flow so test builds get the same install surface real users
+      # will see at v1.5 GA. Without this, dev-latest assets ship as raw
+      # ELFs and end-user testing can't exercise the dpkg / rpm install
+      # path. See v1.5-remaining-work-plan.md (Phase A4 finding).
+      - name: Set up Go (for nfpm)
+        if: runner.os == 'Linux'
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Build Linux packages
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+          export PATH="$(go env GOPATH)/bin:$PATH"
+
+          VERSION="${{ steps.version.outputs.version }}"
+          # Strip leading 'v' for package version (nfpm wants 1.5.0-test.123,
+          # not v1.5.0-test.123).
+          PKG_VERSION="${VERSION#v}"
+          ARTIFACT="${{ matrix.artifact }}"
+
+          # Update nfpm.yaml source path to match the versioned artifact name
+          sed -i "s|dist/space-router-node-linux-x64|dist/${ARTIFACT}|" nfpm.yaml
+
+          # Build .deb
+          VERSION="${PKG_VERSION}" nfpm package --packager deb --target "dist/${ARTIFACT}.deb"
+
+          # Build .rpm
+          VERSION="${PKG_VERSION}" nfpm package --packager rpm --target "dist/${ARTIFACT}.rpm"
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: |
             dist/${{ matrix.artifact }}
             dist/${{ matrix.artifact }}.exe
+            dist/${{ matrix.artifact }}.deb
+            dist/${{ matrix.artifact }}.rpm
 
   build-gui:
     needs: test
