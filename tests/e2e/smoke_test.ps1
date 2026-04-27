@@ -52,9 +52,29 @@ function Stop-DaemonAndClearLock {
     if ($null -eq $Proc) { return }
     try {
         if (-not $Proc.HasExited) {
-            Stop-Process -Id $Proc.Id -Force -ErrorAction SilentlyContinue
+            # IMPORTANT: PyInstaller produces a bootloader .exe that
+            # spawns the actual Python child process. Stop-Process
+            # kills only the named PID — the orphan child keeps the
+            # daemon.lock and continues handling traffic. We need
+            # taskkill /T (tree) /F (force) to kill the whole tree.
+            #
+            # Without /T the next sub-test sees the orphan, refuses to
+            # acquire the lock, and the test fails with "Another daemon
+            # already running" — even though Test-PortBinding logged
+            # PASS. Caught in the test.93 CI run after PR #84's
+            # PID-reuse fix wasn't enough.
+            $taskkillExe = Join-Path $env:SystemRoot "System32\taskkill.exe"
+            if (Test-Path $taskkillExe) {
+                & $taskkillExe /PID $Proc.Id /T /F 2>$null | Out-Null
+            } else {
+                Stop-Process -Id $Proc.Id -Force -ErrorAction SilentlyContinue
+            }
         }
         $Proc.WaitForExit($WaitMs) | Out-Null
+        # WaitForExit returns when the named PID exits. Children may
+        # take a tick longer to clean up — short fixed sleep makes the
+        # next acquire reliable.
+        Start-Sleep -Milliseconds 500
     }
     catch { }
     Remove-Item -Force -ErrorAction SilentlyContinue $script:DaemonLockPath
@@ -226,15 +246,22 @@ function Test-CleanShutdown {
         Log "WARNING: Port not detected as listening, proceeding with shutdown test anyway"
     }
 
-    # On Windows, console apps don't respond to WM_CLOSE (taskkill without /F).
-    # Python handles CTRL_C_EVENT, but sending it via GenerateConsoleCtrlEvent
-    # would also signal the parent process. Use Stop-Process (TerminateProcess)
-    # which is the standard way to stop services on Windows.
-    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-    Log "Sent stop signal to PID $($proc.Id)"
+    # On Windows, console apps don't respond to WM_CLOSE. Use taskkill /T /F
+    # to kill the entire process tree — without /T the PyInstaller
+    # bootloader exits but the actual Python child orphan keeps running
+    # and holds the daemon.lock. Same fix shape as Stop-DaemonAndClearLock.
+    $taskkillExe = Join-Path $env:SystemRoot "System32\taskkill.exe"
+    if (Test-Path $taskkillExe) {
+        & $taskkillExe /PID $proc.Id /T /F 2>$null | Out-Null
+    } else {
+        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    }
+    Log "Sent stop signal to PID $($proc.Id) (tree)"
 
-    # Wait up to 10 seconds for exit
+    # Wait up to 10 seconds for exit of the named PID
     $exited = $proc.WaitForExit(10000)
+    # Children may take a moment longer
+    Start-Sleep -Milliseconds 500
 
     # Always tidy the lock file — if the test fails, the next CI run on
     # a recycled runner image shouldn't inherit a stuck lock.
