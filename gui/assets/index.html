@@ -135,6 +135,41 @@
     TEST BUILD <span id="test-env-label"></span>
   </div>
 
+  <!-- Sticky Incident Banner (auto-claim failures persist across restarts) -->
+  <div id="incident-banner" class="incident-banner" style="display: none;">
+    <span class="incident-banner-icon">&#9888;</span>
+    <div class="incident-banner-body">
+      <div class="incident-banner-title" id="incident-banner-title">Auto-claim failed</div>
+      <div class="incident-banner-text" id="incident-banner-text"></div>
+    </div>
+    <div class="incident-banner-actions">
+      <button id="btn-incident-log" class="btn-ghost-small">Show log</button>
+      <button id="btn-incident-retry" class="btn-ghost-small">Retry now</button>
+      <button id="btn-incident-disable" class="btn-ghost-small">Disable auto-claim</button>
+      <button id="btn-incident-dismiss" class="incident-banner-close" title="Dismiss">&times;</button>
+    </div>
+  </div>
+
+  <!-- Friendly Error Modal (rendered for known error codes from the daemon) -->
+  <div id="error-catalog-overlay" class="staking-modal-overlay" style="display: none;">
+    <div class="staking-modal">
+      <div class="staking-modal-title" id="error-catalog-title">Something went wrong</div>
+      <div class="staking-modal-body" id="error-catalog-body"></div>
+      <div id="error-catalog-remediation" class="error-catalog-remediation"></div>
+      <button id="btn-error-primary" class="staking-modal-primary" style="display: none;"></button>
+      <button id="btn-error-secondary" class="staking-modal-secondary">Close</button>
+    </div>
+  </div>
+
+  <!-- Log viewer modal (used by the incident banner's Show log button) -->
+  <div id="log-viewer-overlay" class="staking-modal-overlay" style="display: none;">
+    <div class="staking-modal" style="width: 480px; max-width: 92vw; text-align: left;">
+      <div class="staking-modal-title">Recent logs</div>
+      <pre id="log-viewer-body" class="log-viewer-body"></pre>
+      <button id="btn-log-close" class="staking-modal-secondary">Close</button>
+    </div>
+  </div>
+
   <!-- Status Dashboard -->
   <div id="screen-status" class="screen" style="display: none;">
     <div class="container">
@@ -312,6 +347,31 @@
           WARNING: Disabling mTLS removes gateway authentication. Your node will accept
           connections from any proxy gateway, not just authorized ones. Only disable this
           for testing with environments that do not require mTLS.
+        </div>
+      </div>
+
+      <!-- Auto-claim — all builds (when escrow is configured) -->
+      <div id="settings-autoclaim-group" class="input-group" style="display: none;">
+        <label>Auto-claim</label>
+        <div class="toggle-row">
+          <span class="toggle-label" id="autoclaim-label">Disabled</span>
+          <label class="toggle-switch">
+            <input type="checkbox" id="settings-autoclaim-enabled">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <div id="autoclaim-thresholds" style="display: none; margin-top: 8px;">
+          <div class="input-group" style="margin-top: 0;">
+            <label for="autoclaim-threshold-space">Threshold (SPACE)</label>
+            <input type="number" id="autoclaim-threshold-space" step="0.01" min="0" placeholder="10">
+            <span class="hint">Auto-claim fires when claimable balance reaches this amount.</span>
+          </div>
+          <div class="input-group">
+            <label for="autoclaim-threshold-count">Threshold (receipts)</label>
+            <input type="number" id="autoclaim-threshold-count" step="1" min="0" placeholder="10">
+            <span class="hint">Auto-claim also fires when this many receipts accumulate. Either trip is enough.</span>
+          </div>
+          <div class="autoclaim-status" id="autoclaim-status"></div>
         </div>
       </div>
 
