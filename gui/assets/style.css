@@ -1090,3 +1090,120 @@ body.has-test-banner .screen {
 .toast.success { border-color: rgba(46, 204, 113, 0.5); }
 .toast.warn    { border-color: rgba(243, 156, 18, 0.5); }
 .toast.error   { border-color: rgba(231, 76, 60, 0.5); }
+
+/* ── Sticky incident banner (auto-claim failures, etc.) ──
+ *
+ * Persistent across GUI restarts via ~/.spacerouter/incidents.json.
+ * Sits above the test banner when both are present.
+ */
+.incident-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  background: rgba(231, 76, 60, 0.18);
+  border-bottom: 1px solid rgba(231, 76, 60, 0.5);
+  color: #ffd0c8;
+  padding: 10px 14px;
+  z-index: 250;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: 13px;
+  -webkit-user-select: text;
+  user-select: text;
+}
+body.has-incident-banner { padding-top: 56px; }
+body.has-incident-banner.has-test-banner { padding-top: 88px; }
+.has-incident-banner.has-test-banner #test-banner { top: 56px; }
+.incident-banner-icon {
+  color: #f39c12;
+  font-size: 16px;
+  line-height: 1;
+  padding-top: 1px;
+}
+.incident-banner-body { flex: 1; min-width: 0; }
+.incident-banner-title { font-weight: 600; margin-bottom: 2px; color: #fff; }
+.incident-banner-text { color: #f4cfc8; font-size: 12px; word-break: break-word; }
+.incident-banner-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.btn-ghost-small {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: #f4cfc8;
+  border-radius: 5px;
+  padding: 4px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.btn-ghost-small:hover { background: rgba(255, 255, 255, 0.16); }
+.incident-banner-close {
+  background: none;
+  border: none;
+  color: #f4cfc8;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+/* ── Friendly error modal extras ── */
+.error-catalog-remediation {
+  font-size: 12px;
+  color: #8080a0;
+  margin-top: 8px;
+  text-align: left;
+  width: 100%;
+}
+.error-catalog-remediation a {
+  color: #5acaff;
+  text-decoration: underline;
+}
+
+/* ── Log viewer ── */
+.log-viewer-body {
+  background: #0a0a14;
+  border: 1px solid #2a2a40;
+  border-radius: 6px;
+  padding: 10px;
+  max-height: 60vh;
+  overflow: auto;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: #c0c0d8;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin-bottom: 12px;
+  text-align: left;
+}
+
+/* ── Auto-claim settings panel ── */
+.autoclaim-status {
+  font-size: 11px;
+  color: #8080a0;
+  margin-top: 6px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 6px;
+  text-align: left;
+}
+.autoclaim-status.has-error { color: #e74c3c; }
+.autoclaim-status.has-success { color: #2ecc71; }
+
+/* ── Claim history badge (audit row source) ── */
+.history-badge {
+  display: inline-block;
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  margin-left: 6px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+}
+.history-badge.tx       { background: rgba(46, 204, 113, 0.18); color: #2ecc71; }
+.history-badge.external { background: rgba(155, 89, 182, 0.18); color: #b58bd6; }

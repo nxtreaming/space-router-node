@@ -14,9 +14,27 @@ const ENV_URLS = {
 
 let statusPollId = null;
 let receiptsPollId = null;
+let incidentPollId = null;
 let currentClaimTaskId = null;
 let isTestBuild = false;
 let versionModalDismissed = false;  // reset on each node start
+
+// G6 — local transitional flag suppresses the polling-loop button
+// label flicker between click and backend-confirmed state change.
+// The flag clears once the backend reports the new state OR after a
+// hard timeout so a stuck request never freezes the UI.
+let nodeTransition = null;  // 'starting' | 'stopping' | null
+let nodeTransitionTimer = null;
+function setNodeTransition(kind) {
+  nodeTransition = kind;
+  if (nodeTransitionTimer) clearTimeout(nodeTransitionTimer);
+  if (kind) {
+    // After 20s, assume the backend won't catch up cleanly and let
+    // the polling loop take over. Same upper bound as stop()'s
+    // default join timeout.
+    nodeTransitionTimer = setTimeout(() => { nodeTransition = null; }, 20000);
+  }
+}
 
 // ── Helpers ──
 
@@ -714,7 +732,41 @@ async function updateStatus() {
     // Cert expiry warning
     certWarning.style.display = status.cert_expiry_warning ? "block" : "none";
 
-    // Action buttons
+    // Action buttons.
+    //
+    // G6 fix: while a click-driven transition is in flight (the user
+    // has just hit Start or Stop and we haven't seen the backend
+    // confirm yet) we keep the *clicked* button visible with its
+    // "Starting…/Stopping…" disabled label rather than letting the
+    // poll-driven branch flip it back to the opposite state for one
+    // tick. The transition flag clears as soon as the backend state
+    // changes (or after a hard 20s timeout, see setNodeTransition).
+    if (nodeTransition === "starting" && (state === "idle" || !state)) {
+      btnRetry.style.display = "none";
+      btnStartNode.style.display = "block";
+      btnStartNode.disabled = true;
+      btnStartNode.textContent = "Starting...";
+      btnStop.style.display = "none";
+      return;
+    }
+    if (nodeTransition === "stopping" && state !== "idle"
+        && state !== "error_permanent") {
+      btnRetry.style.display = "none";
+      btnStartNode.style.display = "none";
+      btnStop.style.display = "block";
+      btnStop.disabled = true;
+      btnStop.textContent = "Stopping...";
+      return;
+    }
+    // Backend has caught up — clear the flag and render the
+    // canonical button for the current state.
+    if (nodeTransition === "starting" && state !== "idle") {
+      setNodeTransition(null);
+    } else if (nodeTransition === "stopping"
+               && (state === "idle" || state === "error_permanent")) {
+      setNodeTransition(null);
+    }
+
     if (state === "error_permanent") {
       btnRetry.style.display = "block";
       btnStartNode.style.display = "none";
@@ -722,11 +774,15 @@ async function updateStatus() {
     } else if (state === "idle") {
       btnRetry.style.display = "none";
       btnStartNode.style.display = "block";
+      btnStartNode.disabled = false;
+      btnStartNode.textContent = "Start";
       btnStop.style.display = "none";
     } else {
       btnRetry.style.display = "none";
       btnStartNode.style.display = "none";
       btnStop.style.display = "block";
+      btnStop.disabled = false;
+      btnStop.textContent = "Stop";
     }
   } catch (e) {
     // Backend not ready yet — ignore
@@ -792,27 +848,36 @@ function initActionButtons() {
     btn.textContent = "Retry";
   });
 
+  // G6: suppress the Start → Starting → Start → Stop flicker. We hold
+  // the "Starting…" label until the polling loop sees a non-IDLE
+  // state, at which point the action-buttons block in updateStatus()
+  // hides this button entirely.
   $("#btn-start-node").addEventListener("click", async function () {
     const btn = $("#btn-start-node");
+    setNodeTransition("starting");
     btn.disabled = true;
     btn.textContent = "Starting...";
     versionModalDismissed = false;
     try {
       await window.pywebview.api.start_node();
     } catch (e) {}
-    btn.disabled = false;
-    btn.textContent = "Start";
+    // Don't reset the label here. The polling loop will drive the
+    // visible button based on the new state once the backend
+    // transitions out of IDLE; setNodeTransition keeps Start hidden
+    // in the meantime.
   });
 
+  // Same for Stop. We blank the staking_status synchronously
+  // server-side (G5) and hold the "Stopping…" label until the loop
+  // confirms the transition.
   $("#btn-stop").addEventListener("click", async function () {
     const btn = $("#btn-stop");
+    setNodeTransition("stopping");
     btn.disabled = true;
     btn.textContent = "Stopping...";
     try {
       await window.pywebview.api.stop_node();
     } catch (e) {}
-    btn.disabled = false;
-    btn.textContent = "Stop";
   });
 }
 
@@ -900,6 +965,9 @@ function initSettings() {
       }
     }
 
+    // Auto-claim panel — load current config + status into the form.
+    await loadAutoClaimPanel();
+
     statusEl.textContent = "";
     hideAll();
     show("screen-settings");
@@ -935,6 +1003,16 @@ function initSettings() {
         mode === "tunnel" ? tunnelHost.value.trim() : "",
         mode === "tunnel" ? tunnelPort.value.trim() : "",
       );
+
+      // Save auto-claim config (all builds; harmless when escrow off)
+      const acResult = await saveAutoClaimPanel();
+      if (acResult && !acResult.ok) {
+        statusEl.textContent = acResult.error || "Auto-claim save failed";
+        statusEl.style.color = "#e74c3c";
+        saveBtn.disabled = false;
+        saveBtn.textContent = "Save & Restart Node";
+        return;
+      }
 
       // Save API URL and mTLS (test builds only)
       if (isTestBuild) {
@@ -1086,6 +1164,9 @@ async function init() {
     initActionButtons();
     initReceiptsScreen();
 
+    // Sticky incident banner (auto-claim failures persist to disk).
+    startIncidentPoll();
+
     if (needsOnboarding) {
       showOnboarding();
     } else {
@@ -1098,6 +1179,399 @@ async function init() {
     // pywebview.api not ready — retry
     setTimeout(init, 200);
   }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Error catalog — friendly modal for known daemon-side error codes.
+// Codes match the constants in gui/api.py. The Python side detects
+// the pattern; we render the human strings here so we can edit them
+// without a daemon redeploy.
+// ─────────────────────────────────────────────────────────────────
+
+const FAUCET_URL = "https://faucet.creditcoin.org/";
+const SUPPORT_URL = "https://docs.spacerouter.io/troubleshooting";
+
+const ERROR_CATALOG = {
+  insufficient_gas: {
+    title: "Out of CTC for gas",
+    body: "Your wallet doesn't have enough CTC to pay the network fee for this claim.",
+    remediationHtml:
+      "Get CTC from the <a href=\"#\" data-faucet>faucet</a>. After funding the wallet, click Retry.",
+    primaryLabel: "Open faucet",
+    primaryAction: () => window.pywebview.api.open_url(FAUCET_URL),
+  },
+  coord_unreachable: {
+    title: "Cannot reach coordination API",
+    body: "The node can't talk to the coordination service right now.",
+    remediationHtml: "Trying to reconnect every 30 seconds. Check your internet connection if this persists.",
+  },
+  chain_rpc_unreachable: {
+    title: "Cannot reach chain RPC",
+    body: "The node can't talk to the Creditcoin RPC endpoint right now.",
+    remediationHtml: "Trying to reconnect every 30 seconds. Check your internet connection if this persists.",
+  },
+  identity_key_missing: {
+    title: "Identity key missing or unreadable",
+    body: "The node identity key file could not be loaded.",
+    remediationHtml: "Re-run setup (Reset Node) to regenerate it. Back up your wallet first.",
+  },
+  rate_mismatch: {
+    title: "Rate config out of sync",
+    body: "The configured price-per-GB doesn't match what the gateway is reporting.",
+    remediationHtml: "Restart the node to re-sync the rate from the gateway.",
+  },
+  receipt_db_locked: {
+    title: "Receipt database is locked",
+    body: "The local receipt database can't be opened — another process may be holding the file.",
+    remediationHtml: "Stop and restart the node. If the error persists, back up <code>~/.spacerouter/receipts.db</code> and restart.",
+  },
+  stake_not_approved: {
+    title: "Stake awaiting approval",
+    body: "Your stake has been registered but isn't approved yet.",
+    remediationHtml: "Approval typically takes 5–30 minutes. The node will start automatically once it goes through.",
+  },
+  disk_full: {
+    title: "Disk full",
+    body: "There's no space left on the device the node is writing to.",
+    remediationHtml: "Free up space and restart the node.",
+  },
+  upnp_nat_blocked: {
+    title: "Node not reachable from internet",
+    body: "UPnP failed and we couldn't auto-detect a working public IP.",
+    remediationHtml: "Switch to <strong>Manual / Tunnel</strong> mode in Settings, or configure port forwarding on your router.",
+  },
+  sleep_resume: {
+    title: "Resumed from sleep",
+    body: "Reconnecting after the system woke from sleep.",
+    remediationHtml: "No action required — the node will reconnect automatically.",
+  },
+};
+
+// Mirror of the Python-side classify_error_text — used when an error
+// surfaces via the task-error path (no error_code attached).
+const ERROR_PATTERNS = [
+  [/insufficient funds for gas|intrinsic gas too low/i, "insufficient_gas"],
+  [/coordination[- ]api|coord(ination)?\s+(api\s+)?unreachable/i, "coord_unreachable"],
+  [/chain rpc|rpc.*unreachable|cc3-testnet|max retries.*rpc/i, "chain_rpc_unreachable"],
+  [/identity key.*(not found|missing|corrupt)|cannot load identity/i, "identity_key_missing"],
+  [/rate.*(mismatch|out of sync|differs)/i, "rate_mismatch"],
+  [/database is locked|sqlite.*locked|disk i\/o error/i, "receipt_db_locked"],
+  [/stake.*(not.*approved|awaiting approval|pending approval)/i, "stake_not_approved"],
+  [/no space left on device|disk full|enospc/i, "disk_full"],
+  [/upnp.*(failed|unavailable|blocked|nat)|cannot detect public ip/i, "upnp_nat_blocked"],
+];
+
+function classifyErrorTextLocal(text) {
+  if (!text) return "unknown";
+  for (const [re, code] of ERROR_PATTERNS) {
+    if (re.test(text)) return code;
+  }
+  return "unknown";
+}
+
+function showErrorCatalogModal(code, contextMessage) {
+  const entry = ERROR_CATALOG[code];
+  const overlay = $("#error-catalog-overlay");
+  const titleEl = $("#error-catalog-title");
+  const bodyEl = $("#error-catalog-body");
+  const remediationEl = $("#error-catalog-remediation");
+  const primaryBtn = $("#btn-error-primary");
+  const secondaryBtn = $("#btn-error-secondary");
+
+  if (!entry) {
+    titleEl.textContent = "Something went wrong";
+    bodyEl.textContent = contextMessage || "An unexpected error occurred.";
+    remediationEl.innerHTML =
+      "Try again, or restart the node. If the problem persists, "
+      + "<a href=\"#\" data-support>contact support</a>.";
+    primaryBtn.style.display = "none";
+  } else {
+    titleEl.textContent = entry.title;
+    bodyEl.textContent = entry.body;
+    remediationEl.innerHTML = entry.remediationHtml || "";
+    if (entry.primaryLabel && entry.primaryAction) {
+      primaryBtn.style.display = "block";
+      primaryBtn.textContent = entry.primaryLabel;
+      // Replace listener safely.
+      const fresh = primaryBtn.cloneNode(true);
+      primaryBtn.parentNode.replaceChild(fresh, primaryBtn);
+      fresh.addEventListener("click", () => {
+        try { entry.primaryAction(); } catch (e) {}
+        overlay.style.display = "none";
+      });
+    } else {
+      primaryBtn.style.display = "none";
+    }
+  }
+
+  // Wire any [data-faucet] / [data-support] anchors in remediation.
+  remediationEl.querySelectorAll("a[data-faucet]").forEach((a) => {
+    a.addEventListener("click", (e) => {
+      e.preventDefault();
+      window.pywebview.api.open_url(FAUCET_URL);
+    });
+  });
+  remediationEl.querySelectorAll("a[data-support]").forEach((a) => {
+    a.addEventListener("click", (e) => {
+      e.preventDefault();
+      window.pywebview.api.open_url(SUPPORT_URL);
+    });
+  });
+
+  // Strip and rebind the close button.
+  const freshClose = secondaryBtn.cloneNode(true);
+  secondaryBtn.parentNode.replaceChild(freshClose, secondaryBtn);
+  freshClose.addEventListener("click", () => {
+    overlay.style.display = "none";
+  });
+
+  overlay.style.display = "flex";
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Sticky incident banner — auto-claim failure UX, persists across
+// GUI restarts via ~/.spacerouter/incidents.json (written by the
+// daemon when an auto-claim attempt raises).
+// ─────────────────────────────────────────────────────────────────
+
+let incidentBannerVisibleId = null;
+
+async function refreshIncidentBanner() {
+  let resp;
+  try {
+    resp = await window.pywebview.api.get_incidents();
+  } catch (e) {
+    return;
+  }
+  if (!resp || !resp.ok) return;
+
+  const items = resp.incidents || [];
+  const last = [...items].reverse().find(
+    (i) => i && i.kind === "auto_claim_failed" && !i.acknowledged,
+  );
+
+  const banner = document.getElementById("incident-banner");
+  if (!banner) return;
+
+  if (!last) {
+    banner.style.display = "none";
+    document.body.classList.remove("has-incident-banner");
+    incidentBannerVisibleId = null;
+    return;
+  }
+
+  // Render once per incident id so we don't reset its state on every
+  // poll (which would re-bind listeners and steal focus).
+  if (incidentBannerVisibleId === last.id) return;
+  incidentBannerVisibleId = last.id;
+
+  const when = last.at
+    ? new Date(last.at * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : "";
+  $("#incident-banner-title").textContent =
+    "Auto-claim failed" + (when ? " at " + when : "");
+  $("#incident-banner-text").textContent =
+    "Reason: " + (last.message || last.code || "unknown");
+
+  banner.style.display = "flex";
+  document.body.classList.add("has-incident-banner");
+
+  // Strip & rebind action listeners.
+  const ids = ["btn-incident-log", "btn-incident-retry",
+               "btn-incident-disable", "btn-incident-dismiss"];
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    const fresh = el.cloneNode(true);
+    el.parentNode.replaceChild(fresh, el);
+  }
+
+  document.getElementById("btn-incident-log").addEventListener("click", showLogViewer);
+  document.getElementById("btn-incident-retry").addEventListener(
+    "click", async () => {
+      try {
+        const r = await window.pywebview.api.receipts_claim_all();
+        if (r && r.ok && r.task_id) {
+          showToast("Claim started", "success");
+          await window.pywebview.api.acknowledge_incident(last.id);
+          incidentBannerVisibleId = null;
+          refreshIncidentBanner();
+        }
+      } catch (e) {}
+    },
+  );
+  document.getElementById("btn-incident-disable").addEventListener(
+    "click", async () => {
+      try {
+        await window.pywebview.api.set_auto_claim_config(false, "", 0);
+        await window.pywebview.api.acknowledge_incident(last.id);
+        showToast("Auto-claim disabled. Restart the node to apply.", "warn");
+        incidentBannerVisibleId = null;
+        refreshIncidentBanner();
+      } catch (e) {}
+    },
+  );
+  document.getElementById("btn-incident-dismiss").addEventListener(
+    "click", async () => {
+      try {
+        await window.pywebview.api.acknowledge_incident(last.id);
+        incidentBannerVisibleId = null;
+        refreshIncidentBanner();
+      } catch (e) {}
+    },
+  );
+}
+
+async function showLogViewer() {
+  const overlay = $("#log-viewer-overlay");
+  const body = $("#log-viewer-body");
+  body.textContent = "Loading…";
+  overlay.style.display = "flex";
+
+  let r;
+  try {
+    r = await window.pywebview.api.get_recent_logs(50);
+  } catch (e) {
+    body.textContent = "Could not load logs.";
+    return;
+  }
+  if (!r || !r.ok || !r.lines || !r.lines.length) {
+    body.textContent = "No log lines available.";
+  } else {
+    body.textContent = r.lines.join("\n");
+  }
+
+  const close = $("#btn-log-close");
+  const fresh = close.cloneNode(true);
+  close.parentNode.replaceChild(fresh, close);
+  fresh.addEventListener("click", () => { overlay.style.display = "none"; });
+}
+
+function startIncidentPoll() {
+  if (incidentPollId) return;
+  refreshIncidentBanner();
+  // Slow poll — incidents are rare; 30s keeps it cheap. The banner
+  // also refreshes immediately after a successful manual claim.
+  incidentPollId = setInterval(refreshIncidentBanner, 30000);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Auto-claim Settings panel — checkbox + thresholds + status line.
+// ─────────────────────────────────────────────────────────────────
+
+function _spaceWeiToHuman(weiStr) {
+  if (!weiStr) return "0";
+  // Use BigInt where available — wei amounts can overflow a double.
+  try {
+    const wei = BigInt(weiStr);
+    const whole = wei / 1000000000000000000n;
+    const frac = wei % 1000000000000000000n;
+    if (frac === 0n) return whole.toString();
+    const fracStr = frac.toString().padStart(18, "0").replace(/0+$/, "");
+    return whole.toString() + "." + fracStr;
+  } catch (e) {
+    return String(weiStr);
+  }
+}
+
+function _humanToSpaceWei(human) {
+  if (human === "" || human == null) return "0";
+  const m = String(human).trim().match(/^(\d+)(?:\.(\d+))?$/);
+  if (!m) return null;
+  const whole = m[1];
+  const frac = (m[2] || "").padEnd(18, "0").slice(0, 18);
+  // Strip leading zeros to get a clean integer string. BigInt handles
+  // anything realistic comfortably.
+  try {
+    const wei = BigInt(whole) * 1000000000000000000n + BigInt(frac || "0");
+    return wei.toString();
+  } catch (e) {
+    return null;
+  }
+}
+
+async function loadAutoClaimPanel() {
+  const group = $("#settings-autoclaim-group");
+  const enabledEl = $("#settings-autoclaim-enabled");
+  const labelEl = $("#autoclaim-label");
+  const thresholdsEl = $("#autoclaim-thresholds");
+  const spaceEl = $("#autoclaim-threshold-space");
+  const countEl = $("#autoclaim-threshold-count");
+  const statusEl = $("#autoclaim-status");
+  if (!group) return;
+
+  let cfg;
+  try {
+    cfg = await window.pywebview.api.get_auto_claim_config();
+  } catch (e) {
+    return;
+  }
+  if (!cfg || !cfg.ok) return;
+
+  // Show the panel for all builds — the daemon ignores it harmlessly
+  // when escrow isn't configured, but ops want to set thresholds
+  // before they switch envs.
+  group.style.display = "";
+  enabledEl.checked = !!cfg.enabled;
+  labelEl.textContent = cfg.enabled ? "Enabled" : "Disabled";
+  thresholdsEl.style.display = cfg.enabled ? "block" : "none";
+  spaceEl.value = _spaceWeiToHuman(cfg.threshold_space_wei);
+  countEl.value = cfg.threshold_count;
+
+  // Live show/hide thresholds when toggled.
+  enabledEl.onchange = () => {
+    labelEl.textContent = enabledEl.checked ? "Enabled" : "Disabled";
+    thresholdsEl.style.display = enabledEl.checked ? "block" : "none";
+  };
+
+  // Status line below the form.
+  try {
+    const st = await window.pywebview.api.get_auto_claim_status();
+    if (st && st.ok) {
+      const outcome = st.last_attempt_outcome || "none";
+      let line;
+      if (outcome === "success") {
+        statusEl.className = "autoclaim-status has-success";
+        line = "Last attempt: success";
+        if (st.last_attempt_at) line += " at " + st.last_attempt_at;
+      } else if (outcome === "failed") {
+        statusEl.className = "autoclaim-status has-error";
+        line = "Last attempt: failed";
+        if (st.last_attempt_at) line += " at " + st.last_attempt_at;
+        if (st.last_error) line += " (" + st.last_error + ")";
+      } else {
+        statusEl.className = "autoclaim-status";
+        line = "No claim attempts yet.";
+      }
+      const claimable = _spaceWeiToHuman(st.current_claimable_wei || "0");
+      line += " · " + claimable + " SPACE accumulated"
+              + " (" + (st.current_claimable_count || 0) + " receipts).";
+      statusEl.textContent = line;
+    } else {
+      statusEl.textContent = "";
+    }
+  } catch (e) {
+    statusEl.textContent = "";
+  }
+}
+
+async function saveAutoClaimPanel() {
+  const enabledEl = $("#settings-autoclaim-enabled");
+  const spaceEl = $("#autoclaim-threshold-space");
+  const countEl = $("#autoclaim-threshold-count");
+  if (!enabledEl) return { ok: true };
+
+  const wei = _humanToSpaceWei(spaceEl.value);
+  if (wei === null) {
+    return { ok: false, error: "Invalid SPACE threshold (must be a positive number)" };
+  }
+  const count = parseInt(countEl.value, 10);
+  if (isNaN(count) || count < 0) {
+    return { ok: false, error: "Invalid receipt threshold (must be a non-negative integer)" };
+  }
+  return await window.pywebview.api.set_auto_claim_config(
+    enabledEl.checked, wei, count,
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -1243,6 +1717,17 @@ function renderHistoryList(containerId, rows) {
     const uuid = document.createElement("span");
     uuid.className = "uuid";
     uuid.textContent = r.request_uuid.slice(0, 8) + "…";
+    // G7 — visible badge so the operator can tell at a glance whether
+    // a row settled via a local tx (Blockscout link works) or was
+    // reconciled by the gateway (no local tx was submitted).
+    const isExternal = r.claim_tx_hash === "external";
+    const badge = document.createElement("span");
+    badge.className = "history-badge " + (isExternal ? "external" : "tx");
+    badge.textContent = isExternal ? "Reconciled" : "On-chain";
+    badge.title = isExternal
+      ? "The gateway auto-settled this receipt on-chain before this node submitted a claim. No local tx was sent."
+      : "This node submitted a claim tx; the badge links to Blockscout via Details.";
+    uuid.appendChild(badge);
     const price = document.createElement("span");
     price.textContent = formatSpace(r.total_price) + " SPACE";
     header.appendChild(uuid);
@@ -1252,12 +1737,9 @@ function renderHistoryList(containerId, rows) {
     const meta = document.createElement("div");
     meta.className = "receipt-meta";
     const when = r.claimed_at
-      ? humanAge(now - r.claimed_at) + " ago"
+      ? humanAge(now - r.claimed_at)
       : "just now";
-    // ``external`` is the synthetic tx_hash the reaper writes when the
-    // gateway auto-settled on our behalf — no on-chain tx was sent from
-    // this node. Call that out so users don't look for a Blockscout row.
-    const source = r.claim_tx_hash === "external"
+    const source = isExternal
       ? "Gateway auto-settled (no local tx)"
       : "On-chain tx";
     meta.textContent = formatBytes(r.data_amount) + " · " + when + " · " + source;
@@ -1270,6 +1752,18 @@ function renderHistoryList(containerId, rows) {
     detailBtn.textContent = "Details";
     detailBtn.addEventListener("click", () => showReceiptDetail(r.request_uuid));
     actions.appendChild(detailBtn);
+
+    // Quick-link Blockscout straight from the row when we have a real
+    // tx hash. Saves the user a Details-modal hop.
+    if (!isExternal && r.claim_tx_hash) {
+      const txBtn = document.createElement("button");
+      txBtn.className = "btn-text-subtle";
+      txBtn.textContent = "Blockscout";
+      txBtn.addEventListener("click", () =>
+        window.pywebview.api.receipts_open_explorer(r.claim_tx_hash));
+      actions.appendChild(txBtn);
+    }
+
     row.appendChild(actions);
 
     container.appendChild(row);
@@ -1433,7 +1927,14 @@ async function pollClaimTask(taskId) {
     }
     if (st.state === "error") {
       finishClaimTask();
-      showToast("Claim failed: " + st.error, "error");
+      // The error is the raw exception text; classify locally to
+      // catch web3 "insufficient funds for gas" and the like.
+      const code = classifyErrorTextLocal(st.error || "");
+      if (code !== "unknown" && ERROR_CATALOG[code]) {
+        showErrorCatalogModal(code, st.error);
+      } else {
+        showToast("Claim failed: " + st.error, "error");
+      }
       await refreshReceipts();
       return;
     }
@@ -1458,7 +1959,16 @@ function renderClaimOutcome(result) {
     return;
   }
   if (!result.ok) {
-    showToast("Claim failed: " + (result.error || "unknown"), "error");
+    // A7 + error catalog: when the daemon attaches a known
+    // ``error_code`` (e.g. insufficient_gas), surface the friendly
+    // modal with the right remediation. Fall back to the toast for
+    // unknown errors so we never swallow the failure silently.
+    const code = result.error_code;
+    if (code && code !== "unknown" && ERROR_CATALOG[code]) {
+      showErrorCatalogModal(code, result.error);
+    } else {
+      showToast("Claim failed: " + (result.error || "unknown"), "error");
+    }
     return;
   }
   const s = result.summary || {};
@@ -1561,8 +2071,17 @@ function initReceiptsScreen() {
   const earningsBtn = $("#btn-earnings");
   if (earningsBtn) earningsBtn.addEventListener("click", showReceipts);
 
+  // G4 — Settings' Back calls hideAll() before showStatus() so the
+  // current screen is properly torn down (interval polls cleared,
+  // display flipped). The Earnings Back was missing the hideAll()
+  // wrapper, so the receipts screen stayed visible underneath the
+  // status screen and the receipts poll kept running. Match the
+  // Settings pattern exactly here.
   const backBtn = $("#btn-receipts-back");
-  if (backBtn) backBtn.addEventListener("click", showStatus);
+  if (backBtn) backBtn.addEventListener("click", function () {
+    hideAll();
+    showStatus();
+  });
 
   const claimBtn = $("#btn-claim-all");
   if (claimBtn) claimBtn.addEventListener("click", onClaimAll);
