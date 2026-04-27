@@ -1224,12 +1224,30 @@ def _acquire_daemon_lock(settings) -> int:
         except (BlockingIOError, OSError):
             return False
 
-    def _pid_alive(pid: int) -> bool:
+    def _pid_is_our_daemon(pid: int) -> bool:
+        """True only if PID is alive AND the process image is our binary.
+
+        This catches PID reuse: if our prior daemon's PID got recycled to
+        an unrelated process (typical on Windows CI runners after
+        TerminateProcess), we treat the lock as stale rather than
+        refusing to start. Without this check we hit the
+        v1.5.0-test.85+ smoke-test failure where the second daemon in a
+        sequence sees a recycled PID and thinks "another daemon is
+        running" when there isn't one.
+        """
         if pid <= 0:
             return False
+
+        # Read the running process's image path; compare basename.
+        binary_basename = os.path.basename(sys.executable).lower()
+        # PyInstaller-frozen builds report the bundled binary; source
+        # runs report the python interpreter. Either is fine — both are
+        # what `os.getpid()` would resolve to from inside this daemon.
+
         if is_windows:
             try:
                 import ctypes
+                from ctypes import wintypes
                 kernel32 = ctypes.windll.kernel32
                 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
                 h = kernel32.OpenProcess(
@@ -1237,23 +1255,73 @@ def _acquire_daemon_lock(settings) -> int:
                 )
                 if not h:
                     return False
-                # Still alive if the process handle is valid AND the
-                # process hasn't signalled exit.
-                STILL_ACTIVE = 259
-                code = ctypes.c_ulong(0)
-                kernel32.GetExitCodeProcess(h, ctypes.byref(code))
-                kernel32.CloseHandle(h)
-                return code.value == STILL_ACTIVE
+                try:
+                    STILL_ACTIVE = 259
+                    code = ctypes.c_ulong(0)
+                    kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+                    if code.value != STILL_ACTIVE:
+                        return False  # cleanly exited, definitely not us
+
+                    # Process is alive — check if it's actually our binary.
+                    QueryFullProcessImageNameW = kernel32.QueryFullProcessImageNameW
+                    QueryFullProcessImageNameW.argtypes = [
+                        wintypes.HANDLE, wintypes.DWORD,
+                        wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+                    ]
+                    QueryFullProcessImageNameW.restype = wintypes.BOOL
+                    buf = ctypes.create_unicode_buffer(1024)
+                    size = wintypes.DWORD(len(buf))
+                    if not QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                        # Couldn't read the image path — be safe and treat as
+                        # not-ours so we take the lock instead of hanging.
+                        return False
+                    return os.path.basename(buf.value).lower() == binary_basename
+                finally:
+                    kernel32.CloseHandle(h)
             except Exception:
-                return True  # uncertain → assume alive, be safe
+                # Uncertain on Windows: prefer "not ours" so we take the
+                # lock. The msvcrt.locking() call below is the real
+                # gatekeeper anyway — if a real daemon does hold it,
+                # that fails and we refuse.
+                return False
         else:
+            # POSIX: kill(pid, 0) tells us alive/dead; /proc/<pid>/comm
+            # tells us the binary name on Linux. macOS uses `ps` since
+            # /proc isn't reliable.
             try:
                 os.kill(pid, 0)
-                return True
             except ProcessLookupError:
                 return False
             except PermissionError:
-                return True  # alive but not ours; still a live daemon
+                # Alive but not ours-as-the-uid. Could still be our
+                # daemon under a different user — be safe.
+                return True
+
+            try:
+                if sys.platform.startswith("linux"):
+                    comm = open(f"/proc/{pid}/comm").read().strip()
+                    return comm.lower() in {
+                        binary_basename,
+                        "python", "python3", binary_basename.removesuffix(".exe"),
+                    }
+                else:  # macOS / BSD: use ps -p PID -o comm=
+                    import subprocess
+                    out = subprocess.run(
+                        ["ps", "-p", str(pid), "-o", "comm="],
+                        capture_output=True, text=True, timeout=2,
+                    )
+                    if out.returncode != 0:
+                        return False
+                    comm = os.path.basename(out.stdout.strip()).lower()
+                    return comm == binary_basename or comm.startswith("python")
+            except Exception:
+                # /proc read failure or ps failure — conservatively say
+                # alive (don't accidentally take a real daemon's lock).
+                return True
+
+    # Backwards-compat alias for the older check (some unit tests may
+    # still patch this name).
+    _pid_alive = _pid_is_our_daemon
 
     if not _try_acquire(fd):
         # Read stored PID to decide whether the lock is stale.
