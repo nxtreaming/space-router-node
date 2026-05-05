@@ -138,6 +138,11 @@ def load_provider_settings(directory: Path | None = None) -> Settings:
     env_vars = {k: v for k, v in os.environ.items() if k.startswith("SR_")}
     if env_vars:
         s = Settings.from_env_mapping(env_vars)
+        # Apply the same testnet-escrow backfill we do for the JSON-load
+        # and defaults-only paths. Without this, a test build that
+        # cold-starts from env vars (no settings.json, no env file) wakes
+        # up with escrow disabled and the receipt submitter dead.
+        _backfill_test_escrow_in_place(s)
         directory.mkdir(parents=True, exist_ok=True)
         s.save(s_path)
         logger.info("settings loaded from: %s (seeded from environment)", s_path)
@@ -173,6 +178,18 @@ def load_provider_settings(directory: Path | None = None) -> Settings:
 _TEST_ESCROW_CONTRACT_ADDRESS = "0xC5740e4e9175301a24FB6d22bA184b8ec0762852"
 _TEST_ESCROW_CHAIN_RPC = "https://rpc.cc3-testnet.creditcoin.network"
 _TEST_ESCROW_CHAIN_ID = 102031
+
+
+def reconcile_passphrase_flag_in_place(s: Settings) -> bool:
+    """Public wrapper for :py:func:`_reconcile_passphrase_flag_in_place`.
+
+    Exposed so non-daemon callers (notably the GUI's :py:class:`ConfigStore`,
+    which has its own settings.json read path that doesn't go through
+    :py:func:`load_provider_settings`) can apply the same keystore-vs-flag
+    reconciliation. See the underscore-prefixed implementation for the
+    full rationale.
+    """
+    return _reconcile_passphrase_flag_in_place(s)
 
 
 def _reconcile_passphrase_flag_in_place(s: Settings) -> bool:
