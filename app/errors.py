@@ -46,6 +46,8 @@ class NodeErrorCode(enum.Enum):
 
     # ── Runtime errors ──
     NODE_OFFLINE = "node_offline"
+    ANOTHER_INSTANCE_RUNNING = "another_instance_running"
+    RPC_UNREACHABLE = "rpc_unreachable"
     UNEXPECTED_ERROR = "unexpected_error"
 
 
@@ -77,6 +79,12 @@ _USER_MESSAGES: dict[NodeErrorCode, str] = {
     NodeErrorCode.RATE_LIMITED: "Too many requests. Waiting before retry...",
     NodeErrorCode.CONNECTION_LOST: "Connection to coordination server interrupted. Retrying...",
     NodeErrorCode.NODE_OFFLINE: "Node went offline. Reconnecting...",
+    NodeErrorCode.ANOTHER_INSTANCE_RUNNING:
+        "Another SpaceRouter Proxy node is already running. "
+        "Quit the other instance (CLI or GUI) before starting this one.",
+    NodeErrorCode.RPC_UNREACHABLE:
+        "Cannot reach the chain RPC endpoint. Check your network connection "
+        "or update the RPC URL in Settings.",
     NodeErrorCode.UNEXPECTED_ERROR: "An unexpected error occurred.",
 }
 

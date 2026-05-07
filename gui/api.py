@@ -605,6 +605,93 @@ class Api:
         except Exception:
             return 1
 
+    def validate_staking_address(self, address: str) -> dict:
+        """Validate a staking-wallet address against coord-side stake state.
+
+        Called from the onboarding wizard so the user sees an immediate
+        actionable error (zero address, unstaked wallet, lookup failure)
+        instead of starting the node and discovering "Insufficient stake"
+        in the status panel.
+
+        Returns ``{ok, status, message}`` where:
+
+        - ``status`` is ``"unstaked" | "qualifying" | "earning" | "unknown" | "lookup_failed" | "invalid"``
+        - ``ok`` is True only when the wallet is in a state that can run
+          (i.e. ``qualifying``/``earning``).  ``unknown`` (not yet known
+          to coord, e.g. brand-new staked wallet) also returns ``ok=True``
+          so a user who just staked but hasn't yet shown up in coord
+          isn't blocked.
+        - ``lookup_failed`` returns ``ok=True`` so a transient coord
+          outage doesn't block onboarding entirely.
+
+        Empty input returns ``ok=True`` because the wizard treats a blank
+        staking field as "use the identity address" — the daemon will
+        re-run the same check after start with the resolved address.
+        """
+        addr = (address or "").strip()
+        if not addr:
+            return {"ok": True, "status": "unset", "message": ""}
+
+        # Format gate first — keeps the round-trip cost down on typos.
+        if not re.match(r"^0x[0-9a-fA-F]{40}$", addr):
+            return {
+                "ok": False,
+                "status": "invalid",
+                "message": "Invalid address — expected 0x followed by 40 hex characters",
+            }
+        # Zero address never has stake; reject up front.
+        if addr.lower() == "0x" + "0" * 40:
+            return {
+                "ok": False,
+                "status": "invalid",
+                "message": "Zero address cannot stake. Enter your real wallet address.",
+            }
+
+        import httpx
+        from gui.config_store import _default_coordination_url
+        api_url = self._config.get("SR_COORDINATION_API_URL") or _default_coordination_url()
+        try:
+            resp = httpx.get(
+                f"{api_url}/nodes",
+                params={"staking_address": addr.lower()},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            nodes = resp.json()
+        except Exception as exc:
+            logger.info("validate_staking_address lookup failed: %s", exc)
+            return {
+                "ok": True,  # don't block onboarding on coord blip
+                "status": "lookup_failed",
+                "message": "Could not verify stake right now (coord unreachable). "
+                            "Continuing — the daemon will re-check after start.",
+            }
+
+        if not isinstance(nodes, list) or not nodes:
+            # Wallet isn't tracked by coord yet. Could be a brand-new
+            # staked wallet (probe race) or a totally unstaked one. We
+            # let the user proceed but flag the state so the wizard can
+            # show a soft warning rather than a hard block.
+            return {
+                "ok": True,
+                "status": "unknown",
+                "message": "Wallet not yet seen by the coordination API. "
+                            "If you just staked, this is fine — start the node and it will verify.",
+            }
+
+        ss = (nodes[0].get("staking_status") or "").lower()
+        if ss in ("qualifying", "earning"):
+            return {"ok": True, "status": ss, "message": ""}
+        if ss == "unstaked":
+            return {
+                "ok": False,
+                "status": "unstaked",
+                "message": "This wallet has no SPACE staked. "
+                            "Stake at least 1 SPACE before starting your node.",
+            }
+        # Anything else (probing, draining, etc) — let the user proceed.
+        return {"ok": True, "status": ss or "unknown", "message": ""}
+
     # ── Leg 2 receipts / earnings ──────────────────────────────────
 
     _ZERO_SUMMARY = {

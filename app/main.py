@@ -142,6 +142,13 @@ def _persist_wizard_results(
             # Preserve previously-configured escrow + coord URL.
             merged.escrow = existing.escrow
             merged.coordination = existing.coordination
+            # Preserve sections the wizard never touches. Without these,
+            # operator-set values like ``claim.auto_claim_enabled`` and
+            # ``receipts.*`` get clobbered by ``ClaimSection()`` /
+            # ``ReceiptsSection()`` defaults whenever the user re-runs
+            # ``--setup`` to update wallet info.
+            merged.claim = existing.claim
+            merged.receipts = existing.receipts
             # Carry over identity_passphrase_set when the wizard didn't
             # touch it (existing key, no fresh passphrase set).
             if not passphrase_set:
@@ -383,25 +390,42 @@ def _fetch_wallet_staking_status() -> str | None:
     list response) instead of the path-style ``/nodes/{node_id}`` —
     the latter expects a node UUID, and passing a 0x-address triggers
     a Postgres UUID-cast error → HTTP 500 from the coord backend.
+
+    rc.11 fix: distinguish *transient lookup failure* (coord timeout /
+    network error) from *wallet definitively unstaked / unknown*. The
+    sentinel ``"__lookup_failed__"`` is returned only when the HTTP call
+    itself fails so the caller can choose to skip the banner instead of
+    showing the full nag every CLI start (Jenna's rc.10 LOW finding).
     """
+    LOOKUP_FAILED = "__lookup_failed__"
     try:
         import httpx
         s = load_settings()
         wallet = (s.STAKING_ADDRESS or "").strip().lower()
         if not wallet:
-            return None
-        resp = httpx.get(
-            f"{s.COORDINATION_API_URL}/nodes",
-            params={"staking_address": wallet},
-            timeout=5,
-        )
-        resp.raise_for_status()
-        nodes = resp.json()
+            return None  # no wallet configured — caller decides to nag
+        try:
+            resp = httpx.get(
+                f"{s.COORDINATION_API_URL}/nodes",
+                params={"staking_address": wallet},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            nodes = resp.json()
+        except (httpx.HTTPError, ValueError):
+            # Network / 5xx / malformed JSON — coord lookup is genuinely
+            # broken right now. Don't nag; surface a softer note instead.
+            logger.debug("staking-status lookup failed", exc_info=True)
+            return LOOKUP_FAILED
         if not isinstance(nodes, list) or not nodes:
-            return None  # wallet not registered yet
+            return None  # wallet not registered yet — first-run nag is correct
         ss = nodes[0].get("staking_status")
         return ss if isinstance(ss, str) else None
     except Exception:
+        # Any other unexpected failure (settings missing, etc).  Fall
+        # through to the legacy "show banner" behaviour rather than
+        # silently masking real config problems.
+        logger.debug("staking-status check raised unexpectedly", exc_info=True)
         return None
 
 
@@ -413,9 +437,22 @@ def _show_staking_prompt() -> None:
     """
     # rc.7 MIN-3: skip the nag if the wallet is already qualifying/earning.
     # Mirrors the GUI gate added in rc.6 (gui/assets/app.js ~L1483) so the
-    # two surfaces stay coherent. Best-effort — on fetch failure we fall
-    # through so first-run setup (no node registered yet) still nags.
-    if _fetch_wallet_staking_status() in ("qualifying", "earning"):
+    # two surfaces stay coherent.
+    #
+    # rc.11 fix: also skip when the lookup transiently failed.  Pre-rc.11
+    # any coord blip caused the full Staking-Required banner to show on
+    # every CLI start (blocking automation in qualifying/earning wallets
+    # whose status the daemon couldn't fetch). We now log a soft note
+    # instead so the operator can see why we couldn't verify.
+    ss = _fetch_wallet_staking_status()
+    if ss in ("qualifying", "earning"):
+        return
+    if ss == "__lookup_failed__":
+        logger.info(
+            "Could not verify staking status with the coordination API "
+            "(transient lookup failure). Skipping the staking banner — "
+            "the daemon will continue and re-check during runtime.",
+        )
         return
 
     min_amount = _fetch_min_staking_amount()
@@ -522,6 +559,11 @@ class _NodeContext:
         self.receipt_poller = None  # ReceiptPoller | None
         self.claim_reaper = None  # ClaimReaper | None
         self.auto_claim_monitor = None  # AutoClaimMonitor | None
+        # State machine reference — populated by ``_run`` so background
+        # phases (escrow config check, etc.) can publish surface-specific
+        # status fields like ``rpc_status`` without threading ``sm``
+        # through every phase signature.
+        self.sm: "NodeStateMachine | None" = None
 
 
 async def _phase_init(ctx: _NodeContext) -> None:
@@ -847,10 +889,10 @@ async def _init_receipt_submitter(ctx: _NodeContext) -> None:
     # startup. The node is still useful for routing even if Leg 2 is
     # misconfigured; we want to surface the root cause instead of
     # accumulating silent failures in the receipt store.
-    await _verify_escrow_config(ctx.s, node_wallet)
+    await _verify_escrow_config(ctx.s, node_wallet, sm=ctx.sm)
 
 
-async def _verify_escrow_config(settings, node_wallet: str) -> None:
+async def _verify_escrow_config(settings, node_wallet: str, sm=None) -> None:  # noqa: ANN001
     """Run cheap sanity checks against the configured escrow chain.
 
     Three checks (each logs ERROR + continues):
@@ -919,12 +961,27 @@ async def _verify_escrow_config(settings, node_wallet: str) -> None:
     info = await asyncio.to_thread(_sync_check)
 
     if info.get("error"):
+        err_text = info["error"]
         logger.error(
             "Escrow config check: RPC/ABI error — %s. Leg 2 claims will "
             "likely fail until this is fixed.",
-            info["error"],
+            err_text,
         )
+        # Surface to the GUI so an operator with a fake/unreachable RPC
+        # URL sees an actionable badge ("RPC unreachable: ...") instead
+        # of just falling silently into the inactive state. Only set on
+        # the unreachable case — ABI/contract errors keep RPC connectivity
+        # intact and would mislead the user otherwise.
+        if sm is not None and "RPC unreachable" in err_text:
+            sm.status.rpc_status = "unreachable"
+            sm.status.rpc_status_detail = err_text
         return
+
+    # RPC is reachable — clear any prior unreachable badge. Lets a
+    # mid-run config fix (settings change + restart) recover cleanly.
+    if sm is not None:
+        sm.status.rpc_status = "ok"
+        sm.status.rpc_status_detail = ""
 
     # S8: chain_id mismatch guard
     expected_chain = getattr(settings, "ESCROW_CHAIN_ID", 0)
@@ -1706,22 +1763,33 @@ def _acquire_daemon_lock(settings) -> int:
                     break
                 fd.close()
             if not acquired:
-                print(
+                # Stale lock the OS refuses to release. Surface a
+                # classified error so the GUI shows actionable copy
+                # instead of the generic "unexpected error" toast that
+                # SystemExit would produce. The CLI wrapper at the end
+                # of `main()` prints this same message to stderr.
+                from app.errors import NodeError, NodeErrorCode
+                msg = (
                     f"Daemon lock {lock_path} appears stale but the OS "
                     f"won't release it. Delete the file manually if no "
-                    f"space-router-node process is running, then retry.",
-                    file=sys.stderr,
+                    f"space-router-node process is running, then retry."
                 )
-                sys.exit(1)
+                print(msg, file=sys.stderr)
+                raise NodeError(NodeErrorCode.ANOTHER_INSTANCE_RUNNING, msg)
         else:
             fd.close()
-            print(
+            # Live holder. Same UX-shaping: raise a classified error so
+            # the GUI's CLI+GUI collision case (and GUI+GUI by extension)
+            # surfaces "Another node is already running" rather than the
+            # generic UNEXPECTED_ERROR fallback in node_manager._run_loop.
+            from app.errors import NodeError, NodeErrorCode
+            msg = (
                 f"Another space-router-node daemon is already running "
                 f"against {store_path}. Refusing to start to avoid "
-                f"receipt corruption. Lock: {lock_path}",
-                file=sys.stderr,
+                f"receipt corruption. Lock: {lock_path}"
             )
-            sys.exit(1)
+            print(msg, file=sys.stderr)
+            raise NodeError(NodeErrorCode.ANOTHER_INSTANCE_RUNNING, msg)
 
     # Write our PID for diagnostic purposes. Lock itself is the source
     # of truth, but `ps`-side tooling benefits from having a PID in the
@@ -1866,6 +1934,7 @@ async def _run(
 
     async with httpx.AsyncClient() as http_client:
         ctx = _NodeContext(s, http_client)
+        ctx.sm = sm
         renewal_task = None
         health_task = None
         status_task = None

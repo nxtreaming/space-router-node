@@ -121,6 +121,12 @@ class NodeStatus:
     last_probe_attempt_at: float | None = None  # unix timestamp
     last_probe_outcome: str | None = None  # "ok"|"rate_limited"|"failed"|"cooldown"|"escalated"
     next_probe_attempt_at: float | None = None  # unix timestamp
+    # Chain RPC reachability — set by the escrow config check at startup.
+    # ``None`` while unverified, ``"ok"`` when the escrow RPC responds, or a
+    # short failure label like ``"unreachable"`` so the GUI can show a
+    # specific badge instead of falling back to generic "offline" copy.
+    rpc_status: str | None = None
+    rpc_status_detail: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -140,6 +146,8 @@ class NodeStatus:
             "last_probe_attempt_at": self.last_probe_attempt_at,
             "last_probe_outcome": self.last_probe_outcome,
             "next_probe_attempt_at": self.next_probe_attempt_at,
+            "rpc_status": self.rpc_status,
+            "rpc_status_detail": self.rpc_status_detail,
         }
 
 

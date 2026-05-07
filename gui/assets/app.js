@@ -422,10 +422,79 @@ function initOnboarding() {
     return true;
   }
 
+  // rc.11 #4: ``stakingValidatedOk`` mirrors the async validation result
+  // from the coord lookup. ``null`` means "not yet checked" or "not
+  // applicable" (empty input falls through to the identity-address
+  // default). Pre-rc.11 the wizard accepted any well-formed hex including
+  // the zero address and unstaked wallets, then surfaced a confusing
+  // "Insufficient stake: 0.00 SPACE" badge after Start.
+  let stakingValidatedOk = true;     // tracks the lookup-side gate
+  let stakingValidating = false;     // suppresses double-fires on rapid blur
+  async function asyncValidateStaking() {
+    const val = stakingInput.value.trim();
+    // Empty falls back to identity address — server re-checks at start.
+    if (!val) {
+      stakingError.textContent = "";
+      stakingError.classList.remove("warn");
+      stakingInput.classList.remove("invalid");
+      stakingValidatedOk = true;
+      validateForm();
+      return;
+    }
+    // Format gate first — saves the round-trip on typos.
+    if (!validateAddress(stakingInput, stakingError)) {
+      stakingValidatedOk = false;
+      validateForm();
+      return;
+    }
+    if (stakingValidating) return;
+    stakingValidating = true;
+    stakingError.textContent = "Checking stake on-chain…";
+    stakingError.classList.remove("warn");
+    try {
+      const result = await window.pywebview.api.validate_staking_address(val);
+      if (result && result.ok) {
+        // Soft warnings (lookup_failed / unknown) — let the user proceed
+        // but surface the note so they can act if their stake hasn't
+        // landed yet.
+        if (result.status === "lookup_failed" || result.status === "unknown") {
+          stakingError.textContent = result.message || "";
+          stakingError.classList.add("warn");
+          stakingInput.classList.remove("invalid");
+        } else {
+          stakingError.textContent = "";
+          stakingError.classList.remove("warn");
+          stakingInput.classList.remove("invalid");
+        }
+        stakingValidatedOk = true;
+      } else {
+        stakingError.textContent = (result && result.message)
+          || "Address rejected by coordination API.";
+        stakingError.classList.remove("warn");
+        stakingInput.classList.add("invalid");
+        stakingValidatedOk = false;
+      }
+    } catch (e) {
+      // Pywebview JS↔Py bridge unavailable or threw — be permissive
+      // (don't block onboarding because the bridge hiccuped) but warn.
+      stakingError.textContent = "Could not verify stake right now — continuing.";
+      stakingError.classList.add("warn");
+      stakingValidatedOk = true;
+    } finally {
+      stakingValidating = false;
+      validateForm();
+    }
+  }
   stakingInput.addEventListener("input", function () {
+    // Format-only validation on input (cheap, immediate); reset the
+    // lookup-side gate to "ok" so the user isn't blocked by stale
+    // state while they're still typing. The blur handler re-runs the
+    // on-chain check.
     validateAddress(stakingInput, stakingError);
+    stakingValidatedOk = true;
     validateForm();
   });
+  stakingInput.addEventListener("blur", asyncValidateStaking);
   collectionInput.addEventListener("input", function () {
     validateAddress(collectionInput, collectionError);
     validateForm();
@@ -444,7 +513,12 @@ function initOnboarding() {
   function validateForm() {
     const importValid = radioGenerate.checked ||
       (radioImport.checked && HEX_KEY_RE.test(identityKeyInput.value.trim()));
-    const stakingValid = validateAddress(stakingInput, stakingError);
+    // Format gate (cheap, runs every keystroke).  If it fails we don't
+    // bother checking the async lookup result.
+    const stakingFormatValid = validateAddress(stakingInput, stakingError);
+    // ``stakingValidatedOk`` is the on-chain lookup gate. Unstaked /
+    // zero-address wallets land here and disable Start.
+    const stakingValid = stakingFormatValid && stakingValidatedOk;
     const collectionValid = validateAddress(collectionInput, collectionError);
     const passphraseValid = validatePassphrase();
     btn.disabled = !(importValid && stakingValid && collectionValid && passphraseValid);
@@ -469,6 +543,18 @@ function initOnboarding() {
       return;
     }
     const staking = stakingInput.value.trim();
+    // rc.11 #4: re-run the async stake check as a final submit-time
+    // gate.  Catches paste-then-click-Start sequences that bypass the
+    // blur handler.  Errors render the same as the blur path; we only
+    // proceed if the lookup-side gate is green.
+    if (staking) {
+      await asyncValidateStaking();
+      if (!stakingValidatedOk) {
+        btn.disabled = false;
+        btn.textContent = "Start Node";
+        return;
+      }
+    }
     const collection = collectionInput.value.trim();
     const identityKeyHex = radioImport.checked ? identityKeyInput.value.trim() : "";
 
@@ -723,6 +809,45 @@ function clearCoordRecoveryHint() {
   }
 }
 
+// rc.11 #7 — RPC status hint sits above the coord-recovery hint and is
+// shown only when ``rpc_status`` is not "ok"/null. Reuses the same style
+// so the two hints stack consistently below the main status line.
+function _rpcHintEl() {
+  let el = document.getElementById("rpc-status-hint");
+  if (!el) {
+    const detail = document.getElementById("status-detail");
+    if (!detail) return null;
+    el = document.createElement("div");
+    el.id = "rpc-status-hint";
+    el.className = "status-detail text-muted";
+    el.style.fontSize = "11px";
+    el.style.marginTop = "2px";
+    detail.parentNode.insertBefore(el, detail.nextSibling);
+  }
+  return el;
+}
+
+function renderRpcStatusHint(status) {
+  const el = _rpcHintEl();
+  if (!el) return;
+  const rpc = status.rpc_status;
+  if (!rpc || rpc === "ok") {
+    el.textContent = "";
+    el.style.display = "none";
+    return;
+  }
+  let label;
+  if (rpc === "unreachable") {
+    label = status.rpc_status_detail
+      ? "RPC unreachable — " + status.rpc_status_detail
+      : "RPC unreachable. Check your network or update the RPC URL in Settings.";
+  } else {
+    label = "RPC: " + rpc;
+  }
+  el.textContent = label;
+  el.style.display = "block";
+}
+
 function renderCoordRecoveryHint(status) {
   const el = _coordHintEl();
   if (!el) return;
@@ -739,7 +864,15 @@ function renderCoordRecoveryHint(status) {
   const outcome = status.last_probe_outcome;
   const nextAt = status.next_probe_attempt_at;
   if (outcome === "rate_limited") {
-    suffix = "last probe rate-limited";
+    // rc.11 #10: append remaining wait so the user knows when the
+    // 5-min coord rate-limit will release instead of seeing a static
+    // "rate-limited" tag with no timing context.
+    if (typeof nextAt === "number" && nextAt > 0) {
+      const secs = Math.max(0, Math.round(nextAt - Date.now() / 1000));
+      suffix = "rate-limited · retry in " + secs + "s";
+    } else {
+      suffix = "last probe rate-limited";
+    }
   } else if (outcome === "escalated") {
     suffix = "escalating to reconnect";
   } else if (typeof nextAt === "number" && nextAt > 0) {
@@ -808,16 +941,24 @@ async function updateStatus() {
     // Staking status display
     const stakingStatusEl = $("#staking-status");
     const ss = status.staking_status || "—";
+    const ssState = status.state || "idle";
     // F3 — surface a clear label for the unstaked state. Pre-rc.5 the
     // raw "unstaked" lower-case token leaked into the GUI; map to a
     // capitalised "Unstaked — stake required" so it reads as a
     // status rather than a typo.
+    //
+    // rc.11 #9: while the node is in initializing/binding/registering
+    // and coord hasn't returned a staking_status yet (em-dash sentinel),
+    // show "Initializing…" instead of the bare placeholder so the UI
+    // matches the QA-guide spec.
     let stakingStatusLabel;
     if (ss === "unstaked") {
       stakingStatusLabel = "Unstaked — stake required";
     } else if (ss === "earning" || ss === "qualifying") {
       // Capitalise for consistency with the new "Unstaked" label.
       stakingStatusLabel = ss.charAt(0).toUpperCase() + ss.slice(1);
+    } else if ((ss === "—" || !ss) && ["initializing", "binding", "registering"].includes(ssState)) {
+      stakingStatusLabel = "Initializing…";
     } else {
       stakingStatusLabel = ss;
     }
@@ -834,6 +975,10 @@ async function updateStatus() {
     // Clear the coord-recovery hint by default; the running branch
     // re-renders it when coord disagrees with the local state.
     clearCoordRecoveryHint();
+    // rc.11 #7 — render the RPC-status hint on every cycle. The
+    // function self-clears when rpc_status is null/"ok", so this is
+    // safe to call regardless of the state branch.
+    renderRpcStatusHint(status);
 
     // Passphrase required — show unlock dialog immediately. Surface the
     // state machine's detail (e.g. "incorrect" after a failed attempt)
@@ -878,7 +1023,7 @@ async function updateStatus() {
         break;
       case "running":
         dot.className = "dot dot-running";
-        text.textContent = "SpaceRouter is running";
+        text.textContent = "SpaceRouter Proxy is running";
         detail.textContent = status.detail || "";
         // Surface the gap between local "running" and coord-side state so an
         // operator can see the daemon's self-probe recovery in flight. Only
@@ -946,6 +1091,18 @@ async function updateStatus() {
           detail.textContent = "Port permission denied. Use a port above 1024.";
         } else if (status.error_code === "port_in_use") {
           detail.textContent = "Port is already in use by another application.";
+        } else if (status.error_code === "another_instance_running") {
+          // rc.11 #1: CLI+GUI collision used to fall through to the
+          // generic "An unexpected error occurred" toast. Surface the
+          // same actionable copy as the GUI+GUI single-instance case.
+          detail.textContent = status.error_message
+            || "Another SpaceRouter Proxy node is already running. "
+               + "Quit the other instance (CLI or GUI) before starting this one.";
+        } else if (status.error_code === "rpc_unreachable") {
+          // rc.11 #7: surface a specific RPC failure instead of the
+          // silent "inactive" fallback when the chain RPC URL is wrong.
+          detail.textContent = status.error_message
+            || "Chain RPC unreachable. Check the RPC URL in Settings.";
         } else {
           detail.textContent = status.error_message || status.error || "";
         }

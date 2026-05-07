@@ -190,7 +190,7 @@ def main() -> None:
 
         start_health_server(api)
 
-    title = "SpaceRouter [TEST]" if BUILD_VARIANT == "test" else "SpaceRouter"
+    title = "SpaceRouter Proxy [TEST]" if BUILD_VARIANT == "test" else "SpaceRouter Proxy"
     window = webview.create_window(
         title=title,
         url=_asset_path("index.html"),
