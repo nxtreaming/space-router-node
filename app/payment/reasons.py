@@ -1,0 +1,159 @@
+"""Error codes and human-readable messages for Leg 2 receipt failures.
+
+Two failure surfaces:
+
+- **Sign failures** — the coord API / gateway refused to sign a receipt the
+  provider submitted (after-relay ``POST /nodes/{id}/receipts`` or an async
+  rejection surfaced via ``GET /nodes/{id}/rejected-receipts``).
+- **Claim failures** — the on-chain ``claimBatch`` tx reverted or timed out.
+
+Both counters are capped independently at :data:`MAX_SIGN_ATTEMPTS` /
+:data:`MAX_CLAIM_ATTEMPTS` (overridable via env). When a counter hits its
+cap, the row is locked (``locked = 1``) and hidden from automatic retry
+selectors. Locked rows remain visible for audit.
+"""
+
+from __future__ import annotations
+
+import os
+
+# --- Sign-side codes ---------------------------------------------------------
+
+SIGN_REJECTED_UNREGISTERED_NODE = "SIGN_REJECTED_UNREGISTERED_NODE"
+SIGN_REJECTED_BYTE_MISMATCH = "SIGN_REJECTED_BYTE_MISMATCH"
+SIGN_REJECTED_PRICE_CAP = "SIGN_REJECTED_PRICE_CAP"
+SIGN_REJECTED_BAD_SIGNATURE = "SIGN_REJECTED_BAD_SIGNATURE"
+SIGN_REJECTED_UNKNOWN_REQUEST = "SIGN_REJECTED_UNKNOWN_REQUEST"
+SIGN_REJECTED_CLOCK_SKEW = "SIGN_REJECTED_CLOCK_SKEW"
+SIGN_EXPIRED_NO_PENDING = "SIGN_EXPIRED_NO_PENDING"
+SIGN_TIMEOUT = "SIGN_TIMEOUT"
+# Escalation when a row spent ~24h hitting transient errors (429/5xx/timeout).
+# It moves to ``failed_retryable`` so the operator sees it; not terminal —
+# manual ``unlock_for_retry`` resets the budget.
+SIGN_TRANSIENT_BUDGET_EXHAUSTED = "SIGN_TRANSIENT_BUDGET_EXHAUSTED"
+# Local pre-flight signature recovery (P3/L6) — the gateway-signed
+# receipt's EIP-712 recovered signer doesn't match
+# ``GATEWAY_PAYER_ADDRESS``. Terminal: a chain-side ``claimBatch`` would
+# revert atomically and poison the whole batch, so we drop the row
+# instead. Operator inspection only — there's no retry that can fix a
+# bad signature.
+SIGN_VERIFY_FAILED = "SIGN_VERIFY_FAILED"
+
+# --- Claim-side codes --------------------------------------------------------
+
+CLAIM_REVERTED = "CLAIM_REVERTED"
+CLAIM_RPC_UNREACHABLE = "CLAIM_RPC_UNREACHABLE"
+CLAIM_TX_TIMEOUT = "CLAIM_TX_TIMEOUT"
+CLAIM_NONCE_ALREADY_USED = "CLAIM_NONCE_ALREADY_USED"
+# Identity wallet (the broadcaster of claimBatch) has no CTC for gas.
+# Surfaced separately from CLAIM_RPC_UNREACHABLE because the resolution
+# is operator-actionable: send CTC to the wallet shown in Earnings.
+# Treated as transient (counts_against_retry_budget=False) so receipts
+# stay retryable until the wallet is funded.
+CLAIM_INSUFFICIENT_GAS = "CLAIM_INSUFFICIENT_GAS"
+
+SIGN_CODES = frozenset({
+    SIGN_REJECTED_UNREGISTERED_NODE,
+    SIGN_REJECTED_BYTE_MISMATCH,
+    SIGN_REJECTED_PRICE_CAP,
+    SIGN_REJECTED_BAD_SIGNATURE,
+    SIGN_REJECTED_UNKNOWN_REQUEST,
+    SIGN_REJECTED_CLOCK_SKEW,
+    SIGN_EXPIRED_NO_PENDING,
+    SIGN_TIMEOUT,
+    SIGN_TRANSIENT_BUDGET_EXHAUSTED,
+    SIGN_VERIFY_FAILED,
+})
+
+CLAIM_CODES = frozenset({
+    CLAIM_REVERTED,
+    CLAIM_RPC_UNREACHABLE,
+    CLAIM_TX_TIMEOUT,
+    CLAIM_NONCE_ALREADY_USED,
+    CLAIM_INSUFFICIENT_GAS,
+})
+
+ALL_CODES = SIGN_CODES | CLAIM_CODES
+
+MESSAGES: dict[str, str] = {
+    SIGN_REJECTED_UNREGISTERED_NODE:
+        "Your node wallet is not registered in the escrow contract. "
+        "Contact support to complete on-chain registration.",
+    SIGN_REJECTED_BYTE_MISMATCH:
+        "The gateway's measured traffic disagreed with your node's report.",
+    SIGN_REJECTED_PRICE_CAP:
+        "The receipt's rate exceeded the network's price cap.",
+    SIGN_REJECTED_BAD_SIGNATURE:
+        "The submission signature didn't verify against your identity key.",
+    SIGN_REJECTED_UNKNOWN_REQUEST:
+        "The gateway has no record of this traffic — receipt cannot be signed.",
+    SIGN_TIMEOUT:
+        "The signing service didn't respond in time. Will retry automatically.",
+    SIGN_REJECTED_CLOCK_SKEW:
+        "Your provider's clock is drifting. Enable NTP (e.g. "
+        "`sudo timedatectl set-ntp true`) and restart.",
+    SIGN_EXPIRED_NO_PENDING:
+        "The gateway never recorded this relay. Receipt expired in "
+        "the signing queue (typically 24h). No action required.",
+    SIGN_TRANSIENT_BUDGET_EXHAUSTED:
+        "Receipt repeatedly failed to sign (~24h of transient errors). "
+        "Check connectivity to the coordination API; the operator may "
+        "need to retry manually after the issue clears.",
+    SIGN_VERIFY_FAILED:
+        "The gateway's signature on this receipt did not verify locally "
+        "against the configured payer address. Submitting it would "
+        "revert the whole batch on-chain, so it has been dropped. "
+        "Contact support if this happens repeatedly.",
+    CLAIM_REVERTED:
+        "The on-chain claim transaction reverted.",
+    CLAIM_RPC_UNREACHABLE:
+        "The Creditcoin RPC endpoint was unreachable. Will retry automatically.",
+    CLAIM_TX_TIMEOUT:
+        "The claim transaction took longer than expected to confirm.",
+    CLAIM_NONCE_ALREADY_USED:
+        "This receipt was already settled on-chain — no further action needed.",
+    CLAIM_INSUFFICIENT_GAS:
+        "Identity wallet has no CTC for gas. Send CTC to the wallet shown "
+        "in Earnings, then retry — receipts stay queued until funded.",
+}
+
+
+def message_for(code: str | None) -> str:
+    """Return a user-facing message for an error code, or empty string."""
+    if not code:
+        return ""
+    return MESSAGES.get(code, code)
+
+
+def is_sign_code(code: str | None) -> bool:
+    return code in SIGN_CODES if code else False
+
+
+def is_claim_code(code: str | None) -> bool:
+    return code in CLAIM_CODES if code else False
+
+
+# Attempt caps — override via env for QA.
+MAX_SIGN_ATTEMPTS = int(os.environ.get("SR_RECEIPT_MAX_SIGN_ATTEMPTS", "2"))
+MAX_CLAIM_ATTEMPTS = int(os.environ.get("SR_RECEIPT_MAX_CLAIM_ATTEMPTS", "2"))
+
+
+# Transient codes don't increment the attempts counter — they're retried
+# indefinitely. Only explicit rejections / terminal tx failures count.
+TRANSIENT_CODES = frozenset({
+    SIGN_TIMEOUT,
+    SIGN_REJECTED_CLOCK_SKEW,  # fix NTP, receipt will be retried on next tick
+    CLAIM_RPC_UNREACHABLE,
+    CLAIM_TX_TIMEOUT,
+    # Operator-actionable: fund the identity wallet with CTC. Receipts
+    # remain retryable indefinitely so they pick up on the next claim
+    # cycle once the wallet has gas.
+    CLAIM_INSUFFICIENT_GAS,
+})
+
+
+def counts_against_retry_budget(code: str | None) -> bool:
+    """Return True if this failure should increment sign/claim_attempts."""
+    if not code:
+        return False
+    return code not in TRANSIENT_CODES

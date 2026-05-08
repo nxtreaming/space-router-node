@@ -1,4 +1,5 @@
 import datetime
+import os
 
 import pytest
 from cryptography import x509
@@ -6,8 +7,18 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
-from app.config import Settings
-from app.tls import ensure_certificates
+# Repo-root `.env` is a developer convenience for running the daemon manually,
+# but pydantic-settings would otherwise read it and leak `SR_*` values into
+# every `Settings()` call in tests. Disable file-based env loading and scrub
+# any leaked `SR_*` from os.environ BEFORE app modules are imported.
+for _key in [k for k in os.environ if k.startswith("SR_")]:
+    del os.environ[_key]
+
+from app.config import Settings  # noqa: E402
+
+Settings.model_config["env_file"] = None
+
+from app.tls import ensure_certificates  # noqa: E402
 
 
 # Well-known test wallet address (derived from Ethereum dev docs test key)

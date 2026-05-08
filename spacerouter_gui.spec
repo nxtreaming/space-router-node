@@ -89,6 +89,12 @@ a = Analysis(
     binaries=[],
     datas=[
         ("gui/assets", "gui/assets"),
+        # TokenPaymentEscrow ABI — ship at both bundle paths because the
+        # GUI entry point (gui/app.py) lands at the bundle root while
+        # app/payment/settlement.py keeps its package path. See homenode.spec
+        # for the full explanation.
+        ("app/payment/escrow_abi.json", "payment"),
+        ("app/payment/escrow_abi.json", "app/payment"),
     ],
     hiddenimports=hiddenimports,
     hookspath=[],
@@ -164,7 +170,7 @@ else:
     if sys.platform == "darwin":
         app = BUNDLE(
             coll,
-            name="SpaceRouter.app",
+            name="SpaceRouter Proxy.app",
             icon="packaging/macos/SpaceRouter.icns",
             bundle_identifier="com.spacerouter.desktop",
             info_plist={

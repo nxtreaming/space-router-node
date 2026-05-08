@@ -82,43 +82,11 @@ class TestConfigOverrides:
             del os.environ["SR_LOG_LEVEL"]
 
 
-class TestConfigHTTPWarning:
-    def test_http_coordination_url_warns_for_remote(self):
-        """Non-localhost HTTP Coordination API URL should emit a warning."""
-        os.environ["SR_COORDINATION_API_URL"] = "http://remote-server.com:8000"
-        try:
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter("always")
-                from app.config import load_settings
-                load_settings()
-                # Check if warning was issued
-                http_warnings = [x for x in w if "plain HTTP" in str(x.message)]
-                assert len(http_warnings) > 0
-        finally:
-            os.environ.pop("SR_COORDINATION_API_URL", None)
-
-    def test_https_coordination_url_no_warning(self):
-        """HTTPS Coordination API URL should not emit a warning."""
-        os.environ["SR_COORDINATION_API_URL"] = "https://api.spacerouter.net"
-        try:
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter("always")
-                from app.config import load_settings
-                load_settings()
-                http_warnings = [x for x in w if "plain HTTP" in str(x.message)]
-                assert len(http_warnings) == 0
-        finally:
-            os.environ.pop("SR_COORDINATION_API_URL", None)
-
-    def test_localhost_http_no_warning(self):
-        """localhost HTTP is acceptable for development — no warning."""
-        os.environ["SR_COORDINATION_API_URL"] = "http://localhost:8000"
-        try:
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter("always")
-                from app.config import load_settings
-                load_settings()
-                http_warnings = [x for x in w if "plain HTTP" in str(x.message)]
-                assert len(http_warnings) == 0
-        finally:
-            os.environ.pop("SR_COORDINATION_API_URL", None)
+# NOTE — the previous TestConfigHTTPWarning class was removed during the
+# v1.5 settings.json migration. The plain-HTTP soft-warning it tested
+# has been superseded by a hard-reject Pydantic validator in
+# app/settings_v2.py: production / staging variants now refuse to load
+# any settings.json or env-seeded config with an http:// URL. Coverage
+# for the new behaviour lives in tests/test_settings_v2.py
+# (test_http_url_rejected_on_production / _on_staging,
+# test_http_url_ok_on_test_variant).

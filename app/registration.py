@@ -18,6 +18,8 @@ All authenticated calls are signed with the node's identity private key.
 
 import logging
 import os
+import re
+from typing import Literal, NamedTuple
 
 import httpx
 
@@ -268,18 +270,46 @@ def _effective_wallet(settings: Settings) -> str:
     return settings.STAKING_ADDRESS.lower()
 
 
+class ProbeRequestResult(NamedTuple):
+    """Outcome of a request_probe() call.
+
+    - ``outcome="ok"``       → probe accepted (200) or node already online (400).
+    - ``outcome="rate_limited"`` → server returned 429; ``retry_after_seconds``
+      carries the server's hint (parsed from the ``detail`` field) so the
+      caller can honour it instead of guessing a backoff.
+    - ``outcome="failed"``   → other 4xx/5xx or network/parse exception.
+    """
+
+    outcome: Literal["ok", "rate_limited", "failed"]
+    retry_after_seconds: int | None  # only set when outcome == "rate_limited"
+
+
+# Default retry-after when the server's detail string can't be parsed.
+_DEFAULT_RATE_LIMIT_RETRY_S = 300
+
+# Server detail format: "Probe already requested recently. Try again in {N}s."
+_RETRY_AFTER_RE = re.compile(r"Try again in (\d+)s")
+
+
 async def request_probe(
     http_client: httpx.AsyncClient,
     settings: Settings,
     node_id: str,
     *,
     identity_key: str,
-) -> bool:
+) -> ProbeRequestResult:
     """Request a health probe from the Coordination API (signed).
 
-    Returns ``True`` when the probe was accepted (200) or the node is
-    already online (400).  Returns ``False`` on rate-limit (429), server
-    error, or network failure — callers can use this to back off.
+    Returns a :class:`ProbeRequestResult` describing the outcome:
+
+    - ``ok``           on 200 (probe queued) or 400 (already online).
+    - ``rate_limited`` on 429, with ``retry_after_seconds`` parsed from the
+      server's ``detail`` field (defaults to 300s when parsing fails).
+    - ``failed``       on any other status or exception.
+
+    The structured return lets the caller respect the server's retry hint
+    rather than applying a blind exponential backoff that compounds with
+    the server's own rate limit.
     """
     signature, timestamp = sign_request(identity_key, "request_probe", node_id)
 
@@ -292,18 +322,30 @@ async def request_probe(
         }, timeout=10.0)
         if resp.status_code == 200:
             logger.info("Health probe requested for node %s — waiting for verification", node_id)
-            return True
+            return ProbeRequestResult("ok", None)
         if resp.status_code == 400:
             logger.info("Probe request returned 400 (node may already be online): %s", resp.text)
-            return True
+            return ProbeRequestResult("ok", None)
         if resp.status_code == 429:
-            logger.warning("Probe request rate-limited (429) for node %s", node_id)
-            return False
+            retry_after = _DEFAULT_RATE_LIMIT_RETRY_S
+            try:
+                detail = resp.json().get("detail", "")
+                m = _RETRY_AFTER_RE.search(detail or "")
+                if m:
+                    retry_after = int(m.group(1))
+            except Exception:
+                # Body wasn't JSON or didn't contain detail — fall back to default.
+                pass
+            logger.warning(
+                "Probe request rate-limited (429) for node %s — retry in %ds",
+                node_id, retry_after,
+            )
+            return ProbeRequestResult("rate_limited", retry_after)
         logger.warning("Probe request failed: %s %s", resp.status_code, resp.text)
-        return False
+        return ProbeRequestResult("failed", None)
     except Exception as exc:
         logger.warning("Failed to request probe for node %s: %s", node_id, exc)
-        return False
+        return ProbeRequestResult("failed", None)
 
 
 async def check_node_status(
@@ -331,18 +373,98 @@ async def deregister_node(
     *,
     identity_key: str,
 ) -> None:
-    """Set node status to offline (signed). Best-effort."""
+    """Set node status to offline (signed).
+
+    Raises on HTTP/network failure so callers can distinguish a real
+    "coord said offline" from a "we tried and the server 500'd". rc.8 #7b:
+    the previous swallow-and-warn made ``deregister_best_effort_sync``
+    report success on coord 500s, which surfaced as a misleading
+    "Notified coordination API (status → offline)" line during --reset.
+    Wrap calls in a try/except at the policy layer (e.g.
+    ``deregister_best_effort_sync``) when failure must not abort the
+    surrounding flow.
+    """
     signature, timestamp = sign_request(identity_key, "update_status", node_id)
 
     url = f"{settings.COORDINATION_API_URL}/nodes/{node_id}/status"
+    resp = await http_client.patch(url, json={
+        "status": "offline",
+        "wallet_address": _effective_wallet(settings),
+        "signature": signature,
+        "timestamp": timestamp,
+    }, timeout=10.0)
+    resp.raise_for_status()
+    logger.info("Deregistered node %s (status → offline)", node_id)
+
+
+def deregister_best_effort_sync(settings: Settings) -> bool:
+    """Synchronous best-effort deregister — load identity from disk and
+    PATCH status to offline.
+
+    rc.6 MAJ-3: Reset Node / fresh restart didn't tell the coord we
+    were going away, so the operator's node hung in "online" state on
+    the dashboard for the full health-check timeout (~3 min) after a
+    reset. This helper bridges the sync reset paths to the async
+    deregister_node helper.
+
+    Returns True on best-effort success (HTTP call dispatched), False
+    on any failure (no identity, network error, etc.). The caller must
+    NOT block reset on the return value — this is purely informational.
+    """
+    import asyncio
+
     try:
-        resp = await http_client.patch(url, json={
-            "status": "offline",
-            "wallet_address": _effective_wallet(settings),
-            "signature": signature,
-            "timestamp": timestamp,
-        }, timeout=10.0)
-        resp.raise_for_status()
-        logger.info("Deregistered node %s (status → offline)", node_id)
+        from app.identity import load_or_create_identity
     except Exception as exc:
-        logger.warning("Failed to deregister node %s: %s", node_id, exc)
+        # rc.10 #3: do NOT pass exc_info=True here — --reset runs against a
+        # CLI logger whose StreamHandler would dump the full traceback
+        # (httpx HTTPStatusError + Mozilla URL hint) to stderr BEFORE
+        # _do_reset prints its honest "Coord deregister failed (likely
+        # server issue)" message, scaring operators who just want to wipe.
+        logger.warning(
+            "Cannot import identity module for reset-time deregister: %s",
+            exc,
+        )
+        return False
+
+    try:
+        identity_key, identity_address = load_or_create_identity(
+            settings.IDENTITY_KEY_PATH,
+            settings.IDENTITY_PASSPHRASE,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not load identity for reset-time deregister; skipping: %s",
+            exc,
+        )
+        return False
+
+    async def _run() -> None:
+        async with httpx.AsyncClient() as client:
+            await deregister_node(
+                client, settings, identity_address,
+                identity_key=identity_key,
+            )
+
+    try:
+        asyncio.run(_run())
+        return True
+    except httpx.HTTPStatusError as exc:
+        # rc.10 #3b: httpx.HTTPStatusError.__str__ embeds the Mozilla URL
+        # ("For more information check: https://developer.mozilla.org/...")
+        # inline. Even without exc_info=True (rc.10 #3), formatting `%s` on
+        # the exception leaks that URL into operator-facing logs. Render
+        # the diagnostic ourselves with just the status + URL we hit.
+        logger.warning(
+            "Best-effort deregister failed; continuing with reset: "
+            "HTTP %d on %s",
+            exc.response.status_code,
+            exc.request.url,
+        )
+        return False
+    except Exception as exc:
+        logger.warning(
+            "Best-effort deregister failed; continuing with reset: %s",
+            exc,
+        )
+        return False

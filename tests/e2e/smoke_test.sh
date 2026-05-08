@@ -25,6 +25,17 @@ log()  { echo "  [INFO]  $*"; }
 pass() { echo "  [PASS]  $*"; PASS=$((PASS + 1)); }
 fail() { echo "  [FAIL]  $*"; FAIL=$((FAIL + 1)); }
 
+# The daemon enforces a single-instance lock at ~/.spacerouter/daemon.lock
+# (see app/main.py::_acquire_daemon_lock). It's keyed off RECEIPT_STORE_PATH's
+# parent directory, but settings_from_provider_settings rebuilds that path
+# from app/paths.py::config_dir(), so SR_RECEIPT_STORE_PATH overrides are
+# silently ignored. The smoke test runs two daemon instances back-to-back
+# (test_port_binding then test_clean_shutdown), so we explicitly drop the
+# lock file between them. POSIX flock releases on process death, but
+# clearing the on-disk PID line makes the test deterministic and mirrors
+# the Windows path.
+DAEMON_LOCK_PATH="${HOME}/.spacerouter/daemon.lock"
+
 # Start a mock coordination API that responds to POST /nodes and PATCH requests
 start_mock_api() {
     local MOCK_PORT=19099
@@ -120,37 +131,44 @@ test_port_binding() {
     PID=$!
     log "Started binary with PID $PID"
 
-    # Give it time to start, register, and bind
-    sleep 5
+    # Poll until the port is listening (up to 30 seconds).
+    # The binary needs to fetch config, detect public IP, generate identity,
+    # and register — startup time varies with CI runner load.
+    LISTENING=""
+    for i in $(seq 1 30); do
+        if ! kill -0 "$PID" 2>/dev/null; then
+            fail "Binary exited prematurely"
+            return
+        fi
+        if command -v lsof &>/dev/null; then
+            LISTENING=$(lsof -iTCP:"${SR_NODE_PORT}" -sTCP:LISTEN 2>/dev/null || true)
+        elif command -v ss &>/dev/null; then
+            LISTENING=$(ss -tlnp 2>/dev/null | grep ":${SR_NODE_PORT}" || true)
+        elif command -v netstat &>/dev/null; then
+            LISTENING=$(netstat -an 2>/dev/null | grep "LISTEN" | grep ":${SR_NODE_PORT}" || true)
+        else
+            log "No port-checking tool available, skipping port binding check"
+            kill "$PID" 2>/dev/null || true
+            wait "$PID" 2>/dev/null || true
+            pass "Binary started (port check skipped — no lsof/ss/netstat)"
+            return
+        fi
+        if [ -n "$LISTENING" ]; then
+            break
+        fi
+        sleep 1
+    done
 
-    if ! kill -0 "$PID" 2>/dev/null; then
-        fail "Binary exited prematurely"
-        return
-    fi
-
-    # Check if the port is listening
-    if command -v lsof &>/dev/null; then
-        LISTENING=$(lsof -iTCP:"${SR_NODE_PORT}" -sTCP:LISTEN 2>/dev/null || true)
-    elif command -v ss &>/dev/null; then
-        LISTENING=$(ss -tlnp 2>/dev/null | grep ":${SR_NODE_PORT}" || true)
-    elif command -v netstat &>/dev/null; then
-        LISTENING=$(netstat -an 2>/dev/null | grep "LISTEN" | grep ":${SR_NODE_PORT}" || true)
-    else
-        log "No port-checking tool available, skipping port binding check"
-        kill "$PID" 2>/dev/null || true
-        wait "$PID" 2>/dev/null || true
-        pass "Binary started (port check skipped — no lsof/ss/netstat)"
-        return
-    fi
-
-    # Clean up
+    # Clean up: stop the daemon, wait for it to actually exit, then
+    # remove the lock file so test_clean_shutdown's daemon can acquire it.
     kill "$PID" 2>/dev/null || true
     wait "$PID" 2>/dev/null || true
+    rm -f "$DAEMON_LOCK_PATH"
 
     if [ -n "$LISTENING" ]; then
         pass "Binary is listening on port $SR_NODE_PORT"
     else
-        fail "Binary did not bind to port $SR_NODE_PORT"
+        fail "Binary did not bind to port $SR_NODE_PORT within 30 seconds"
     fi
 }
 
@@ -164,7 +182,22 @@ test_clean_shutdown() {
     PID=$!
     log "Started binary with PID $PID"
 
-    sleep 5
+    # Wait until the port is bound before sending SIGTERM
+    for i in $(seq 1 30); do
+        if ! kill -0 "$PID" 2>/dev/null; then
+            fail "Binary exited before SIGTERM could be sent"
+            return
+        fi
+        if command -v lsof &>/dev/null; then
+            READY=$(lsof -iTCP:"${SR_NODE_PORT}" -sTCP:LISTEN 2>/dev/null || true)
+        elif command -v ss &>/dev/null; then
+            READY=$(ss -tlnp 2>/dev/null | grep ":${SR_NODE_PORT}" || true)
+        else
+            READY=""
+        fi
+        [ -n "$READY" ] && break
+        sleep 1
+    done
 
     if ! kill -0 "$PID" 2>/dev/null; then
         fail "Binary exited before SIGTERM could be sent"
@@ -179,6 +212,9 @@ test_clean_shutdown() {
         if ! kill -0 "$PID" 2>/dev/null; then
             wait "$PID" 2>/dev/null
             EXIT_CODE=$?
+            # Drop the lock file regardless of result so a recycled
+            # runner image can't inherit a stuck daemon.lock.
+            rm -f "$DAEMON_LOCK_PATH"
             if [ "$EXIT_CODE" -eq 0 ] || [ "$EXIT_CODE" -eq 143 ]; then
                 pass "Clean shutdown (exit code $EXIT_CODE)"
             else
@@ -192,6 +228,7 @@ test_clean_shutdown() {
     # Force kill if still running
     kill -9 "$PID" 2>/dev/null || true
     wait "$PID" 2>/dev/null || true
+    rm -f "$DAEMON_LOCK_PATH"
     fail "Binary did not exit within 10 seconds after SIGTERM"
 }
 

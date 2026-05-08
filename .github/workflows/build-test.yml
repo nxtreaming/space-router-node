@@ -32,11 +32,11 @@ jobs:
       matrix:
         include:
           - os: macos-14
-            artifact: space-router-node-test-macos-arm64
+            artifact: spacerouter-proxy-cli-v1.5.0-test.${{ github.run_number }}-macos-arm64
           - os: windows-latest
-            artifact: space-router-node-test-windows-x64
+            artifact: spacerouter-proxy-cli-v1.5.0-test.${{ github.run_number }}-windows-x64
           - os: ubuntu-latest
-            artifact: space-router-node-test-linux-x64
+            artifact: spacerouter-proxy-cli-v1.5.0-test.${{ github.run_number }}-linux-x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -51,7 +51,7 @@ jobs:
         id: version
         shell: bash
         run: |
-          VERSION="v0.0.0-test.${{ github.run_number }}"
+          VERSION="v1.5.0-test.${{ github.run_number }}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Building test version: ${VERSION}"
 
@@ -98,12 +98,47 @@ jobs:
           SR_NODE_PORT: "19090"
           SR_WALLET_ADDRESS: "0x0000000000000000000000000000000000000001"
 
+      # Build Linux packages (.deb and .rpm) via nfpm — mirrors build.yml's
+      # release flow so test builds get the same install surface real users
+      # will see at v1.5 GA. Without this, dev-latest assets ship as raw
+      # ELFs and end-user testing can't exercise the dpkg / rpm install
+      # path. See v1.5-remaining-work-plan.md (Phase A4 finding).
+      - name: Set up Go (for nfpm)
+        if: runner.os == 'Linux'
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Build Linux packages
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+          export PATH="$(go env GOPATH)/bin:$PATH"
+
+          VERSION="${{ steps.version.outputs.version }}"
+          # Strip leading 'v' for package version (nfpm wants 1.5.0-test.123,
+          # not v1.5.0-test.123).
+          PKG_VERSION="${VERSION#v}"
+          ARTIFACT="${{ matrix.artifact }}"
+
+          # Update nfpm.yaml source path to match the versioned artifact name
+          sed -i "s|dist/space-router-node-linux-x64|dist/${ARTIFACT}|" nfpm.yaml
+
+          # Build .deb
+          VERSION="${PKG_VERSION}" nfpm package --packager deb --target "dist/${ARTIFACT}.deb"
+
+          # Build .rpm
+          VERSION="${PKG_VERSION}" nfpm package --packager rpm --target "dist/${ARTIFACT}.rpm"
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: |
             dist/${{ matrix.artifact }}
             dist/${{ matrix.artifact }}.exe
+            dist/${{ matrix.artifact }}.deb
+            dist/${{ matrix.artifact }}.rpm
 
   build-gui:
     needs: test
@@ -112,9 +147,9 @@ jobs:
       matrix:
         include:
           - os: macos-14
-            artifact: spacerouter-gui-test-macos-arm64
+            artifact: spacerouter-proxy-gui-v1.5.0-test.${{ github.run_number }}-macos-arm64
           - os: windows-latest
-            artifact: spacerouter-gui-test-windows-x64
+            artifact: spacerouter-proxy-gui-v1.5.0-test.${{ github.run_number }}-windows-x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -129,7 +164,7 @@ jobs:
         id: version
         shell: bash
         run: |
-          VERSION="v0.0.0-test.${{ github.run_number }}"
+          VERSION="v1.5.0-test.${{ github.run_number }}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Building GUI test version: ${VERSION}"
 
@@ -145,11 +180,59 @@ jobs:
       - name: Build GUI app
         run: pyinstaller spacerouter_gui.spec
 
+      # Build the CLI binary in the same job so we can embed it inside
+      # SpaceRouter Proxy.app on macOS. Without this, QA installs from the .dmg
+      # have no way to reach --claim / --receipts. Mirrors build.yml.
+      - name: Build embedded CLI binary (macOS)
+        if: runner.os == 'macOS'
+        run: pyinstaller --clean --noconfirm homenode.spec
+
+      - name: Embed CLI in macOS app bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cp dist/space-router-node "dist/SpaceRouter Proxy.app/Contents/MacOS/space-router-node"
+          chmod +x "dist/SpaceRouter Proxy.app/Contents/MacOS/space-router-node"
+          ls -la "dist/SpaceRouter Proxy.app/Contents/MacOS/"
+
+      # PyInstaller's per-component ad-hoc signatures invalidate the .app
+      # bundle's outer seal once we drop in the embedded CLI binary above
+      # — `codesign --verify --deep` reports the bundle as broken, which
+      # makes Gatekeeper block first-launch even on test builds where we
+      # accept that the bundle isn't notarized.  Re-sign the whole bundle
+      # ad-hoc so the seal is consistent again. AppTranslocation will
+      # still occur on first launch (test builds aren't notarized) but
+      # the bundle at least loads instead of being rejected as damaged.
+      # Phase A findings #1 / #2.
+      - name: Re-seal macOS bundle (ad-hoc)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          xattr -cr "dist/SpaceRouter Proxy.app"
+          codesign --force --deep --sign - "dist/SpaceRouter Proxy.app"
+          codesign --verify --deep --strict --verbose=2 "dist/SpaceRouter Proxy.app"
+
+      - name: Embedded CLI smoke test (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # Confirm --help succeeds (argparse is wired) and the
+          # version-frozen binary reports the same version the GUI was
+          # stamped with. Catches packaging regressions like the
+          # ``space-router-node`` entrypoint failing to import app.*
+          "./dist/SpaceRouter Proxy.app/Contents/MacOS/space-router-node" --help > /dev/null
+          printed_version=$("./dist/SpaceRouter Proxy.app/Contents/MacOS/space-router-node" --version 2>&1 || true)
+          echo "Embedded CLI reports: $printed_version"
+          case "$printed_version" in
+            *"${{ steps.version.outputs.version }}"*) echo "version matches" ;;
+            *) echo "::warning::embedded CLI version mismatch — got '$printed_version', expected '${{ steps.version.outputs.version }}'" ;;
+          esac
+
       # ── GUI smoke tests ──
       - name: GUI smoke test (macOS)
         if: runner.os == 'macOS'
         shell: bash
-        run: bash tests/e2e/gui_smoke_test.sh "dist/SpaceRouter.app/Contents/MacOS/SpaceRouter"
+        run: bash tests/e2e/gui_smoke_test.sh "dist/SpaceRouter Proxy.app/Contents/MacOS/SpaceRouter"
         timeout-minutes: 3
 
       - name: GUI smoke test (Windows)
@@ -158,29 +241,88 @@ jobs:
         run: .\tests\e2e\gui_smoke_test.ps1 -Binary "dist\SpaceRouter.exe"
         timeout-minutes: 3
 
-      # Package macOS DMG (unsigned — test builds skip code signing)
+      # Belt-and-suspenders: confirm the embedded CLI is still in the
+      # bundle right before we package the DMG. test.95 shipped a .app
+      # missing space-router-node despite earlier embed/smoke steps —
+      # something between embed and DMG was stripping it. Hard-fail so
+      # the next regression doesn't get to QA undetected.
+      - name: Assert embedded CLI is present pre-DMG (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -e
+          BUNDLE_CLI="dist/SpaceRouter Proxy.app/Contents/MacOS/space-router-node"
+          if [ ! -f "$BUNDLE_CLI" ]; then
+            echo "::error::Embedded CLI missing from app bundle before DMG packaging: $BUNDLE_CLI"
+            ls -la "dist/SpaceRouter Proxy.app/Contents/MacOS/" || true
+            exit 1
+          fi
+          if [ ! -x "$BUNDLE_CLI" ]; then
+            echo "::error::Embedded CLI is not executable: $BUNDLE_CLI"
+            exit 1
+          fi
+          echo "OK: $BUNDLE_CLI present and executable"
+
+      - name: Install create-dmg
+        if: runner.os == 'macOS'
+        run: brew install create-dmg
+
+      # Package macOS DMG (unsigned — test builds skip code signing).
+      # Drag-to-Applications layout with branded chevron background.
       - name: Package macOS DMG
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          if [ -d "dist/SpaceRouter.app" ]; then
+          if [ -d "dist/SpaceRouter Proxy.app" ]; then
+            DMG="dist/${{ matrix.artifact }}.dmg"
+            rm -f "$DMG"
             for attempt in 1 2 3; do
-              if hdiutil create -volname "SpaceRouter" \
-                   -srcfolder "dist/SpaceRouter.app" \
-                   -ov -format UDZO \
-                   "dist/${{ matrix.artifact }}.dmg"; then
+              if create-dmg \
+                   --volname "SpaceRouter Proxy" \
+                   --background "packaging/macos/dmg/background.tiff" \
+                   --window-size 600 400 \
+                   --icon-size 110 \
+                   --icon "SpaceRouter Proxy.app" 150 185 \
+                   --app-drop-link 450 185 \
+                   --hide-extension "SpaceRouter Proxy.app" \
+                   --no-internet-enable \
+                   "$DMG" \
+                   "dist/SpaceRouter Proxy.app"; then
                 break
               fi
               if [ "$attempt" -lt 3 ]; then
-                echo "hdiutil failed (attempt $attempt/3), retrying in 5s..."
+                echo "create-dmg failed (attempt $attempt/3), retrying in 5s..."
+                rm -f "$DMG"
                 sleep 5
               fi
             done
-            if [ ! -f "dist/${{ matrix.artifact }}.dmg" ]; then
-              echo "All hdiutil attempts failed"
+            if [ ! -f "$DMG" ]; then
+              echo "All create-dmg attempts failed"
               exit 1
             fi
           fi
+
+      # Mount the DMG we just produced and verify the embedded CLI is
+      # actually in the shipping artifact — guards against hdiutil
+      # silently dropping files (we suspect a re-seal / signature step
+      # interaction caused the test.95 regression). Detach when done.
+      - name: Assert embedded CLI is in shipping DMG (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -e
+          DMG="dist/${{ matrix.artifact }}.dmg"
+          MOUNT_POINT=$(mktemp -d)
+          hdiutil attach "$DMG" -mountpoint "$MOUNT_POINT" -nobrowse -readonly -quiet
+          BUNDLE_CLI="$MOUNT_POINT/SpaceRouter Proxy.app/Contents/MacOS/space-router-node"
+          if [ ! -f "$BUNDLE_CLI" ]; then
+            echo "::error::Embedded CLI missing from DMG: $BUNDLE_CLI"
+            ls -la "$MOUNT_POINT/SpaceRouter Proxy.app/Contents/MacOS/" || true
+            hdiutil detach "$MOUNT_POINT" -quiet || true
+            exit 1
+          fi
+          echo "OK: CLI present in DMG ($BUNDLE_CLI)"
+          hdiutil detach "$MOUNT_POINT" -quiet
 
       # Rename Windows artifact (onefile mode produces dist/SpaceRouter.exe directly)
       - name: Rename artifact (Windows)

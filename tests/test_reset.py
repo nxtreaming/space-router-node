@@ -22,10 +22,11 @@ def store(tmp_path):
 
 @pytest.fixture()
 def store_with_state(store, tmp_path):
-    """ConfigStore with identity key, certs, and custom addresses written."""
-    from dotenv import set_key
+    """ConfigStore with identity key, certs, and custom addresses written.
 
-    # Create identity key
+    Uses the v1.5 settings.json store (not the legacy spacerouter.env).
+    """
+    # Create identity key + cert files
     certs_dir = tmp_path / "certs"
     certs_dir.mkdir(parents=True, exist_ok=True)
     (certs_dir / "node-identity.key").write_text("fake-identity-key\n")
@@ -33,9 +34,9 @@ def store_with_state(store, tmp_path):
     (certs_dir / "node.key").write_text("fake-key\n")
     (certs_dir / "gateway-ca.crt").write_text("fake-ca\n")
 
-    # Set custom addresses
-    set_key(str(store.path), "SR_STAKING_ADDRESS", "0x" + "aa" * 20)
-    set_key(str(store.path), "SR_COLLECTION_ADDRESS", "0x" + "bb" * 20)
+    # Persist custom addresses via the canonical save_wallets() path —
+    # writes settings.json, not spacerouter.env.
+    store.save_wallets("0x" + "aa" * 20, "0x" + "bb" * 20)
     return store
 
 
@@ -63,25 +64,29 @@ class TestConfigStoreReset:
         assert not certs_dir.exists()
 
     def test_reset_clears_addresses(self, store_with_state):
-        """reset() must clear staking and collection addresses back to defaults."""
-        vals_before = dotenv_values(str(store_with_state.path))
-        assert vals_before.get("SR_STAKING_ADDRESS") == "0x" + "aa" * 20
+        """reset() must clear staking and collection addresses."""
+        # Pre-condition: addresses persisted via store_with_state fixture.
+        assert store_with_state.get("SR_STAKING_ADDRESS") == "0x" + "aa" * 20
 
         store_with_state.reset()
 
-        vals_after = dotenv_values(str(store_with_state.path))
-        assert vals_after.get("SR_STAKING_ADDRESS") == ""
-        assert vals_after.get("SR_COLLECTION_ADDRESS") == ""
+        assert store_with_state.get("SR_STAKING_ADDRESS") == ""
+        assert store_with_state.get("SR_COLLECTION_ADDRESS") == ""
 
-    def test_reset_restores_default_config(self, store_with_state):
-        """reset() must rewrite the config file with all default values."""
-        from gui.config_store import _DEFAULTS
+    def test_reset_deletes_settings_json(self, store_with_state):
+        """reset() must DELETE settings.json (rc.5 MAJ-3).
 
+        Pre-rc.5 reset() re-saved a defaults instance, which left a stale
+        defaults file behind that drifted out of sync when the canonical
+        defaults changed between releases. The cold-start path in
+        ``app.settings_loader`` re-creates settings.json on the next
+        start with current canonical defaults — including the test
+        variant's escrow opt-in via ``_backfill_test_escrow_in_place``.
+        Brings GUI behavior in line with CLI's ``_do_reset``.
+        """
         store_with_state.reset()
 
-        vals = dotenv_values(str(store_with_state.path))
-        for key, default in _DEFAULTS.items():
-            assert vals.get(key) == default, f"{key} should be '{default}', got '{vals.get(key)}'"
+        assert not store_with_state._settings_json_path.exists()
 
     def test_reset_makes_needs_onboarding_true(self, store_with_state):
         """After reset(), needs_onboarding() must return True (identity key gone)."""
@@ -105,8 +110,31 @@ class TestConfigStoreReset:
 
         store.reset()  # should not raise
 
-        vals = dotenv_values(str(store.path))
-        assert vals.get("SR_STAKING_ADDRESS") == ""
+        assert store.get("SR_STAKING_ADDRESS") == ""
+
+    def test_reset_wipes_receipts_db_and_incidents_and_logs(
+        self, store_with_state, tmp_path,
+    ):
+        """reset() must wipe operational state — receipts.db, incidents.json,
+        logs/ — not just settings + identity. Pre-rc.3 these survived a
+        Fresh Restart, so a "fresh" node still showed stale failed-claim
+        rows and old incident banners on next start.
+        """
+        (tmp_path / "receipts.db").write_text("sqlite-bytes")
+        (tmp_path / "receipts.db-wal").write_text("wal-bytes")
+        (tmp_path / "receipts.db-shm").write_text("shm-bytes")
+        (tmp_path / "incidents.json").write_text("[]")
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        (logs_dir / "spacerouter-node.log").write_text("log-line\n")
+
+        store_with_state.reset()
+
+        assert not (tmp_path / "receipts.db").exists()
+        assert not (tmp_path / "receipts.db-wal").exists()
+        assert not (tmp_path / "receipts.db-shm").exists()
+        assert not (tmp_path / "incidents.json").exists()
+        assert not logs_dir.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +166,8 @@ class TestApiFreshRestart:
         assert not (tmp_path / "certs" / "node-identity.key").exists()
         # Verify certs dir was removed
         assert not (tmp_path / "certs").exists()
+        # rc.5 MAJ-3: settings.json must be deleted, not re-saved.
+        assert not (tmp_path / "settings.json").exists()
 
     def test_fresh_restart_clears_env_vars(self, store_with_state):
         """fresh_restart() must remove all SR_ env vars."""
@@ -207,3 +237,297 @@ class TestCliReset:
         source = inspect.getsource(_do_reset)
         assert "--keep-identity" not in source
         assert "keep_identity" not in source
+
+    def test_do_reset_wipes_operational_state(self, tmp_path):
+        """CLI --reset must wipe receipts.db, incidents.json, logs/ in
+        addition to settings + certs."""
+        certs_dir = tmp_path / "certs"
+        certs_dir.mkdir()
+        (certs_dir / "node-identity.key").write_text("fake\n")
+        (tmp_path / "receipts.db").write_text("sqlite-bytes")
+        (tmp_path / "incidents.json").write_text("[]")
+        (tmp_path / "logs").mkdir()
+        (tmp_path / "logs" / "spacerouter-node.log").write_text("entry\n")
+
+        with patch("app.main.load_settings") as mock_settings, \
+             patch("app.paths.config_dir", return_value=tmp_path), \
+             patch("app.main.sys") as mock_sys:
+            mock_settings.return_value.IDENTITY_KEY_PATH = str(
+                certs_dir / "node-identity.key"
+            )
+            mock_sys.argv = ["prog", "--reset"]
+            mock_sys.stdin.isatty.return_value = False
+            mock_sys.exit = MagicMock(side_effect=SystemExit)
+
+            from app.main import _do_reset
+            _do_reset()
+
+        assert not (tmp_path / "receipts.db").exists()
+        assert not (tmp_path / "incidents.json").exists()
+        assert not (tmp_path / "logs").exists()
+
+
+# ---------------------------------------------------------------------------
+# wipe_operational_state() — pure helper
+# ---------------------------------------------------------------------------
+
+
+class TestWipeOperationalState:
+    def test_wipes_present_artefacts(self, tmp_path):
+        from app.paths import wipe_operational_state
+
+        (tmp_path / "receipts.db").write_text("x")
+        (tmp_path / "receipts.db-wal").write_text("x")
+        (tmp_path / "incidents.json").write_text("[]")
+        (tmp_path / "logs").mkdir()
+        (tmp_path / "logs" / "a.log").write_text("y")
+        # rc.5 MAJ-3: pid/coordination locks must also go.
+        (tmp_path / "daemon.lock").write_text("12345")
+        (tmp_path / "claim.lock").write_text("active")
+
+        notes = wipe_operational_state(tmp_path)
+
+        assert not (tmp_path / "receipts.db").exists()
+        assert not (tmp_path / "receipts.db-wal").exists()
+        assert not (tmp_path / "incidents.json").exists()
+        assert not (tmp_path / "logs").exists()
+        assert not (tmp_path / "daemon.lock").exists()
+        assert not (tmp_path / "claim.lock").exists()
+        assert any("receipts.db" in n for n in notes)
+        assert any("incidents.json" in n for n in notes)
+        assert any("logs" in n for n in notes)
+        assert any("daemon.lock" in n for n in notes)
+        assert any("claim.lock" in n for n in notes)
+
+    def test_silent_when_nothing_to_wipe(self, tmp_path):
+        from app.paths import wipe_operational_state
+
+        notes = wipe_operational_state(tmp_path)
+        assert notes == []  # no artefacts, no notes
+
+    def test_does_not_touch_unrelated_files(self, tmp_path):
+        from app.paths import wipe_operational_state
+
+        (tmp_path / "settings.json").write_text("{}")
+        certs = tmp_path / "certs"
+        certs.mkdir()
+        (certs / "node-identity.key").write_text("k")
+
+        wipe_operational_state(tmp_path)
+
+        # The wipe must not touch settings.json or certs/ —
+        # those are owned by the GUI/CLI reset paths.
+        assert (tmp_path / "settings.json").exists()
+        assert (certs / "node-identity.key").exists()
+
+
+# ---------------------------------------------------------------------------
+# rc.6 BLK-2 — receipt store singleton survives wipe_operational_state
+# ---------------------------------------------------------------------------
+
+
+class TestReceiptStoreSingletonSurvivesReset:
+    """The receipt store keeps a module-level singleton with an
+    `_initialized=True` flag. wipe_operational_state deletes
+    receipts.db on disk but the in-process singleton kept saying
+    "already initialized" — so the next initialize() short-circuited,
+    the schema never re-ran, and SQLite auto-created an empty file
+    on first query → "no such table: signed_receipts"."""
+
+    def test_clear_singleton_drops_cached_instance(self, tmp_path):
+        from app.payment import receipt_store as rs
+
+        path = tmp_path / "receipts.db"
+        first = rs.get_store(path)
+        assert rs.get_store(path) is first  # cached
+        rs.clear_singleton()
+        second = rs.get_store(path)
+        assert second is not first
+
+    def test_initialize_self_heals_when_file_was_deleted(self, tmp_path):
+        """initialize() must notice the file is gone and re-run schema."""
+        import asyncio
+
+        from app.payment import receipt_store as rs
+
+        path = tmp_path / "receipts.db"
+        store = rs.get_store(path)
+
+        # First init — schema applied, file exists.
+        asyncio.run(store.initialize())
+        assert path.exists()
+        assert store._initialized is True
+
+        # Simulate wipe_operational_state deleting the file under us
+        # without going through clear_singleton (defense in depth).
+        path.unlink()
+        for sib in ("receipts.db-wal", "receipts.db-shm"):
+            p = tmp_path / sib
+            if p.exists():
+                p.unlink()
+
+        # initialize() should detect the missing file and rebuild.
+        asyncio.run(store.initialize())
+        assert path.exists()
+
+        # And the schema must be present (no "no such table" on summary()).
+        summary = asyncio.run(store.summary())
+        assert summary["claimed"] == 0
+
+    def test_wipe_then_fresh_get_store_has_working_schema(self, tmp_path):
+        """End-to-end: initialize → wipe → get_store again → use store."""
+        import asyncio
+
+        from app.paths import wipe_operational_state
+        from app.payment import receipt_store as rs
+
+        path = tmp_path / "receipts.db"
+        store = rs.get_store(path)
+        asyncio.run(store.initialize())
+        assert path.exists()
+
+        # Reset Node path: wipe disk + drop the singleton.
+        wipe_operational_state(tmp_path)
+        assert not path.exists()
+
+        # Next caller obtains a fresh store; the cached one was cleared
+        # so its stale `_initialized=True` can't poison the new path.
+        fresh = rs.get_store(path)
+        assert fresh is not store
+        asyncio.run(fresh.initialize())
+        assert path.exists()
+        # Schema must be wired up — summary works without OperationalError.
+        summary = asyncio.run(fresh.summary())
+        assert summary["claimed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# rc.6 MAJ-3 — Reset must deregister from coord
+# ---------------------------------------------------------------------------
+
+
+class TestResetDeregistersFromCoord:
+    """Pre-rc.6 fresh_restart and _do_reset made zero HTTP calls. The
+    operator's node hung in "online" state on the dashboard for the
+    full health-check timeout (~3 min) after a reset.
+
+    We call deregister_best_effort_sync BEFORE deleting identity/settings
+    so the helper still has a key to sign with. Failure is logged and
+    swallowed so reset always completes even if the coord is unreachable.
+    """
+
+    def test_fresh_restart_calls_deregister_before_reset(
+        self, store_with_state, tmp_path,
+    ):
+        from gui.api import Api
+        from gui.node_manager import NodeManager
+
+        node = MagicMock(spec=NodeManager)
+        api = Api(config=store_with_state, node_manager=node)
+
+        with patch(
+            "app.registration.deregister_best_effort_sync",
+            return_value=True,
+        ) as mock_dereg:
+            result = api.fresh_restart()
+
+        assert result["ok"] is True
+        # Deregister was attempted exactly once.
+        assert mock_dereg.call_count == 1
+        # Identity was still deleted afterwards (reset proceeds).
+        assert not (tmp_path / "certs").exists()
+
+    def test_fresh_restart_continues_when_deregister_raises(
+        self, store_with_state, tmp_path,
+    ):
+        """Reset must still complete if the coord is unreachable."""
+        from gui.api import Api
+        from gui.node_manager import NodeManager
+
+        node = MagicMock(spec=NodeManager)
+        api = Api(config=store_with_state, node_manager=node)
+
+        with patch(
+            "app.registration.deregister_best_effort_sync",
+            side_effect=RuntimeError("coord unreachable"),
+        ):
+            result = api.fresh_restart()
+
+        assert result["ok"] is True
+        # Identity was still cleaned up.
+        assert not (tmp_path / "certs").exists()
+
+    def test_do_reset_calls_deregister_before_deleting_identity(
+        self, tmp_path,
+    ):
+        """CLI --reset must also notify coord before removing certs."""
+        certs_dir = tmp_path / "certs"
+        certs_dir.mkdir()
+        (certs_dir / "node-identity.key").write_text("fake\n")
+        env_file = tmp_path / "spacerouter.env"
+        env_file.write_text("SR_STAKING_ADDRESS=0x" + "aa" * 20 + "\n")
+
+        with patch("app.main.load_settings") as mock_settings, \
+             patch("app.paths.config_dir", return_value=tmp_path), \
+             patch("app.main.sys") as mock_sys, \
+             patch(
+                 "app.registration.deregister_best_effort_sync",
+                 return_value=True,
+             ) as mock_dereg:
+            mock_settings.return_value.IDENTITY_KEY_PATH = str(
+                certs_dir / "node-identity.key"
+            )
+            mock_sys.argv = ["prog", "--reset"]
+            mock_sys.stdin.isatty.return_value = False
+
+            from app.main import _do_reset
+            _do_reset()
+
+        assert mock_dereg.call_count == 1
+        # Reset still proceeded.
+        assert not certs_dir.exists()
+
+
+class TestDeregisterBestEffortSync:
+    """Unit tests for the rc.6 MAJ-3 helper itself."""
+
+    def test_returns_false_when_identity_missing(self, tmp_path):
+        from app.config import Settings
+        from app.registration import deregister_best_effort_sync
+
+        settings = Settings(
+            COORDINATION_API_URL="http://example.invalid",
+            IDENTITY_KEY_PATH=str(tmp_path / "missing.key"),
+            IDENTITY_PASSPHRASE="",
+        )
+        # No key file — load_or_create_identity would create one, but
+        # we want the bail-out path. Use a truly broken settings to
+        # force load_or_create_identity to fail.
+        with patch(
+            "app.identity.load_or_create_identity",
+            side_effect=RuntimeError("no key"),
+        ):
+            ok = deregister_best_effort_sync(settings)
+        assert ok is False
+
+    def test_returns_true_on_successful_dispatch(self, tmp_path):
+        """Helper returns True when the async deregister_node was awaited
+        without raising."""
+        from app.config import Settings
+        from app.registration import deregister_best_effort_sync
+
+        settings = Settings(
+            COORDINATION_API_URL="http://example.invalid",
+            IDENTITY_KEY_PATH=str(tmp_path / "missing.key"),
+            IDENTITY_PASSPHRASE="",
+        )
+
+        async def _ok(*args, **kwargs):
+            return None
+
+        with patch(
+            "app.identity.load_or_create_identity",
+            return_value=("0x" + "ab" * 32, "0x" + "cd" * 20),
+        ), patch("app.registration.deregister_node", side_effect=_ok):
+            ok = deregister_best_effort_sync(settings)
+        assert ok is True

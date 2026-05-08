@@ -498,6 +498,80 @@ h2 {
   margin-top: 4px;
 }
 
+/* Reset warning list — explicit consequences of Fresh Restart. */
+.reset-warning-list {
+  margin: 12px 0 16px 20px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #2c3e50;
+}
+
+.reset-warning-list li {
+  margin-bottom: 10px;
+}
+
+.reset-confirm-prompt {
+  margin: 8px 0;
+  font-size: 13px;
+  color: #555;
+}
+
+.reset-confirm-prompt code {
+  background: #f4f4f4;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-family: monospace;
+}
+
+#reset-confirm-input {
+  width: 100%;
+  padding: 8px 10px;
+  font-size: 14px;
+  font-family: monospace;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  margin-bottom: 8px;
+  box-sizing: border-box;
+}
+
+#reset-confirm-input:focus {
+  outline: none;
+  border-color: #e74c3c;
+}
+
+/* Disabled-button styling so the gating is visible. */
+.btn-primary:disabled,
+.btn-danger:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Passphrase row — input + show/hide toggle. */
+.passphrase-row {
+  display: flex;
+  gap: 6px;
+  align-items: stretch;
+}
+
+.passphrase-row input {
+  flex: 1;
+}
+
+.passphrase-toggle {
+  padding: 0 10px;
+  font-size: 12px;
+  background: #ecf0f1;
+  border: 1px solid #bdc3c7;
+  border-radius: 4px;
+  cursor: pointer;
+  color: #2c3e50;
+}
+
+.passphrase-toggle:hover {
+  background: #d5dbdf;
+}
+
 /* Network setup radio cards */
 .network-options {
   display: flex;
@@ -932,3 +1006,321 @@ body.has-test-banner .screen {
 .version-status.needs-update {
   color: #ff6b8a;
 }
+
+/* ───────────────────────────────────────────────────────────────────
+ * Payments / Receipts screen — PR 5
+ * Reuses existing tokens (#1a1a2e card, #6C5CE7 accent, etc). Any
+ * new primitive is scoped to .receipt-* or named utility classes so
+ * it can't bleed into onboarding / status / settings.
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* Clickable variant of .wallet-display for the Earnings entry row */
+.wallet-display-clickable {
+  width: 100%;
+  background: #1a1a2e;
+  border: 1px solid #2a2a40;
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+  transition: border-color 0.2s;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+}
+.wallet-display-clickable:hover { border-color: #4a4a60; }
+.wallet-display-clickable .wallet-label { flex: 0 0 auto; }
+.wallet-display-clickable .wallet-summary {
+  flex: 1;
+  text-align: right;
+  font-size: 13px;
+  color: #c0c0d8;
+  font-family: "SF Mono", "Cascadia Code", "Fira Code", monospace;
+  padding-right: 8px;
+}
+.wallet-chevron {
+  color: #606078;
+  font-size: 18px;
+  line-height: 1;
+}
+
+/* Ghost button — non-destructive counterpart to .btn-secondary */
+.btn-ghost {
+  display: inline-block;
+  padding: 10px 16px;
+  background: transparent;
+  color: #6C5CE7;
+  border: 1px solid rgba(108, 92, 231, 0.45);
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s, opacity 0.2s;
+  font-family: inherit;
+}
+.btn-ghost:hover:not(:disabled) {
+  background: rgba(108, 92, 231, 0.08);
+}
+.btn-ghost:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Receipt list rows live inside a .status-card */
+.receipts-section {
+  margin-bottom: 16px;
+}
+.receipts-section-title {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: #8080a0;
+  margin: 0 0 8px 2px;
+}
+.receipts-retryable-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.receipts-retryable-header .receipts-section-title {
+  margin: 0;
+}
+.receipts-hint {
+  font-size: 13px;
+  color: #d8a96b;
+  margin: 4px 2px 12px;
+  line-height: 1.4;
+}
+.claim-wallet-hint {
+  font-size: 13px;
+  color: #a0a0c0;
+  margin: 4px 2px 8px;
+  line-height: 1.4;
+}
+.claim-wallet-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.claim-wallet-addr {
+  font-family: ui-monospace, "SF Mono", monospace;
+  font-size: 12px;
+  color: #d4d4f0;
+  background: rgba(255, 255, 255, 0.05);
+  padding: 6px 10px;
+  border-radius: 6px;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.btn-small {
+  font-size: 12px;
+  padding: 4px 10px;
+}
+.receipt-row {
+  padding: 12px 0;
+  border-top: 1px solid #2a2a40;
+}
+.receipt-row:first-child { border-top: 0; }
+.receipt-row.locked { opacity: 0.6; }
+.receipt-row-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+  color: #c0c0d8;
+}
+.receipt-row-header .uuid {
+  font-family: "SF Mono", "Cascadia Code", "Fira Code", monospace;
+  font-size: 12px;
+  color: #8080a0;
+}
+.receipt-row.locked .uuid { text-decoration: line-through; }
+.receipt-meta {
+  color: #8080a0;
+  font-size: 12px;
+  margin-top: 4px;
+}
+.receipt-reason {
+  color: #f39c12;
+  font-size: 13px;
+  margin-top: 6px;
+  line-height: 1.45;
+}
+.receipt-row.locked .receipt-reason { color: #e74c3c; }
+.receipt-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+  align-items: center;
+}
+.receipt-actions .btn-ghost,
+.receipt-actions .btn-text-subtle { flex: 1; }
+.receipt-claim-summary {
+  text-align: center;
+  font-size: 14px;
+  color: #c0c0d8;
+  margin-bottom: 12px;
+}
+.receipt-claim-summary strong { color: #ffffff; }
+.text-success { color: #2ecc71; }
+.text-warn    { color: #f39c12; }
+.text-error   { color: #e74c3c; }
+.text-muted   { color: #606078; }
+
+.receipt-empty {
+  text-align: center;
+  color: #8080a0;
+  font-size: 13px;
+  padding: 16px 8px;
+}
+
+/* Toast — surfaces claim completion / errors non-modally */
+.toast {
+  position: fixed;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #1a1a2e;
+  border: 1px solid #2a2a40;
+  border-radius: 8px;
+  padding: 10px 16px;
+  font-size: 13px;
+  color: #e0e0e0;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  opacity: 0;
+  transition: opacity 0.25s;
+  z-index: 200;
+  pointer-events: none;
+}
+.toast.visible {
+  opacity: 1;
+}
+.toast.success { border-color: rgba(46, 204, 113, 0.5); }
+.toast.warn    { border-color: rgba(243, 156, 18, 0.5); }
+.toast.error   { border-color: rgba(231, 76, 60, 0.5); }
+
+/* ── Sticky incident banner (auto-claim failures, etc.) ──
+ *
+ * Persistent across GUI restarts via ~/.spacerouter/incidents.json.
+ * Sits above the test banner when both are present.
+ */
+.incident-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  background: rgba(231, 76, 60, 0.18);
+  border-bottom: 1px solid rgba(231, 76, 60, 0.5);
+  color: #ffd0c8;
+  padding: 10px 14px;
+  z-index: 250;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: 13px;
+  -webkit-user-select: text;
+  user-select: text;
+}
+body.has-incident-banner { padding-top: 56px; }
+body.has-incident-banner.has-test-banner { padding-top: 88px; }
+.has-incident-banner.has-test-banner #test-banner { top: 56px; }
+.incident-banner-icon {
+  color: #f39c12;
+  font-size: 16px;
+  line-height: 1;
+  padding-top: 1px;
+}
+.incident-banner-body { flex: 1; min-width: 0; }
+.incident-banner-title { font-weight: 600; margin-bottom: 2px; color: #fff; }
+.incident-banner-text { color: #f4cfc8; font-size: 12px; word-break: break-word; }
+.incident-banner-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.btn-ghost-small {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: #f4cfc8;
+  border-radius: 5px;
+  padding: 4px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.btn-ghost-small:hover { background: rgba(255, 255, 255, 0.16); }
+.incident-banner-close {
+  background: none;
+  border: none;
+  color: #f4cfc8;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+/* ── Friendly error modal extras ── */
+.error-catalog-remediation {
+  font-size: 12px;
+  color: #8080a0;
+  margin-top: 8px;
+  text-align: left;
+  width: 100%;
+}
+.error-catalog-remediation a {
+  color: #5acaff;
+  text-decoration: underline;
+}
+
+/* ── Log viewer ── */
+.log-viewer-body {
+  background: #0a0a14;
+  border: 1px solid #2a2a40;
+  border-radius: 6px;
+  padding: 10px;
+  max-height: 60vh;
+  overflow: auto;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: #c0c0d8;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin-bottom: 12px;
+  text-align: left;
+}
+
+/* ── Auto-claim settings panel ── */
+.autoclaim-status {
+  font-size: 11px;
+  color: #8080a0;
+  margin-top: 6px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 6px;
+  text-align: left;
+}
+.autoclaim-status.has-error { color: #e74c3c; }
+.autoclaim-status.has-success { color: #2ecc71; }
+
+/* ── Claim history badge (audit row source) ── */
+.history-badge {
+  display: inline-block;
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  margin-left: 6px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+}
+.history-badge.tx       { background: rgba(46, 204, 113, 0.18); color: #2ecc71; }
+.history-badge.external { background: rgba(155, 89, 182, 0.18); color: #b58bd6; }

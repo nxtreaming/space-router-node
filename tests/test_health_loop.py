@@ -9,7 +9,7 @@ import respx
 from httpx import Response
 
 from app.config import Settings
-from app.registration import request_probe
+from app.registration import ProbeRequestResult, request_probe
 
 # Reuse identity fixtures from existing tests
 from eth_account import Account
@@ -38,11 +38,11 @@ def probe_settings():
 
 
 class TestRequestProbeReturnValues:
-    """Verify request_probe returns bool indicating acceptance."""
+    """Verify request_probe returns a ProbeRequestResult."""
 
     @pytest.mark.asyncio
     @respx.mock
-    async def test_request_probe_returns_true_on_200(self, probe_settings):
+    async def test_request_probe_ok_on_200(self, probe_settings):
         respx.post(f"{COORDINATION_URL}/nodes/{TEST_NODE_ID}/request-probe").mock(
             return_value=Response(200, json={"ok": True}),
         )
@@ -50,11 +50,11 @@ class TestRequestProbeReturnValues:
             result = await request_probe(
                 client, probe_settings, TEST_NODE_ID, identity_key=TEST_IDENTITY_KEY,
             )
-        assert result is True
+        assert result == ProbeRequestResult("ok", None)
 
     @pytest.mark.asyncio
     @respx.mock
-    async def test_request_probe_returns_true_on_400(self, probe_settings):
+    async def test_request_probe_ok_on_400(self, probe_settings):
         respx.post(f"{COORDINATION_URL}/nodes/{TEST_NODE_ID}/request-probe").mock(
             return_value=Response(400, text="already online"),
         )
@@ -62,11 +62,11 @@ class TestRequestProbeReturnValues:
             result = await request_probe(
                 client, probe_settings, TEST_NODE_ID, identity_key=TEST_IDENTITY_KEY,
             )
-        assert result is True
+        assert result == ProbeRequestResult("ok", None)
 
     @pytest.mark.asyncio
     @respx.mock
-    async def test_request_probe_returns_false_on_429(self, probe_settings):
+    async def test_request_probe_rate_limited_on_429(self, probe_settings):
         respx.post(f"{COORDINATION_URL}/nodes/{TEST_NODE_ID}/request-probe").mock(
             return_value=Response(429, text="rate limited"),
         )
@@ -74,11 +74,40 @@ class TestRequestProbeReturnValues:
             result = await request_probe(
                 client, probe_settings, TEST_NODE_ID, identity_key=TEST_IDENTITY_KEY,
             )
-        assert result is False
+        # Plain text body — falls back to default 300s.
+        assert result.outcome == "rate_limited"
+        assert result.retry_after_seconds == 300
 
     @pytest.mark.asyncio
     @respx.mock
-    async def test_request_probe_returns_false_on_500(self, probe_settings):
+    async def test_request_probe_429_parses_retry_hint(self, probe_settings):
+        respx.post(f"{COORDINATION_URL}/nodes/{TEST_NODE_ID}/request-probe").mock(
+            return_value=Response(
+                429,
+                json={"detail": "Probe already requested recently. Try again in 247s."},
+            ),
+        )
+        async with httpx.AsyncClient() as client:
+            result = await request_probe(
+                client, probe_settings, TEST_NODE_ID, identity_key=TEST_IDENTITY_KEY,
+            )
+        assert result == ProbeRequestResult("rate_limited", 247)
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_request_probe_429_unparseable_detail_uses_default(self, probe_settings):
+        respx.post(f"{COORDINATION_URL}/nodes/{TEST_NODE_ID}/request-probe").mock(
+            return_value=Response(429, json={"detail": "rate limited (no hint)"}),
+        )
+        async with httpx.AsyncClient() as client:
+            result = await request_probe(
+                client, probe_settings, TEST_NODE_ID, identity_key=TEST_IDENTITY_KEY,
+            )
+        assert result == ProbeRequestResult("rate_limited", 300)
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_request_probe_failed_on_500(self, probe_settings):
         respx.post(f"{COORDINATION_URL}/nodes/{TEST_NODE_ID}/request-probe").mock(
             return_value=Response(500, text="server error"),
         )
@@ -86,11 +115,11 @@ class TestRequestProbeReturnValues:
             result = await request_probe(
                 client, probe_settings, TEST_NODE_ID, identity_key=TEST_IDENTITY_KEY,
             )
-        assert result is False
+        assert result == ProbeRequestResult("failed", None)
 
     @pytest.mark.asyncio
     @respx.mock
-    async def test_request_probe_returns_false_on_exception(self, probe_settings):
+    async def test_request_probe_failed_on_exception(self, probe_settings):
         respx.post(f"{COORDINATION_URL}/nodes/{TEST_NODE_ID}/request-probe").mock(
             side_effect=httpx.ConnectError("connection refused"),
         )
@@ -98,7 +127,7 @@ class TestRequestProbeReturnValues:
             result = await request_probe(
                 client, probe_settings, TEST_NODE_ID, identity_key=TEST_IDENTITY_KEY,
             )
-        assert result is False
+        assert result == ProbeRequestResult("failed", None)
 
 
 # ---------------------------------------------------------------------------
@@ -333,11 +362,11 @@ class TestSelfProbeLoopCooldown:
 
 
 class TestSelfProbeLoopBackoff:
-    """Verify _self_probe_loop applies exponential backoff on rate-limited responses."""
+    """Verify _self_probe_loop honours the server's retry-after hint on 429."""
 
     @pytest.mark.asyncio
-    async def test_backoff_on_rejected_probe(self, probe_settings):
-        """When request_probe returns False (429), probe_result should be 'rate_limited'."""
+    async def test_rate_limited_surfaces_to_dashboard(self, probe_settings):
+        """When request_probe returns rate_limited, dashboard sees 'rate_limited'."""
         from app.main import _self_probe_loop
 
         ctx = _make_ctx(probe_settings)
@@ -356,22 +385,15 @@ class TestSelfProbeLoopBackoff:
                 stop_event.set()
             raise asyncio.TimeoutError()
 
-        init_time = 100.0
-        _time_call = [0]
-        def _fake_time():
-            _time_call[0] += 1
-            return init_time if _time_call[0] == 1 else init_time + 300
-
         with patch("asyncio.wait_for", side_effect=_fake_wait_for), \
-             patch("time.time", side_effect=_fake_time), \
+             patch("time.time", return_value=400.0), \
              patch("app.registration.check_node_status", new_callable=AsyncMock,
                    return_value={"status": "offline", "health_score": 0.1, "staking_status": "qualifying"}), \
-             patch("app.registration.request_probe", new_callable=AsyncMock, return_value=False):
+             patch("app.registration.request_probe", new_callable=AsyncMock,
+                   return_value=ProbeRequestResult("rate_limited", 120)):
 
             await _self_probe_loop(ctx, sm, stop_event, dashboard)
 
-            # The first iteration's dashboard update should show "rate_limited"
-            # (second iteration sees doubled cooldown and reports "cooldown")
             probe_results = [
                 call.kwargs["last_probe_result"]
                 for call in dashboard.update.call_args_list
@@ -428,3 +450,116 @@ class TestHealthLoopProbeCoordination:
 
             # Probe should NOT be called because self-probe is recent
             assert mock_probe.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# rc.6 BLK-3 — RECONNECTING transition race between health + self-probe loops
+# ---------------------------------------------------------------------------
+
+
+class TestReconnectingTransitionRace:
+    """Both _health_loop and _self_probe_loop can transition to RECONNECTING.
+    If they race, the second caller hits a state that is already RECONNECTING,
+    and (because RECONNECTING→RECONNECTING is an invalid transition in the
+    state table) the second transition raises ValueError, killing the loop.
+
+    The fix guards each call site to no-op if state is already RECONNECTING.
+    """
+
+    @pytest.mark.asyncio
+    async def test_health_loop_no_op_when_state_already_reconnecting(
+        self, probe_settings
+    ):
+        """When the self-probe loop already moved us to RECONNECTING, the
+        health loop's threshold path must not raise ValueError."""
+        from app.main import _health_loop
+        from app.state import NodeState, NodeStateMachine
+
+        ctx = _make_ctx(probe_settings)
+        # Use a real state machine seeded into RECONNECTING (simulating
+        # the self-probe loop having already escalated).
+        sm = NodeStateMachine()
+        # Drive sm to RECONNECTING via the only legal path.
+        sm.transition(NodeState.INITIALIZING, "init")
+        sm.transition(NodeState.BINDING, "bind")
+        sm.transition(NodeState.REGISTERING, "register")
+        sm.transition(NodeState.RUNNING, "run")
+        sm.transition(NodeState.RECONNECTING, "self-probe escalated")
+        assert sm.state == NodeState.RECONNECTING
+
+        stop_event = asyncio.Event()
+
+        # Force health_check_status to fail repeatedly so the loop hits
+        # the threshold path on its very first iteration.
+        from app.main import _HEARTBEAT_FAIL_THRESHOLD
+
+        call_count = 0
+
+        async def _fake_wait_for(coro, *, timeout):
+            nonlocal call_count
+            call_count += 1
+            coro.close()
+            # Run enough iterations to exceed the threshold, then stop.
+            if call_count >= _HEARTBEAT_FAIL_THRESHOLD + 1:
+                stop_event.set()
+            raise asyncio.TimeoutError()
+
+        mock_activity = MagicMock()
+        mock_activity.record_health_check = MagicMock()
+
+        # No exception should escape — the guard short-circuits.
+        with patch("asyncio.wait_for", side_effect=_fake_wait_for), \
+             patch("time.time", return_value=1000.0), \
+             patch("app.registration.check_node_status",
+                   new_callable=AsyncMock,
+                   side_effect=Exception("simulated coord failure")), \
+             patch("app.registration.request_probe", new_callable=AsyncMock), \
+             patch("app.tls.check_certificate_expiry", return_value=None), \
+             patch("app.node_logging.activity", mock_activity):
+            await _health_loop(ctx, sm, stop_event)
+
+        # State stays RECONNECTING — the second transition was guarded.
+        assert sm.state == NodeState.RECONNECTING
+
+    @pytest.mark.asyncio
+    async def test_self_probe_loop_no_op_when_state_already_reconnecting(
+        self, probe_settings
+    ):
+        """When the health loop already moved us to RECONNECTING, the
+        self-probe loop's escalation path must not raise ValueError."""
+        from app.main import _self_probe_loop, _SELF_PROBE_OFFLINE_ESCALATION_THRESHOLD
+        from app.state import NodeState, NodeStateMachine
+
+        ctx = _make_ctx(probe_settings)
+        sm = NodeStateMachine()
+        sm.transition(NodeState.INITIALIZING, "init")
+        sm.transition(NodeState.BINDING, "bind")
+        sm.transition(NodeState.REGISTERING, "register")
+        sm.transition(NodeState.RUNNING, "run")
+        sm.transition(NodeState.RECONNECTING, "health loop escalated")
+        assert sm.state == NodeState.RECONNECTING
+
+        stop_event = asyncio.Event()
+        iteration = 0
+
+        async def _fake_wait_for(coro, *, timeout):
+            nonlocal iteration
+            iteration += 1
+            coro.close()
+            # Run enough iterations to exceed the offline escalation threshold.
+            if iteration >= _SELF_PROBE_OFFLINE_ESCALATION_THRESHOLD + 2:
+                stop_event.set()
+            raise asyncio.TimeoutError()
+
+        # No exception should escape — the guard short-circuits.
+        with patch("asyncio.wait_for", side_effect=_fake_wait_for), \
+             patch("time.time", return_value=1000.0), \
+             patch("app.registration.check_node_status",
+                   new_callable=AsyncMock,
+                   return_value={"status": "offline", "health_score": 0.1,
+                                 "staking_status": "qualifying"}), \
+             patch("app.registration.request_probe", new_callable=AsyncMock):
+            await _self_probe_loop(ctx, sm, stop_event)
+
+        # State stays RECONNECTING — no ValueError.
+        assert sm.state == NodeState.RECONNECTING

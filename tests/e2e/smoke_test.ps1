@@ -25,9 +25,90 @@ if ($BasePort -eq 0) { $BasePort = 19090 }
 $PortBindingPort = $BasePort
 $ShutdownPort = $BasePort + 1
 
+# The daemon enforces a single-instance lock at ~/.spacerouter/daemon.lock.
+# That's the right behaviour for real operators (we don't want two daemons
+# fighting over the same receipts.db), but the smoke test runs two daemon
+# instances back-to-back on the same host — Test-PortBinding then
+# Test-CleanShutdown — so we explicitly tear the lock down between cases.
+# The path is derived from app/paths.py::config_dir() and ignores
+# SR_RECEIPT_STORE_PATH (settings_from_provider_settings rebuilds it from
+# config_dir), so per-test path overrides do NOT decouple the lock.
+$script:DaemonLockPath = Join-Path $env:USERPROFILE ".spacerouter\daemon.lock"
+
 function Log($msg) { Write-Host "  [INFO]  $msg" }
 function Pass($msg) { Write-Host "  [PASS]  $msg"; $script:Pass++ }
 function Fail($msg) { Write-Host "  [FAIL]  $msg"; $script:Fail++ }
+
+# Stop a daemon process, wait for it to fully exit, then remove the
+# daemon.lock file so the next sub-test can acquire it. The msvcrt lock
+# releases when the handle is closed at process death, but the file
+# itself sticks around with the prior PID inside it — and on Windows
+# the OS sometimes lags a beat between TerminateProcess and the kernel
+# closing the handle, which is exactly the window where the stale-PID
+# branch in _acquire_daemon_lock can mis-fire under CI load. Explicit
+# delete after Wait removes the ambiguity.
+function Stop-DaemonAndClearLock {
+    param([System.Diagnostics.Process]$Proc, [int]$WaitMs = 10000)
+    if ($null -eq $Proc) { return }
+    try {
+        if (-not $Proc.HasExited) {
+            # IMPORTANT: PyInstaller produces a bootloader .exe that
+            # spawns the actual Python child process. Stop-Process
+            # kills only the named PID — the orphan child keeps the
+            # daemon.lock and continues handling traffic. We need
+            # taskkill /T (tree) /F (force) to kill the whole tree.
+            #
+            # Without /T the next sub-test sees the orphan, refuses to
+            # acquire the lock, and the test fails with "Another daemon
+            # already running" — even though Test-PortBinding logged
+            # PASS. Caught in the test.93 CI run after PR #84's
+            # PID-reuse fix wasn't enough.
+            $taskkillExe = Join-Path $env:SystemRoot "System32\taskkill.exe"
+            if (Test-Path $taskkillExe) {
+                & $taskkillExe /PID $Proc.Id /T /F 2>$null | Out-Null
+            } else {
+                Stop-Process -Id $Proc.Id -Force -ErrorAction SilentlyContinue
+            }
+        }
+        $Proc.WaitForExit($WaitMs) | Out-Null
+        # WaitForExit returns when the named PID exits. Children may
+        # take a tick longer to clean up — short fixed sleep makes the
+        # next acquire reliable.
+        Start-Sleep -Milliseconds 500
+    }
+    catch { }
+    Remove-Item -Force -ErrorAction SilentlyContinue $script:DaemonLockPath
+}
+
+# Reliable TCP port check using TcpClient (Test-NetConnection is unreliable on CI runners)
+function Test-TcpPort {
+    param([int]$Port, [int]$TimeoutMs = 2000)
+    try {
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        $result = $tcp.BeginConnect("127.0.0.1", $Port, $null, $null)
+        $success = $result.AsyncWaitHandle.WaitOne($TimeoutMs)
+        if ($success) {
+            $tcp.EndConnect($result)
+        }
+        $tcp.Close()
+        return $success
+    }
+    catch {
+        return $false
+    }
+}
+
+# Poll until port is listening or timeout (returns $true/$false)
+function Wait-ForPort {
+    param([int]$Port, [int]$MaxSeconds = 30)
+    for ($i = 0; $i -lt $MaxSeconds; $i++) {
+        if (Test-TcpPort -Port $Port) {
+            return $true
+        }
+        Start-Sleep -Seconds 1
+    }
+    return $false
+}
 
 # Start a mock coordination API
 function Start-MockApi {
@@ -79,19 +160,13 @@ server.serve_forever()
     $env:SR_COORDINATION_API_URL = "http://127.0.0.1:$MockApiPort"
     Log "Started mock coordination API on port $MockApiPort (PID $($script:MockApiProcess.Id))"
 
-    # Wait for the mock API to be ready (up to 10 seconds)
-    for ($i = 0; $i -lt 20; $i++) {
-        try {
-            $null = Invoke-WebRequest -Uri "http://127.0.0.1:$MockApiPort/" -Method GET -TimeoutSec 1 -ErrorAction SilentlyContinue
-            Log "Mock API is ready"
-            return
-        }
-        catch {
-            # Connection refused or other error — server not ready yet
-        }
-        Start-Sleep -Milliseconds 500
+    # Wait for the mock API to be ready
+    if (Wait-ForPort -Port $MockApiPort -MaxSeconds 10) {
+        Log "Mock API is ready"
     }
-    Log "WARNING: Mock API may not be ready after 10 seconds"
+    else {
+        Log "WARNING: Mock API may not be ready after 10 seconds"
+    }
 }
 
 function Stop-MockApi {
@@ -127,36 +202,26 @@ function Test-PortBinding {
     $proc = Start-Process -FilePath $Binary -PassThru -NoNewWindow
     Log "Started binary with PID $($proc.Id)"
 
-    Start-Sleep -Seconds 6
+    # Poll until the port is listening (up to 30 seconds)
+    $listening = Wait-ForPort -Port ([int]$env:SR_NODE_PORT) -MaxSeconds 30
 
     if ($proc.HasExited) {
         Fail "Binary exited prematurely with code $($proc.ExitCode)"
+        # Even on premature exit, drop the lock file so the next test
+        # isn't blocked by a stale-PID daemon.lock entry.
+        Remove-Item -Force -ErrorAction SilentlyContinue $script:DaemonLockPath
         return
     }
 
-    # Check if the port is listening
-    try {
-        $connection = Test-NetConnection -ComputerName 127.0.0.1 -Port ([int]$env:SR_NODE_PORT) -WarningAction SilentlyContinue
-        $listening = $connection.TcpTestSucceeded
-    }
-    catch {
-        Log "Test-NetConnection failed: $_, trying netstat fallback"
-        $netstat = netstat -an 2>$null | Select-String ":$($env:SR_NODE_PORT)\s+.*LISTENING"
-        $listening = ($null -ne $netstat)
-    }
-
-    # Clean up
-    try {
-        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-        $proc.WaitForExit(5000) | Out-Null
-    }
-    catch { }
+    # Clean up: stop the daemon, wait for full exit, drop the lock file
+    # so Test-CleanShutdown's daemon can acquire it.
+    Stop-DaemonAndClearLock -Proc $proc -WaitMs 5000
 
     if ($listening) {
         Pass "Binary is listening on port $($env:SR_NODE_PORT)"
     }
     else {
-        Fail "Binary did not bind to port $($env:SR_NODE_PORT)"
+        Fail "Binary did not bind to port $($env:SR_NODE_PORT) within 30 seconds"
     }
 }
 
@@ -169,22 +234,38 @@ function Test-CleanShutdown {
     $proc = Start-Process -FilePath $Binary -PassThru -NoNewWindow
     Log "Started binary with PID $($proc.Id)"
 
-    Start-Sleep -Seconds 6
+    # Wait until the port is bound before sending stop signal
+    $ready = Wait-ForPort -Port ([int]$env:SR_NODE_PORT) -MaxSeconds 30
 
     if ($proc.HasExited) {
         Fail "Binary exited before shutdown signal could be sent"
         return
     }
 
-    # On Windows, console apps don't respond to WM_CLOSE (taskkill without /F).
-    # Python handles CTRL_C_EVENT, but sending it via GenerateConsoleCtrlEvent
-    # would also signal the parent process. Use Stop-Process (TerminateProcess)
-    # which is the standard way to stop services on Windows.
-    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-    Log "Sent stop signal to PID $($proc.Id)"
+    if (-not $ready) {
+        Log "WARNING: Port not detected as listening, proceeding with shutdown test anyway"
+    }
 
-    # Wait up to 10 seconds for exit
+    # On Windows, console apps don't respond to WM_CLOSE. Use taskkill /T /F
+    # to kill the entire process tree — without /T the PyInstaller
+    # bootloader exits but the actual Python child orphan keeps running
+    # and holds the daemon.lock. Same fix shape as Stop-DaemonAndClearLock.
+    $taskkillExe = Join-Path $env:SystemRoot "System32\taskkill.exe"
+    if (Test-Path $taskkillExe) {
+        & $taskkillExe /PID $proc.Id /T /F 2>$null | Out-Null
+    } else {
+        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    }
+    Log "Sent stop signal to PID $($proc.Id) (tree)"
+
+    # Wait up to 10 seconds for exit of the named PID
     $exited = $proc.WaitForExit(10000)
+    # Children may take a moment longer
+    Start-Sleep -Milliseconds 500
+
+    # Always tidy the lock file — if the test fails, the next CI run on
+    # a recycled runner image shouldn't inherit a stuck lock.
+    Remove-Item -Force -ErrorAction SilentlyContinue $script:DaemonLockPath
 
     if ($exited) {
         Pass "Process stopped successfully (exit code $($proc.ExitCode))"

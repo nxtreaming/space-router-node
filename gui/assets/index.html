@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SpaceRouter</title>
+  <title>SpaceRouter Proxy</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -17,7 +17,7 @@
           <path d="M50.1392 103.712H49.4394C36.143 103.712 26.7345 99.4354 25.5681 87.9275H38.2424C39.4088 93.2149 44.5407 93.9147 49.7504 93.9147C56.9818 93.9147 60.6363 92.1263 60.6363 87.3054V86.6056C60.6363 82.64 58.6924 80.9294 51.7721 80.6183L44.3075 80.3073C32.3329 79.8408 26.5012 75.1754 26.5012 65.4558V64.9115C26.5012 53.4813 33.8103 47.7273 48.273 47.7273H49.2061C62.1137 47.7273 71.2112 53.0925 72.2221 64.0562H59.5477C58.3814 58.9242 54.4158 57.5246 48.5063 57.5246C41.7415 57.5246 38.7867 59.3908 38.7867 63.9007V64.2895C38.7867 68.255 40.6529 69.9657 47.651 70.2767L55.0379 70.51C67.0901 71.0543 72.8441 75.6419 72.8441 85.4393V86.1391C72.8441 98.9689 63.9021 103.712 50.1392 103.712Z" fill="#0C0E10"/>
         </svg>
       </div>
-      <h1>SpaceRouter</h1>
+      <h1>SpaceRouter Proxy</h1>
       <p class="subtitle">Set up your node in seconds.</p>
 
       <!-- Identity Key -->
@@ -38,6 +38,14 @@
         </div>
       </div>
 
+      <!-- Staking address — main onboarding field (rc.11: promoted out of Advanced).
+           Validated against the coord API on blur via Api.validate_staking_address. -->
+      <div class="input-group">
+        <label for="staking-input">Staking address</label>
+        <input type="text" id="staking-input" placeholder="Defaults to identity address" spellcheck="false" autocomplete="off">
+        <span id="staking-error" class="error"></span>
+      </div>
+
       <div class="input-group">
         <label for="env-select">Environment</label>
         <select id="env-select"></select>
@@ -51,12 +59,18 @@
       <div class="advanced-section" id="advanced-section" style="display: none;">
         <div class="input-group" style="margin-top: 0;">
           <label for="passphrase-input">Passphrase</label>
-          <input type="password" id="passphrase-input" placeholder="Optional — encrypts key on disk" autocomplete="new-password">
+          <div class="passphrase-row">
+            <input type="password" id="passphrase-input" placeholder="Optional — encrypts key on disk" autocomplete="new-password">
+            <button type="button" id="passphrase-show-toggle" class="passphrase-toggle" aria-label="Show passphrase">Show</button>
+          </div>
         </div>
         <div class="input-group">
-          <label for="staking-input">Staking address</label>
-          <input type="text" id="staking-input" placeholder="Defaults to identity address" spellcheck="false" autocomplete="off">
-          <span id="staking-error" class="error"></span>
+          <label for="passphrase-confirm-input">Confirm passphrase</label>
+          <div class="passphrase-row">
+            <input type="password" id="passphrase-confirm-input" placeholder="Re-enter passphrase" autocomplete="new-password">
+            <button type="button" id="passphrase-confirm-show-toggle" class="passphrase-toggle" aria-label="Show passphrase">Show</button>
+          </div>
+          <span id="passphrase-error" class="error"></span>
         </div>
         <div class="input-group">
           <label for="collection-input">Collection address</label>
@@ -94,6 +108,7 @@
       </div>
 
       <button id="btn-start" class="btn-primary">Start Node</button>
+      <div id="version-label-onboarding" class="version-label"></div>
     </div>
   </div>
 
@@ -135,11 +150,46 @@
     TEST BUILD <span id="test-env-label"></span>
   </div>
 
+  <!-- Sticky Incident Banner (auto-claim failures persist across restarts) -->
+  <div id="incident-banner" class="incident-banner" style="display: none;">
+    <span class="incident-banner-icon">&#9888;</span>
+    <div class="incident-banner-body">
+      <div class="incident-banner-title" id="incident-banner-title">Auto-claim failed</div>
+      <div class="incident-banner-text" id="incident-banner-text"></div>
+    </div>
+    <div class="incident-banner-actions">
+      <button id="btn-incident-log" class="btn-ghost-small">Show log</button>
+      <button id="btn-incident-retry" class="btn-ghost-small">Retry now</button>
+      <button id="btn-incident-disable" class="btn-ghost-small">Disable auto-claim</button>
+      <button id="btn-incident-dismiss" class="incident-banner-close" title="Dismiss">&times;</button>
+    </div>
+  </div>
+
+  <!-- Friendly Error Modal (rendered for known error codes from the daemon) -->
+  <div id="error-catalog-overlay" class="staking-modal-overlay" style="display: none;">
+    <div class="staking-modal">
+      <div class="staking-modal-title" id="error-catalog-title">Something went wrong</div>
+      <div class="staking-modal-body" id="error-catalog-body"></div>
+      <div id="error-catalog-remediation" class="error-catalog-remediation"></div>
+      <button id="btn-error-primary" class="staking-modal-primary" style="display: none;"></button>
+      <button id="btn-error-secondary" class="staking-modal-secondary">Close</button>
+    </div>
+  </div>
+
+  <!-- Log viewer modal (used by the incident banner's Show log button) -->
+  <div id="log-viewer-overlay" class="staking-modal-overlay" style="display: none;">
+    <div class="staking-modal" style="width: 480px; max-width: 92vw; text-align: left;">
+      <div class="staking-modal-title">Recent logs</div>
+      <pre id="log-viewer-body" class="log-viewer-body"></pre>
+      <button id="btn-log-close" class="staking-modal-secondary">Close</button>
+    </div>
+  </div>
+
   <!-- Status Dashboard -->
   <div id="screen-status" class="screen" style="display: none;">
     <div class="container">
       <div class="status-header">
-        <h2>SpaceRouter</h2>
+        <h2>SpaceRouter Proxy</h2>
         <!-- Settings gear -->
         <button id="btn-settings" class="btn-settings" title="Settings">
           <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -159,6 +209,11 @@
       </div>
 
       <div class="wallet-display">
+        <span class="wallet-label">Identity</span>
+        <span id="identity-address" class="wallet-value">-</span>
+      </div>
+
+      <div class="wallet-display">
         <span class="wallet-label">Staking</span>
         <span id="staking-address" class="wallet-value">-</span>
       </div>
@@ -172,6 +227,12 @@
         <span class="wallet-label">Staking Status</span>
         <span id="staking-status" class="wallet-value">-</span>
       </div>
+
+      <button type="button" id="btn-earnings" class="wallet-display-clickable" style="display: none;">
+        <span class="wallet-label">Earnings</span>
+        <span class="wallet-summary" id="earnings-summary">—</span>
+        <span class="wallet-chevron">&rsaquo;</span>
+      </button>
 
       <div class="info-box">
         <p>Earn <strong>Spacecoin</strong> by running this node. <strong>Stake</strong> to earn yield.</p>
@@ -199,10 +260,25 @@
   <!-- Fresh Restart Confirmation Dialog -->
   <div id="screen-fresh-restart" class="screen" style="display: none;">
     <div class="container">
-      <h2>Reset Node</h2>
-      <p class="subtitle">This will delete your identity key, certificates, and all configuration. You will need to set up the node again.</p>
+      <h2>Reset Node — this is permanent</h2>
+      <p class="subtitle">Read each consequence carefully before continuing:</p>
+      <ul class="reset-warning-list">
+        <li><strong>Pending receipts will be permanently lost.</strong> Any unclaimed earnings cannot be recovered.</li>
+        <li><strong>Identity key will be replaced.</strong> Your provider node ID changes; the gateway sees you as a new node.</li>
+        <li><strong>You will need to re-stake</strong> against the new identity to resume earning.</li>
+      </ul>
+      <p class="reset-confirm-prompt">Type <code>RESET</code> below to enable the confirm button.</p>
+      <input
+        type="text"
+        id="reset-confirm-input"
+        autocomplete="off"
+        autocapitalize="off"
+        autocorrect="off"
+        spellcheck="false"
+        placeholder="RESET"
+      />
       <div class="restart-actions">
-        <button id="btn-restart-confirm" class="btn-primary btn-danger">Reset Node</button>
+        <button id="btn-restart-confirm" class="btn-primary btn-danger" disabled>Confirm Reset</button>
         <button id="btn-restart-cancel" class="btn-back">Cancel</button>
       </div>
     </div>
@@ -309,11 +385,120 @@
         </div>
       </div>
 
+      <!-- Auto-claim — all builds (when escrow is configured) -->
+      <div id="settings-autoclaim-group" class="input-group" style="display: none;">
+        <label>Auto-claim</label>
+        <div class="toggle-row">
+          <span class="toggle-label" id="autoclaim-label">Disabled</span>
+          <label class="toggle-switch">
+            <input type="checkbox" id="settings-autoclaim-enabled">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <div id="autoclaim-thresholds" style="display: none; margin-top: 8px;">
+          <div class="input-group" style="margin-top: 0;">
+            <label for="autoclaim-threshold-space">Threshold (SPACE)</label>
+            <input type="number" id="autoclaim-threshold-space" step="0.01" min="0" placeholder="10">
+            <span class="hint">Auto-claim fires when claimable balance reaches this amount.</span>
+          </div>
+          <div class="input-group">
+            <label for="autoclaim-threshold-count">Threshold (receipts)</label>
+            <input type="number" id="autoclaim-threshold-count" step="1" min="0" placeholder="10">
+            <span class="hint">Auto-claim also fires when this many receipts accumulate. Either trip is enough.</span>
+          </div>
+          <div class="autoclaim-status" id="autoclaim-status"></div>
+        </div>
+      </div>
+
       <button id="btn-save-settings" class="btn-primary">Save &amp; Restart Node</button>
       <div id="settings-status" class="settings-status"></div>
       <div id="settings-version-status" class="version-status"></div>
     </div>
   </div>
+
+  <!-- Earnings / Payments Screen -->
+  <div id="screen-receipts" class="screen" style="display: none;">
+    <div class="container">
+      <div class="settings-header">
+        <button id="btn-receipts-back" class="btn-back">&larr; Back</button>
+        <h2>Earnings</h2>
+      </div>
+
+      <!-- Claim wallet hint — surfaces the auto-derived identity wallet
+           that broadcasts claimBatch(). Users have no other obvious way
+           to discover this address; needs CTC for gas. -->
+      <div id="claim-wallet-card" class="status-card" style="display: none;">
+        <p class="receipts-section-title">Claim wallet</p>
+        <p class="claim-wallet-hint">
+          On-chain claims are sent from this wallet. Send a small amount
+          of CTC to it for gas — receipts won't settle until it's funded.
+        </p>
+        <div class="claim-wallet-row">
+          <code id="claim-wallet-address" class="claim-wallet-addr">—</code>
+          <button id="btn-copy-claim-wallet" class="btn-ghost btn-small">Copy</button>
+        </div>
+      </div>
+
+      <!-- Claimable section -->
+      <div id="receipts-claimable-card" class="status-card" style="display: none;">
+        <p class="receipt-claim-summary">
+          <strong id="receipts-claimable-count">—</strong> receipt<span id="receipts-claimable-plural">s</span>
+          ·
+          <strong id="receipts-claimable-total">—</strong> SPACE ready
+        </p>
+        <button id="btn-claim-all" class="btn-primary">Claim All Outstanding</button>
+      </div>
+
+      <!-- Needs attention section -->
+      <div id="receipts-retryable-card" class="status-card" style="display: none;">
+        <div class="receipts-retryable-header">
+          <p class="receipts-section-title" id="receipts-retryable-title">Needs attention</p>
+          <button id="btn-retry-all" class="btn-ghost">Retry all</button>
+        </div>
+        <p id="receipts-retryable-hint" class="receipts-hint" style="display: none;"></p>
+        <div id="receipts-retryable-list"></div>
+      </div>
+
+      <!-- Pending signing section -->
+      <div id="receipts-pending-card" class="status-card" style="display: none;">
+        <p class="receipts-section-title">Pending signing</p>
+        <div id="receipts-pending-list"></div>
+      </div>
+
+      <!-- Locked section -->
+      <div id="receipts-locked-card" class="status-card" style="display: none;">
+        <p class="receipts-section-title">Locked (cannot retry)</p>
+        <div id="receipts-locked-list"></div>
+      </div>
+
+      <!-- Claim history — claimed rows stay here as an audit record -->
+      <div id="receipts-history-card" class="status-card" style="display: none;">
+        <p class="receipts-section-title" id="receipts-history-title">Claim history</p>
+        <div id="receipts-history-list"></div>
+      </div>
+
+      <div id="receipts-empty" class="receipt-empty" style="display: none;">
+        No earnings yet. Receipts from routed traffic appear here.
+      </div>
+    </div>
+  </div>
+
+  <!-- Receipt Detail Modal (uses staking-modal-overlay chrome) -->
+  <div id="receipt-detail-overlay" class="staking-modal-overlay" style="display: none;">
+    <div class="staking-modal" style="width: 340px; text-align: left;">
+      <div class="staking-modal-title" id="receipt-detail-title">Receipt details</div>
+      <div id="receipt-detail-body" style="color: #c0c0d8; font-size: 12px; line-height: 1.5; width: 100%;">
+        <!-- populated from JS -->
+      </div>
+      <button id="btn-receipt-detail-tx" class="staking-modal-primary" style="display: none;">
+        View on Blockscout
+      </button>
+      <button id="btn-receipt-detail-close" class="staking-modal-secondary">Close</button>
+    </div>
+  </div>
+
+  <!-- Toast for claim-completion feedback -->
+  <div id="toast" class="toast"></div>
 
   <!-- Passphrase Unlock Dialog -->
   <div id="dialog-overlay" class="dialog-overlay" style="display: none;">

@@ -60,7 +60,20 @@ a = Analysis(
     ["app/main.py"],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[
+        # TokenPaymentEscrow ABI — the file is read from two different
+        # runtime paths because PyInstaller flattens the entry-point
+        # module's package root onto ``_MEIPASS`` *and* keeps sibling
+        # packages at their imported path:
+        #   - app/main.py               → _MEIPASS/main.py, so the startup
+        #     check at app/main.py:604 resolves to _MEIPASS/payment/…
+        #   - app/payment/settlement.py → _MEIPASS/app/payment/..., so its
+        #     _ABI_PATH resolves to _MEIPASS/app/payment/…
+        # Ship the JSON at BOTH destinations or one of the two paths
+        # fails on ``--claim``/startup with FileNotFoundError.
+        ("app/payment/escrow_abi.json", "payment"),
+        ("app/payment/escrow_abi.json", "app/payment"),
+    ],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

@@ -137,13 +137,32 @@ class CLIFormatter(logging.Formatter):
 _STATUS_INTERVAL = 300  # 5 minutes
 
 
-def setup_cli_logging(log_level: str = "INFO") -> None:
+def setup_cli_logging(log_level: str = "INFO", *, log_to_stderr: bool = False) -> None:
     """Configure logging for CLI mode with structured console output.
 
     Replaces existing StreamHandlers with our CLIFormatter while
     preserving any file handlers (e.g. the GUI RotatingFileHandler).
+
+    When *log_to_stderr* is True the StreamHandler points at stderr
+    instead of stdout. This keeps machine-readable subcommand output
+    (e.g. ``--receipts --json``) clean — the JSON payload owns stdout
+    and any INFO/WARNING/ERROR messages go to stderr where pipelines
+    won't choke on them.
     """
     global _recent_handler
+
+    # Force stdout/stderr to UTF-8 so log messages containing non-ASCII
+    # characters (e.g. `→`, `…`, emojis) don't blow up on Windows where
+    # the default console code page is cp1252 and the handler emits
+    # `UnicodeEncodeError: 'charmap' codec can't encode character`.
+    # ``errors='replace'`` so a truly unmappable terminal shows `?`
+    # instead of crashing the logger. Requires Python 3.7+.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
     root = logging.getLogger()
     # Remove only stream handlers — preserve file handlers (GUI log persistence)
@@ -161,7 +180,8 @@ def setup_cli_logging(log_level: str = "INFO") -> None:
         if isinstance(h, logging.FileHandler):
             h.setLevel(level)
 
-    handler = logging.StreamHandler(sys.stdout)
+    target_stream = sys.stderr if log_to_stderr else sys.stdout
+    handler = logging.StreamHandler(target_stream)
     handler.setLevel(level)
     handler.setFormatter(CLIFormatter())
     root.addHandler(handler)

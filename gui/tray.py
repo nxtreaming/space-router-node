@@ -152,7 +152,7 @@ class SpaceRouterTray:
             AppKit.NSVariableStatusItemLength
         )
 
-        tooltip = "SpaceRouter [TEST]" if BUILD_VARIANT == "test" else "SpaceRouter"
+        tooltip = "SpaceRouter Proxy [TEST]" if BUILD_VARIANT == "test" else "SpaceRouter Proxy"
         button = self._status_item.button()
         button.setToolTip_(tooltip)
         self._set_macos_icon(_TRAY_IMG_STARTING)
@@ -160,7 +160,7 @@ class SpaceRouterTray:
         menu = AppKit.NSMenu.alloc().init()
 
         show_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Show SpaceRouter", "showWindow:", ""
+            "Show SpaceRouter Proxy", "showWindow:", ""
         )
         show_item.setTarget_(self._delegate)
         menu.addItem_(show_item)
@@ -168,7 +168,7 @@ class SpaceRouterTray:
         menu.addItem_(AppKit.NSMenuItem.separatorItem())
 
         quit_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Quit SpaceRouter", "quitApp:", ""
+            "Quit SpaceRouter Proxy", "quitApp:", ""
         )
         quit_item.setTarget_(self._delegate)
         menu.addItem_(quit_item)
@@ -252,14 +252,14 @@ class SpaceRouterTray:
         from app.variant import BUILD_VARIANT
 
         self._load_win_tray_images()
-        tooltip = "SpaceRouter [TEST]" if BUILD_VARIANT == "test" else "SpaceRouter"
+        tooltip = "SpaceRouter Proxy [TEST]" if BUILD_VARIANT == "test" else "SpaceRouter Proxy"
 
         icon_image = self._WIN_TRAY_IMAGES.get("tray-yellow", self._create_win_fallback((242, 156, 18)))
 
         menu = pystray.Menu(
-            pystray.MenuItem("Show SpaceRouter", self._win_on_show, default=True),
+            pystray.MenuItem("Show SpaceRouter Proxy", self._win_on_show, default=True),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit SpaceRouter", self._win_on_quit),
+            pystray.MenuItem("Quit SpaceRouter Proxy", self._win_on_quit),
         )
 
         self._pystray_icon = pystray.Icon(

@@ -23,8 +23,14 @@ from dotenv import get_key, set_key
 
 # Light imports only — heavy libraries (httpx, cryptography, web3, etc.)
 # are deferred to first use inside _run() / _phase_*() to keep CLI startup fast.
+from app import constants
 from app.config import load_settings, _default_coordination_url
-from app.identity import KeystorePassphraseRequired, load_or_create_identity, write_identity_key
+from app.identity import (
+    KeystorePassphraseRequired,
+    KeystoreWrongPassphrase,
+    load_or_create_identity,
+    write_identity_key,
+)
 from app.state import NodeState, NodeStateMachine
 from app.version import __version__
 from app.wallet import validate_wallet_address
@@ -37,12 +43,121 @@ _CERT_CHECK_INTERVAL = 86400  # 24 hours
 _PROBE_REQUEST_INTERVAL = 1800  # 30 minutes
 _HEARTBEAT_FAIL_THRESHOLD = 3
 
-_ENV_FILE = ".env"
+def _wizard_env_file() -> str:
+    """Canonical env file the first-run wizard persists into.
+
+    Pre-rc.3 the wizard wrote to ``./.env`` (relative to the cwd), which
+    the daemon's settings_loader never reads — so wallet addresses,
+    network mode, referral code, and the passphrase boolean were
+    silently lost on the first daemon start. Now we write to the
+    canonical ``~/.spacerouter/spacerouter.env`` location so
+    :py:func:`app.settings_loader.load_provider_settings` migrates it
+    into ``settings.json`` on the next read.
+    """
+    from app.settings_loader import env_path
+    p = env_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return str(p)
 
 
 # ---------------------------------------------------------------------------
 # First-run interactive setup (CLI only)
 # ---------------------------------------------------------------------------
+
+def _persist_wizard_results(
+    *,
+    staking_address: str,
+    collection_address: str,
+    referral_code: str,
+    upnp_enabled: bool,
+    public_ip: str,
+    public_port: str,
+    passphrase_set: bool,
+) -> None:
+    """Write wizard answers directly into ``~/.spacerouter/settings.json``.
+
+    Pre-rc.5 the wizard only wrote to ``spacerouter.env`` and relied on
+    ``settings_loader`` to migrate the env file on the next daemon read.
+    But ``load_settings()`` is invoked BEFORE the wizard (to compute
+    ``needs_setup``), and that call's cold-start branch persists a
+    defaults-only ``settings.json``. From then on the env-file migration
+    is a no-op (target exists), so the wizard's values never reach
+    settings.json. This helper plugs that gap by writing settings.json
+    directly using the same ``Settings.from_env_mapping`` shape.
+
+    The passphrase is INTENTIONALLY not persisted — only the
+    ``identity_passphrase_set`` boolean is, and only when the user
+    actually picked a passphrase. The plaintext passphrase stays in
+    ``os.environ['SR_IDENTITY_PASSPHRASE']`` for the immediate daemon
+    start that follows.
+    """
+    from app.settings_loader import settings_path
+    from app.settings_v2 import Settings as _SettingsV2
+    from app.variant import BUILD_VARIANT as _BUILD_VARIANT
+
+    env_dict: dict[str, str] = {"SR_BUILD_VARIANT": _BUILD_VARIANT}
+    if staking_address:
+        env_dict["SR_STAKING_ADDRESS"] = staking_address
+    if collection_address:
+        env_dict["SR_COLLECTION_ADDRESS"] = collection_address
+    if referral_code:
+        env_dict["SR_REFERRAL_CODE"] = referral_code
+    env_dict["SR_UPNP_ENABLED"] = "true" if upnp_enabled else "false"
+    if public_ip:
+        env_dict["SR_PUBLIC_IP"] = public_ip
+    if public_port and str(public_port) != "9090":
+        env_dict["SR_PUBLIC_PORT"] = str(public_port)
+    if passphrase_set:
+        # ``from_env_mapping`` reads the presence of SR_IDENTITY_PASSPHRASE
+        # to flip the boolean — value is never stored, only the boolean flag.
+        env_dict["SR_IDENTITY_PASSPHRASE"] = "set"
+
+    sp = settings_path()
+    sp.parent.mkdir(parents=True, exist_ok=True)
+
+    # Merge: if a defaults-only settings.json already exists (cold-start
+    # path), preserve any operator-set fields we didn't overwrite. Build
+    # a fresh Settings from the wizard mapping, then copy it over the
+    # existing one section-by-section using model_dump merge.
+    merged = _SettingsV2.from_env_mapping(env_dict)
+    if sp.exists():
+        try:
+            existing = _SettingsV2.load(sp)
+        except Exception:  # noqa: BLE001
+            existing = None
+        if existing is not None:
+            # Wizard answers win for the fields the user just chose; for
+            # everything else (escrow defaults, coord URL, ports the
+            # wizard didn't touch) keep the existing value.
+            if not staking_address:
+                merged.wallet.staking_address = existing.wallet.staking_address
+            if not collection_address:
+                merged.wallet.collection_address = existing.wallet.collection_address
+            if not referral_code:
+                merged.node.referral_code = existing.node.referral_code
+            if not public_ip:
+                merged.node.public_ip = existing.node.public_ip
+            if not public_port or str(public_port) == "9090":
+                merged.node.public_port = existing.node.public_port
+            # Preserve previously-configured escrow + coord URL.
+            merged.escrow = existing.escrow
+            merged.coordination = existing.coordination
+            # Preserve sections the wizard never touches. Without these,
+            # operator-set values like ``claim.auto_claim_enabled`` and
+            # ``receipts.*`` get clobbered by ``ClaimSection()`` /
+            # ``ReceiptsSection()`` defaults whenever the user re-runs
+            # ``--setup`` to update wallet info.
+            merged.claim = existing.claim
+            merged.receipts = existing.receipts
+            # Carry over identity_passphrase_set when the wizard didn't
+            # touch it (existing key, no fresh passphrase set).
+            if not passphrase_set:
+                merged.wallet.identity_passphrase_set = (
+                    existing.wallet.identity_passphrase_set
+                )
+
+    merged.save(sp)
+
 
 def _first_run_setup() -> bool:
     """Interactive first-time setup wizard with rich prompts.
@@ -156,7 +271,8 @@ def _first_run_setup() -> bool:
         # --- Referral Code ---
         wizard_step(step, "Referral Code (optional)")
         step += 1
-        existing_referral = get_key(_ENV_FILE, "SR_REFERRAL_CODE") or ""
+        env_file = _wizard_env_file()
+        existing_referral = get_key(env_file, "SR_REFERRAL_CODE") or ""
         if existing_referral:
             wizard_success(f"Referral code already set: {existing_referral}")
             referral_code = existing_referral
@@ -199,24 +315,48 @@ def _first_run_setup() -> bool:
                 wizard_error("Hostname is required for tunnel mode")
             public_port = wizard_input("Public port", default="9090")
 
-        # --- Persist to .env ---
+        # --- Persist to ~/.spacerouter/spacerouter.env ---
+        # settings_loader migrates this into settings.json on the next
+        # daemon read. The passphrase is intentionally NOT migrated to
+        # settings.json — only the boolean flag is — so the wizard ALSO
+        # exports it to os.environ for the immediate daemon start that
+        # follows. Subsequent restarts re-prompt via the unlock dialog
+        # (GUI) or require SR_IDENTITY_PASSPHRASE to be set externally
+        # (systemd EnvironmentFile, etc.).
         if passphrase:
-            set_key(_ENV_FILE, "SR_IDENTITY_PASSPHRASE", passphrase)
+            set_key(env_file, "SR_IDENTITY_PASSPHRASE", passphrase)
+            os.environ["SR_IDENTITY_PASSPHRASE"] = passphrase
         if staking_address:
-            set_key(_ENV_FILE, "SR_STAKING_ADDRESS", staking_address)
+            set_key(env_file, "SR_STAKING_ADDRESS", staking_address)
         if collection_address:
-            set_key(_ENV_FILE, "SR_COLLECTION_ADDRESS", collection_address)
+            set_key(env_file, "SR_COLLECTION_ADDRESS", collection_address)
         if referral_code:
-            set_key(_ENV_FILE, "SR_REFERRAL_CODE", referral_code)
+            set_key(env_file, "SR_REFERRAL_CODE", referral_code)
 
         # Network mode
-        set_key(_ENV_FILE, "SR_UPNP_ENABLED", str(upnp_enabled).lower())
+        set_key(env_file, "SR_UPNP_ENABLED", str(upnp_enabled).lower())
         if public_ip:
-            set_key(_ENV_FILE, "SR_PUBLIC_IP", public_ip)
+            set_key(env_file, "SR_PUBLIC_IP", public_ip)
         if public_port and public_port != "9090":
-            set_key(_ENV_FILE, "SR_PUBLIC_PORT", public_port)
+            set_key(env_file, "SR_PUBLIC_PORT", public_port)
 
-        wizard_done(_ENV_FILE)
+        # ALSO write directly to settings.json. Pre-rc.5 we relied on
+        # settings_loader picking up the env file on the next daemon
+        # start, but a settings.json had already been created by the
+        # earlier ``load_settings()`` call (the cold-start path persists
+        # defaults). With settings.json present the env-file migration is
+        # skipped and the wizard's values are silently dropped.
+        _persist_wizard_results(
+            staking_address=staking_address,
+            collection_address=collection_address,
+            referral_code=referral_code,
+            upnp_enabled=upnp_enabled,
+            public_ip=public_ip,
+            public_port=public_port,
+            passphrase_set=bool(passphrase),
+        )
+
+        wizard_done(env_file)
         return True
 
     except (KeyboardInterrupt, EOFError):
@@ -236,12 +376,85 @@ def _fetch_min_staking_amount() -> int:
         return 1
 
 
+def _fetch_wallet_staking_status() -> str | None:
+    """Best-effort fetch of the operator's coord-side ``staking_status``.
+
+    rc.7 MIN-3: mirrors the GUI staking-modal gate (see
+    ``gui/assets/app.js`` ~L1483) so the CLI doesn't nag operators whose
+    wallet is already ``qualifying``/``earning``. Fail-safe: any error
+    (no STAKING_ADDRESS configured, network failure, malformed JSON,
+    wallet not yet registered) returns ``None`` so the caller falls
+    through to the existing prompt — first-run setup still gets the nag.
+
+    rc.8 fix: query ``/nodes?staking_address=...`` (case-insensitive,
+    list response) instead of the path-style ``/nodes/{node_id}`` —
+    the latter expects a node UUID, and passing a 0x-address triggers
+    a Postgres UUID-cast error → HTTP 500 from the coord backend.
+
+    rc.11 fix: distinguish *transient lookup failure* (coord timeout /
+    network error) from *wallet definitively unstaked / unknown*. The
+    sentinel ``"__lookup_failed__"`` is returned only when the HTTP call
+    itself fails so the caller can choose to skip the banner instead of
+    showing the full nag every CLI start (Jenna's rc.10 LOW finding).
+    """
+    LOOKUP_FAILED = "__lookup_failed__"
+    try:
+        import httpx
+        s = load_settings()
+        wallet = (s.STAKING_ADDRESS or "").strip().lower()
+        if not wallet:
+            return None  # no wallet configured — caller decides to nag
+        try:
+            resp = httpx.get(
+                f"{s.COORDINATION_API_URL}/nodes",
+                params={"staking_address": wallet},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            nodes = resp.json()
+        except (httpx.HTTPError, ValueError):
+            # Network / 5xx / malformed JSON — coord lookup is genuinely
+            # broken right now. Don't nag; surface a softer note instead.
+            logger.debug("staking-status lookup failed", exc_info=True)
+            return LOOKUP_FAILED
+        if not isinstance(nodes, list) or not nodes:
+            return None  # wallet not registered yet — first-run nag is correct
+        ss = nodes[0].get("staking_status")
+        return ss if isinstance(ss, str) else None
+    except Exception:
+        # Any other unexpected failure (settings missing, etc).  Fall
+        # through to the legacy "show banner" behaviour rather than
+        # silently masking real config problems.
+        logger.debug("staking-status check raised unexpectedly", exc_info=True)
+        return None
+
+
 def _show_staking_prompt() -> None:
     """Display a staking requirement notice before starting the node.
 
     Only shown when stdin is a TTY (interactive mode). In non-interactive
     mode (piped input, systemd), logs a warning instead.
     """
+    # rc.7 MIN-3: skip the nag if the wallet is already qualifying/earning.
+    # Mirrors the GUI gate added in rc.6 (gui/assets/app.js ~L1483) so the
+    # two surfaces stay coherent.
+    #
+    # rc.11 fix: also skip when the lookup transiently failed.  Pre-rc.11
+    # any coord blip caused the full Staking-Required banner to show on
+    # every CLI start (blocking automation in qualifying/earning wallets
+    # whose status the daemon couldn't fetch). We now log a soft note
+    # instead so the operator can see why we couldn't verify.
+    ss = _fetch_wallet_staking_status()
+    if ss in ("qualifying", "earning"):
+        return
+    if ss == "__lookup_failed__":
+        logger.info(
+            "Could not verify staking status with the coordination API "
+            "(transient lookup failure). Skipping the staking banner — "
+            "the daemon will continue and re-check during runtime.",
+        )
+        return
+
     min_amount = _fetch_min_staking_amount()
 
     if not sys.stdin.isatty():
@@ -343,6 +556,14 @@ class _NodeContext:
         self.node_id: str = ""
         self.gateway_ca_cert: str | None = None
         self.version_check = None  # VersionCheckResult | None
+        self.receipt_poller = None  # ReceiptPoller | None
+        self.claim_reaper = None  # ClaimReaper | None
+        self.auto_claim_monitor = None  # AutoClaimMonitor | None
+        # State machine reference — populated by ``_run`` so background
+        # phases (escrow config check, etc.) can publish surface-specific
+        # status fields like ``rpc_status`` without threading ``sm``
+        # through every phase signature.
+        self.sm: "NodeStateMachine | None" = None
 
 
 async def _phase_init(ctx: _NodeContext) -> None:
@@ -358,7 +579,7 @@ async def _phase_init(ctx: _NodeContext) -> None:
         from app.upnp import setup_upnp_mapping
 
         ctx.upnp_endpoint = await setup_upnp_mapping(
-            s.NODE_PORT, lease_duration=s.UPNP_LEASE_DURATION,
+            s.NODE_PORT, lease_duration=constants.UPNP_LEASE_DURATION,
         )
         if ctx.upnp_endpoint:
             logger.info("UPnP mapping active: %s:%d", ctx.upnp_endpoint[0], ctx.upnp_endpoint[1])
@@ -444,7 +665,7 @@ async def _phase_bind(ctx: _NodeContext) -> None:
     # Use SO_REUSEADDR to avoid "address already in use" after restart
     server = await asyncio.start_server(
         handler,
-        host=s.BIND_ADDRESS,
+        host=constants.BIND_ADDRESS,
         port=s.NODE_PORT,
         ssl=ctx.ssl_ctx,
         reuse_address=True,
@@ -453,18 +674,64 @@ async def _phase_bind(ctx: _NodeContext) -> None:
     logger.info("Home Node listening on port %d", s.NODE_PORT)
 
 
+_first_register_attempted: bool = False
+# rc.8 #6: bounded retry on ENDPOINT_UNREACHABLE for the *first* registration
+# of this process. Repro: full GUI quit → immediate CLI launch → coord probes
+# while UPnP teardown is still in flight (5-15s) → connection_refused →
+# ENDPOINT_UNREACHABLE on first attempt, but the second attempt seconds later
+# succeeds. Bound the retry to first-launch only; runtime re-registrations
+# (the reconnect loop near line 2073) keep their own backoff and must not
+# get a second free pass on every reentry.
+_FIRST_LAUNCH_RETRY_MAX_ATTEMPTS = 3
+_FIRST_LAUNCH_RETRY_SLEEP_S = 5
+
+
 async def _phase_register(ctx: _NodeContext) -> None:
     """REGISTERING: Register with the Coordination API."""
+    from app.errors import NodeError, NodeErrorCode, classify_error
     from app.registration import register_node, save_gateway_ca_cert
 
-    node_id, gateway_ca_cert = await register_node(
-        ctx.http, ctx.s, ctx.public_ip,
-        identity_key=ctx.identity_key,
-        upnp_endpoint=ctx.upnp_endpoint,
-        wallet_address=ctx.wallet_address,
-        staking_address=ctx.staking_address,
-        collection_address=ctx.collection_address,
-    )
+    global _first_register_attempted  # noqa: PLW0603
+    is_first_launch = not _first_register_attempted
+    _first_register_attempted = True
+
+    async def _do_register():
+        return await register_node(
+            ctx.http, ctx.s, ctx.public_ip,
+            identity_key=ctx.identity_key,
+            upnp_endpoint=ctx.upnp_endpoint,
+            wallet_address=ctx.wallet_address,
+            staking_address=ctx.staking_address,
+            collection_address=ctx.collection_address,
+        )
+
+    if is_first_launch:
+        last_err: Exception | None = None
+        for attempt in range(1, _FIRST_LAUNCH_RETRY_MAX_ATTEMPTS + 1):
+            try:
+                node_id, gateway_ca_cert = await _do_register()
+                break
+            except Exception as exc:
+                # Only retry classified ENDPOINT_UNREACHABLE — every other code
+                # (REGISTRATION_REJECTED, IP_CONFLICT, VERSION_TOO_OLD, etc.)
+                # propagates immediately so the GUI/CLI surfaces the real fault.
+                classified = exc if isinstance(exc, NodeError) else classify_error(exc)
+                if classified.code is not NodeErrorCode.ENDPOINT_UNREACHABLE:
+                    raise
+                last_err = exc
+                if attempt >= _FIRST_LAUNCH_RETRY_MAX_ATTEMPTS:
+                    raise
+                logger.info(
+                    "Endpoint not yet reachable, retrying in %ds (attempt %d/%d)...",
+                    _FIRST_LAUNCH_RETRY_SLEEP_S, attempt, _FIRST_LAUNCH_RETRY_MAX_ATTEMPTS,
+                )
+                await asyncio.sleep(_FIRST_LAUNCH_RETRY_SLEEP_S)
+        else:  # pragma: no cover — defensive; the loop always breaks or raises
+            assert last_err is not None
+            raise last_err
+    else:
+        node_id, gateway_ca_cert = await _do_register()
+
     ctx.node_id = node_id
     ctx.gateway_ca_cert = gateway_ca_cert
 
@@ -472,8 +739,301 @@ async def _phase_register(ctx: _NodeContext) -> None:
     if gateway_ca_cert:
         save_gateway_ca_cert(gateway_ca_cert, ctx.s.GATEWAY_CA_CERT_PATH)
 
+    # Initialise the Leg 2 receipt submitter. Needs node_id + identity key +
+    # gateway's payer address (fetched from coord API /config). We do this
+    # after registration since node_id isn't known before.
+    if ctx.s.PAYMENT_ENABLED and ctx.s.NODE_RATE_PER_GB > 0:
+        await _init_receipt_submitter(ctx)
+    else:
+        _log_leg2_gated_off(ctx.s)
+
     # Upgrade to mTLS if enabled
     _upgrade_mtls(ctx)
+
+
+def _log_leg2_gated_off(s) -> None:
+    """Surface why Leg 2 is disabled. test.95 silently skipped this path
+    when escrow.enabled=false slipped through Fresh Restart, leaving the
+    user wondering why no receipts ever materialised. Make the gate
+    decision explicit in the log so the next misconfiguration shows up
+    immediately instead of via a quiet Earnings-card spam.
+    """
+    from app.variant import BUILD_VARIANT
+
+    if not s.PAYMENT_ENABLED:
+        msg = (
+            "Leg 2 disabled — settings.escrow.enabled=false. "
+            "Receipts will not be signed or claimed. "
+            "Set escrow.enabled=true in ~/.spacerouter/settings.json "
+            "(or SR_PAYMENT_ENABLED=true) to participate in escrow payments."
+        )
+    else:
+        msg = (
+            "Leg 2 disabled — settings.escrow.leg2_rate_per_gb=%d (must be > 0). "
+            "Set a non-zero rate (the coord TOFU sync will overwrite it on first /config call)."
+        ) % int(getattr(s, "NODE_RATE_PER_GB", 0) or 0)
+
+    if BUILD_VARIANT == "test":
+        # On test builds, escrow OFF is almost always misconfiguration —
+        # escalate to WARNING so it shows up in the GUI status panel
+        # alongside other startup warnings.
+        logger.warning(msg)
+    else:
+        logger.info(msg)
+
+
+async def _init_receipt_submitter(ctx: _NodeContext) -> None:
+    from app.payment.receipt_submitter import (
+        ReceiptPoller, ReceiptSubmitter, set_submitter,
+    )
+    try:
+        resp = await ctx.http.get(f"{ctx.s.COORDINATION_API_URL}/config", timeout=10.0)
+        resp.raise_for_status()
+        gateway_payer = resp.json().get("gatewayPayerAddress") or ""
+    except Exception:
+        logger.warning("Failed to fetch /config for Leg 2 payer address — Leg 2 disabled", exc_info=True)
+        return
+    if not gateway_payer:
+        logger.info("Coord API reports no gatewayPayerAddress — Leg 2 disabled")
+        return
+
+    # Single source of truth: COLLECTION_ADDRESS is what the contract pays,
+    # and it's what coord API stores as the node's wallet. Falling back to
+    # STAKING_ADDRESS for legacy configs where COLLECTION_ADDRESS wasn't set.
+    # NODE_IDENTITY_ADDRESS is ignored for receipts — if operator configured
+    # it distinct from the collection wallet, we warn.
+    node_wallet = ctx.s.COLLECTION_ADDRESS or ctx.s.STAKING_ADDRESS
+    if not node_wallet:
+        logger.info("No provider wallet address configured — Leg 2 disabled")
+        return
+
+    nia = (ctx.s.NODE_IDENTITY_ADDRESS or "").strip()
+    if nia and nia.lower() != node_wallet.lower():
+        logger.warning(
+            "SR_NODE_IDENTITY_ADDRESS=%s is set but differs from COLLECTION_ADDRESS=%s; "
+            "Leg 2 receipts pay COLLECTION_ADDRESS. Remove NODE_IDENTITY_ADDRESS or match it.",
+            nia, node_wallet,
+        )
+
+    submitter = ReceiptSubmitter(
+        settings=ctx.s,
+        node_id=ctx.node_id,
+        identity_key=ctx.identity_key,
+        identity_address=ctx.identity_address,
+        gateway_payer_address=gateway_payer,
+        node_wallet_address=node_wallet,
+    )
+    set_submitter(submitter)
+
+    poller = ReceiptPoller(
+        settings=ctx.s,
+        node_id=ctx.node_id,
+        identity_key=ctx.identity_key,
+        node_wallet_address=node_wallet,
+    )
+    await poller.start()
+    ctx.receipt_poller = poller
+
+    # P3/L5 — one-shot reconciliation of any tx that was broadcast
+    # but didn't reach mark_claimed before the previous run crashed.
+    # Runs before the reaper starts so the recurring reaper tick
+    # doesn't redo work the reconciler already handled. Best-effort
+    # — failure here just logs; the reaper picks up anything left.
+    try:
+        from app.payment.inflight_reconciler import reconcile_inflight
+        recon = await reconcile_inflight(ctx.s)
+        if recon["checked"]:
+            logger.info(
+                "Startup reconcile: %d in-flight row(s) — settled %d, "
+                "cleared %d.",
+                recon["checked"], recon["marked_claimed"], recon["cleared"],
+            )
+    except Exception:
+        logger.exception("Startup in-flight reconcile failed; continuing")
+
+    # Reaper resolves stuck CLAIM_TX_TIMEOUT rows by re-querying the chain.
+    # Only runs when escrow RPC + contract are configured — safe on dev
+    # setups that don't have on-chain settlement enabled.
+    from app.payment.reaper import ClaimReaper
+    reaper = ClaimReaper(settings=ctx.s)
+    if reaper.enabled:
+        await reaper.start()
+        ctx.claim_reaper = reaper
+
+    # P10 — optional auto-claim monitor. Default OFF; only spins up when
+    # the operator opted in via settings.json. Same lifecycle as the
+    # reaper: start now, stop on daemon shutdown. Reuses the daemon's
+    # already-resolved identity key as the settlement key (matching the
+    # CLI ``--claim`` default), so the monitor never has to re-prompt
+    # for a passphrase from a background task.
+    from app.payment.auto_claim import AutoClaimMonitor
+    settlement_key_hex = os.environ.get("SR_SETTLEMENT_KEY", "") or (
+        ctx.identity_key if ctx.identity_key.startswith("0x")
+        else ("0x" + ctx.identity_key if ctx.identity_key else "")
+    )
+    auto_claim = AutoClaimMonitor(
+        settings=ctx.s, settlement_key_hex=settlement_key_hex or None,
+    )
+    if auto_claim.enabled:
+        await auto_claim.start()
+        ctx.auto_claim_monitor = auto_claim
+
+    logger.info(
+        "Leg 2 submitter ready — payer=%s node_wallet=%s rate=%d/GB "
+        "(poller every 10s, reaper enabled=%s, auto-claim enabled=%s)",
+        gateway_payer, node_wallet[:12] + "...",
+        ctx.s.NODE_RATE_PER_GB, reaper.enabled, auto_claim.enabled,
+    )
+
+    # Sanity checks for Leg 2 config — ERROR-log only, never fail
+    # startup. The node is still useful for routing even if Leg 2 is
+    # misconfigured; we want to surface the root cause instead of
+    # accumulating silent failures in the receipt store.
+    await _verify_escrow_config(ctx.s, node_wallet, sm=ctx.sm)
+
+
+async def _verify_escrow_config(settings, node_wallet: str, sm=None) -> None:  # noqa: ANN001
+    """Run cheap sanity checks against the configured escrow chain.
+
+    Three checks (each logs ERROR + continues):
+
+    - **S8**: Does the RPC actually point at the chain_id we expect?
+      Misconfigured prod-vs-test RPCs silently broadcast claim txs to
+      the wrong chain otherwise.
+    - **P1**: Is the node wallet registered via ``registerNode()``?
+      Without registration, every Leg 2 claim silently skips on-chain.
+    - **P2**: Does ``SR_COLLECTION_ADDRESS`` match the ``node_address``
+      in existing unclaimed signed receipts? Changing the config after
+      receipts accumulate orphans them.
+    - **P9**: Warn if ``NODE_RATE_PER_GB`` is zero.
+    """
+    if settings.NODE_RATE_PER_GB <= 0:
+        logger.warning(
+            "SR_NODE_RATE_PER_GB=%d — all Leg 2 receipts will be zero-value "
+            "and skipped. Set a non-zero rate to earn payouts.",
+            settings.NODE_RATE_PER_GB,
+        )
+
+    if not settings.ESCROW_CHAIN_RPC or not settings.ESCROW_CONTRACT_ADDRESS:
+        return  # Escrow disabled; nothing to verify.
+
+    def _sync_check() -> dict:
+        out: dict = {"chain_id": None, "registered": None, "error": None}
+        try:
+            from web3 import Web3
+            from eth_utils import to_bytes, to_checksum_address
+            import json as _json
+            from pathlib import Path as _Path
+
+            w3 = Web3(Web3.HTTPProvider(
+                settings.ESCROW_CHAIN_RPC, request_kwargs={"timeout": 10},
+            ))
+            if not w3.is_connected():
+                out["error"] = f"RPC unreachable: {settings.ESCROW_CHAIN_RPC}"
+                return out
+
+            out["chain_id"] = int(w3.eth.chain_id)
+
+            abi_path = _Path(__file__).parent / "payment" / "escrow_abi.json"
+            with open(abi_path) as f:
+                abi_data = _json.load(f)
+            abi = abi_data["escrow"] if isinstance(abi_data, dict) else abi_data
+
+            contract = w3.eth.contract(
+                address=Web3.to_checksum_address(settings.ESCROW_CONTRACT_ADDRESS),
+                abi=abi,
+            )
+            node_b32 = to_bytes(hexstr="0x" + node_wallet.lower().removeprefix("0x").zfill(64))
+            try:
+                mapped = contract.functions.getNodeWallet(node_b32).call()
+                out["registered"] = (
+                    mapped != "0x0000000000000000000000000000000000000000"
+                )
+            except Exception as e:
+                # Older contract revisions may not have getNodeWallet;
+                # don't fail the check. Default to "unknown".
+                out["registered"] = None
+                logger.debug("getNodeWallet call failed: %s", e)
+        except Exception as e:
+            out["error"] = str(e)
+        return out
+
+    info = await asyncio.to_thread(_sync_check)
+
+    if info.get("error"):
+        err_text = info["error"]
+        logger.error(
+            "Escrow config check: RPC/ABI error — %s. Leg 2 claims will "
+            "likely fail until this is fixed.",
+            err_text,
+        )
+        # Surface to the GUI so an operator with a fake/unreachable RPC
+        # URL sees an actionable badge ("RPC unreachable: ...") instead
+        # of just falling silently into the inactive state. Only set on
+        # the unreachable case — ABI/contract errors keep RPC connectivity
+        # intact and would mislead the user otherwise.
+        if sm is not None and "RPC unreachable" in err_text:
+            sm.status.rpc_status = "unreachable"
+            sm.status.rpc_status_detail = err_text
+        return
+
+    # RPC is reachable — clear any prior unreachable badge. Lets a
+    # mid-run config fix (settings change + restart) recover cleanly.
+    if sm is not None:
+        sm.status.rpc_status = "ok"
+        sm.status.rpc_status_detail = ""
+
+    # S8: chain_id mismatch guard
+    expected_chain = getattr(settings, "ESCROW_CHAIN_ID", 0)
+    actual_chain = info.get("chain_id")
+    if expected_chain and actual_chain and expected_chain != actual_chain:
+        logger.error(
+            "ESCROW CHAIN ID MISMATCH: SR_ESCROW_CHAIN_ID=%d but "
+            "SR_ESCROW_CHAIN_RPC reports chain_id=%d. Your claim "
+            "transactions will be rejected or go to the wrong chain. "
+            "Fix the config before running --claim.",
+            expected_chain, actual_chain,
+        )
+
+    # P1: registerNode guard
+    if info.get("registered") is False:
+        logger.error(
+            "NODE NOT REGISTERED in escrow contract: node_wallet=%s on "
+            "chain_id=%s. Payouts will silently fail until engineering "
+            "calls registerNode(). Receipts will still sign but "
+            "--claim will not transfer tokens.",
+            node_wallet, actual_chain,
+        )
+
+    # P2: collection-address-changed-mid-lifetime guard
+    try:
+        from app.payment.receipt_store import get_store
+        store = get_store(settings.RECEIPT_STORE_PATH)
+        await store.initialize()
+        # Query directly via a helper that returns distinct node_address
+        # values across unclaimed rows.
+        import sqlite3 as _sqlite3
+        def _do():
+            with _sqlite3.connect(store.path) as conn:
+                rows = conn.execute(
+                    "SELECT DISTINCT node_address FROM signed_receipts "
+                    "WHERE claimed_at IS NULL AND locked = 0"
+                ).fetchall()
+            return [r[0] for r in rows]
+        existing_addrs = await asyncio.to_thread(_do)
+        expected_b32 = "0x" + node_wallet.lower().removeprefix("0x").zfill(64)
+        orphans = [a for a in existing_addrs if a.lower() != expected_b32]
+        if orphans:
+            logger.warning(
+                "COLLECTION ADDRESS CHANGED: %d unclaimed receipt(s) "
+                "reference a different node_address than the current "
+                "SR_COLLECTION_ADDRESS=%s. They will pay out to the "
+                "previous collection wallet if that wallet is still "
+                "registered. Run --receipts --json to inspect.",
+                len(orphans), node_wallet,
+            )
+    except Exception:
+        logger.debug("Collection-address drift check failed", exc_info=True)
 
 
 def _upgrade_mtls(ctx: _NodeContext) -> None:
@@ -506,9 +1066,60 @@ async def _rebind_server_mtls(ctx: _NodeContext) -> None:
         await ctx.server.wait_closed()
     handler = functools.partial(handle_client, settings=s)
     ctx.server = await asyncio.start_server(
-        handler, host=s.BIND_ADDRESS, port=s.NODE_PORT, ssl=ctx.ssl_ctx,
+        handler, host=constants.BIND_ADDRESS, port=s.NODE_PORT, ssl=ctx.ssl_ctx,
         reuse_address=True,
     )
+
+
+async def _upnp_renewal_loop(
+    renew_fn,  # noqa: ANN001 — async callable returning bool
+    long_interval: int,
+    short_interval: int = 60,
+    escalate_after: int = 3,
+) -> None:
+    """Keep the UPnP port mapping alive across its lease lifetime.
+
+    ``renew_fn`` is a full re-discovery + re-add, so on success the
+    mapping is good for another ``LEASE_DURATION`` seconds. We wake
+    every ``long_interval`` seconds for the normal refresh, but on
+    failure we shrink to ``short_interval`` so transient router /
+    network blips don't leave the mapping expired for up to a full
+    half-lease gap — that was the "ENDPOINT_UNREACHABLE at ~1h15m"
+    symptom QA saw on a default 3600s lease.
+
+    Factored out of ``_run`` so it can be tested without standing up
+    the whole node.
+    """
+    consecutive_failures = 0
+    while True:
+        interval = short_interval if consecutive_failures > 0 else long_interval
+        await asyncio.sleep(interval)
+        ok = await renew_fn()
+        if ok:
+            if consecutive_failures:
+                logger.info(
+                    "UPnP lease recovered after %d failed attempt(s)",
+                    consecutive_failures,
+                )
+            consecutive_failures = 0
+            logger.debug("UPnP lease renewed")
+        else:
+            consecutive_failures += 1
+            # Escalate tone once we've burned through the natural grace
+            # window (short_interval retries cover a few minutes; past
+            # that the original mapping is probably already expired).
+            if consecutive_failures >= escalate_after:
+                logger.error(
+                    "UPnP lease renewal has failed %d consecutive "
+                    "attempts — node may be ENDPOINT_UNREACHABLE until "
+                    "the router accepts a re-mapping.",
+                    consecutive_failures,
+                )
+            else:
+                logger.warning(
+                    "UPnP lease renewal failed (attempt %d); retrying in %ds",
+                    consecutive_failures, short_interval,
+                )
 
 
 async def _version_check_loop(
@@ -602,6 +1213,14 @@ async def _health_loop(
 
         if consecutive_failures >= _HEARTBEAT_FAIL_THRESHOLD:
             logger.warning("Health check threshold reached — triggering reconnection")
+            # rc.6 BLK-3: the self-probe loop (_self_probe_loop) can also
+            # trigger this transition. If it raced ahead of us, the state
+            # is already RECONNECTING and a second transition would raise
+            # ValueError (RECONNECTING→RECONNECTING is not allowed) —
+            # killing this task. Guard at the call site; the state table
+            # itself stays correct.
+            if sm.state == NodeState.RECONNECTING:
+                return
             sm.transition(NodeState.RECONNECTING, "Lost connection to coordination server")
             return  # exit health loop; orchestrator handles reconnection
 
@@ -638,11 +1257,11 @@ async def _health_loop(
                 and now - last_global >= _SELF_PROBE_REQUEST_COOLDOWN):
             last_probe_request = now
             try:
-                accepted = await request_probe(
+                result = await request_probe(
                     ctx.http, ctx.s, ctx.node_id,
                     identity_key=ctx.identity_key,
                 )
-                if accepted:
+                if result.outcome == "ok":
                     ctx._last_probe_request_time = now
             except Exception:
                 pass  # non-critical
@@ -679,7 +1298,12 @@ async def _status_summary_loop(
 # Self-probe interval — more frequent than health checks to catch bore disconnects fast
 _SELF_PROBE_INTERVAL = 60  # 1 minute
 _SELF_PROBE_REQUEST_COOLDOWN = 300  # 5 min — matches server rate limit
-_SELF_PROBE_BACKOFF_CAP = 1800  # 30 min max backoff on consecutive 429s
+_SELF_PROBE_BACKOFF_CAP = 600  # 10 min max backoff on persistent failures
+# After this many consecutive offline polls (≈6 min at 60s each), give up on
+# self-probe recovery and force RECONNECTING — that path retries UPnP and
+# re-registers, which is the only thing that can override offline status
+# without a consecutive-success threshold.
+_SELF_PROBE_OFFLINE_ESCALATION_THRESHOLD = 6
 
 
 async def _self_probe_loop(
@@ -692,7 +1316,21 @@ async def _self_probe_loop(
 
     Runs every 60s (vs 5min for health checks) to catch bore tunnel
     disconnects and other reachability issues quickly.  Also feeds
-    staking_status, health_score, and probe results to the dashboard.
+    staking_status, health_score, and probe results to the dashboard
+    and to ``sm.status`` for GUI consumption.
+
+    Recovery flow (the bug this exists to fix):
+      - On the first online→offline transition, we fire a probe request
+        immediately, ignoring the client-side cooldown (the server's
+        own rate limit still applies).
+      - On 429 we honour the server's ``Try again in {N}s`` hint exactly
+        instead of blindly doubling the cooldown.
+      - On other failures we double the cooldown up to
+        ``_SELF_PROBE_BACKOFF_CAP``.
+      - After ``_SELF_PROBE_OFFLINE_ESCALATION_THRESHOLD`` consecutive
+        offline polls we transition to RECONNECTING, since persistent
+        offline status almost always means the tunnel/UPnP lease is
+        dead and only re-registration can recover it.
     """
     import time as _time
 
@@ -700,10 +1338,13 @@ async def _self_probe_loop(
 
     # Run first check almost immediately (5s delay for registration to settle)
     first_run = True
-    # Start at current time so first cooldown respects the registration probe
-    # (which already fired during _phase_register).
-    last_probe_request_time = _time.time()
+    # Start at 0.0 so the first attempt can fire immediately if the loop is
+    # created into an already-offline state — the server's own rate limit
+    # is still respected via the 429 path.
+    last_probe_request_time = 0.0
     current_cooldown = _SELF_PROBE_REQUEST_COOLDOWN
+    previous_status: str | None = None
+    consecutive_offline = 0
     while not stop_event.is_set():
         delay = 5 if first_run else _SELF_PROBE_INTERVAL
         first_run = False
@@ -720,62 +1361,132 @@ async def _self_probe_loop(
             node_data = await check_node_status(
                 ctx.http, ctx.s, ctx.node_id, identity_key=ctx.identity_key,
             )
-            status = node_data.get("status", "unknown")
-            health_score = node_data.get("health_score", 0)
-            staking_status = node_data.get("staking_status", "—")
-
-            probe_result = status
-            if status not in ("online", "active"):
-                logger.warning(
-                    "Self-probe: coordination reports status='%s' health_score=%.1f — requesting probe",
-                    status, health_score,
-                )
-                now = _time.time()
-                if now - last_probe_request_time >= current_cooldown:
-                    try:
-                        accepted = await request_probe(
-                            ctx.http, ctx.s, ctx.node_id,
-                            identity_key=ctx.identity_key,
-                        )
-                        if accepted:
-                            last_probe_request_time = now
-                            probe_result = "probe_requested"
-                            current_cooldown = _SELF_PROBE_REQUEST_COOLDOWN
-                            ctx._last_probe_request_time = now
-                        else:
-                            # 429 or server error — exponential backoff
-                            probe_result = "rate_limited"
-                            current_cooldown = min(
-                                current_cooldown * 2,
-                                _SELF_PROBE_BACKOFF_CAP,
-                            )
-                            logger.info(
-                                "Probe request not accepted — backing off to %ds",
-                                current_cooldown,
-                            )
-                    except Exception:
-                        probe_result = "probe_failed"
-                else:
-                    probe_result = "cooldown"
-
-            # Update state machine so GUI can read staking_status
-            sm.status.staking_status = staking_status
-
-            if dashboard:
-                dashboard.update(
-                    last_probe_result=probe_result,
-                    last_probe_time=_time.time(),
-                    health_status=status,
-                    health_score=str(health_score),
-                    staking_status=staking_status,
-                )
         except Exception as exc:
-            logger.debug("Self-probe check failed: %s", exc)
+            # Promoted DEBUG → INFO: a swallowed status check is the kind of
+            # thing operators need to see when the node is silently stuck.
+            logger.info("Self-probe check failed: %s", exc)
+            sm.status.last_probe_outcome = "failed"
             if dashboard:
                 dashboard.update(
                     last_probe_result="error",
                     last_probe_time=_time.time(),
                 )
+            continue
+
+        status = node_data.get("status", "unknown")
+        health_score = float(node_data.get("health_score", 0.0))
+        staking_status = node_data.get("staking_status", "—")
+
+        # Plumb coord-side observations through to GUI / dashboard.
+        sm.status.coord_status = status
+        sm.status.coord_health_score = health_score
+        sm.status.staking_status = staking_status
+
+        if status in ("online", "active"):
+            consecutive_offline = 0
+            previous_status = status
+            sm.status.next_probe_attempt_at = None
+            if dashboard:
+                dashboard.update(
+                    last_probe_result=status,
+                    last_probe_time=_time.time(),
+                    health_status=status,
+                    health_score=str(health_score),
+                    staking_status=staking_status,
+                )
+            continue
+
+        # ---- Offline branch ------------------------------------------------
+        consecutive_offline += 1
+        # Online→offline transition: force an immediate probe request
+        # (subject only to the server's rate limit, not the client cooldown).
+        is_first_transition = (
+            previous_status in ("online", "active") and consecutive_offline == 1
+        )
+        previous_status = status
+
+        logger.warning(
+            "Self-probe: coord reports status=%s health_score=%.1f (consecutive_offline=%d)",
+            status, health_score, consecutive_offline,
+        )
+
+        now = _time.time()
+        cooldown_ok = (now - last_probe_request_time) >= current_cooldown
+        probe_result = "cooldown"
+
+        if is_first_transition or cooldown_ok:
+            # Always advance last_probe_request_time so the client-side gate
+            # is honest about when we actually reached out.
+            last_probe_request_time = now
+            sm.status.last_probe_attempt_at = now
+            ctx._last_probe_request_time = now
+
+            result = await request_probe(
+                ctx.http, ctx.s, ctx.node_id,
+                identity_key=ctx.identity_key,
+            )
+            if result.outcome == "ok":
+                current_cooldown = _SELF_PROBE_REQUEST_COOLDOWN
+                sm.status.last_probe_outcome = "ok"
+                sm.status.next_probe_attempt_at = now + current_cooldown
+                probe_result = "probe_requested"
+                logger.info(
+                    "Probe requested for node %s — next attempt in %ds",
+                    ctx.node_id, current_cooldown,
+                )
+            elif result.outcome == "rate_limited":
+                # Honour the server's retry hint exactly — no exponential
+                # doubling. +5s jitter buffer to avoid racing the rate limit.
+                wait = (result.retry_after_seconds or _SELF_PROBE_REQUEST_COOLDOWN) + 5
+                current_cooldown = wait
+                sm.status.last_probe_outcome = "rate_limited"
+                sm.status.next_probe_attempt_at = now + wait
+                probe_result = "rate_limited"
+                logger.info("Probe rate-limited by coord (retry in %ds)", wait)
+            else:  # failed
+                current_cooldown = min(current_cooldown * 2, _SELF_PROBE_BACKOFF_CAP)
+                sm.status.last_probe_outcome = "failed"
+                sm.status.next_probe_attempt_at = now + current_cooldown
+                probe_result = "probe_failed"
+                logger.info(
+                    "Probe request failed — backing off to %ds", current_cooldown,
+                )
+        else:
+            # Cooldown active — don't hit the server, but surface when we
+            # plan to try next so the GUI can render a countdown.
+            sm.status.last_probe_outcome = "cooldown"
+            sm.status.next_probe_attempt_at = last_probe_request_time + current_cooldown
+
+        if dashboard:
+            dashboard.update(
+                last_probe_result=probe_result,
+                last_probe_time=_time.time(),
+                health_status=status,
+                health_score=str(health_score),
+                staking_status=staking_status,
+            )
+
+        # Escalation: persistent offline despite probe attempts → force
+        # RECONNECTING.  The orchestrator's RECONNECTING path retries UPnP
+        # and re-registers; re-registration enqueues a REGISTRATION-priority
+        # probe which is the only class that can override offline status
+        # without a consecutive-success threshold on the coord side.
+        if consecutive_offline >= _SELF_PROBE_OFFLINE_ESCALATION_THRESHOLD:
+            logger.warning(
+                "Coord reports offline for %d consecutive polls — escalating to RECONNECTING",
+                consecutive_offline,
+            )
+            sm.status.last_probe_outcome = "escalated"
+            # rc.6 BLK-3: see _health_loop — the same race applies here in
+            # reverse. Guard against a double-transition that would raise
+            # ValueError and kill this loop.
+            if sm.state == NodeState.RECONNECTING:
+                return
+            sm.transition(
+                NodeState.RECONNECTING,
+                "Persistent offline status from coord — retrying registration",
+            )
+            return  # exit loop; orchestrator handles reconnect
 
 
 async def _dashboard_loop(
@@ -806,6 +1517,301 @@ async def _dashboard_loop(
 
 # ── Orchestrator ─────────────────────────────────────────────────────────────
 
+def _check_disk_space(settings) -> None:
+    """Warn / ERROR when the receipt-store filesystem is filling up.
+
+    SQLite writes silently fail at ENOSPC. Daemon continues running but
+    drops every receipt it tries to persist. Surfacing this at startup
+    (and after each tick would be nice but is too noisy) lets operators
+    act before data is lost.
+    """
+    import shutil
+    from pathlib import Path
+
+    store_path = Path(settings.RECEIPT_STORE_PATH).expanduser()
+    target = store_path.parent if store_path.parent.exists() else Path.home()
+    try:
+        stat = shutil.disk_usage(target)
+    except OSError as exc:
+        logger.debug("disk_usage(%s) failed: %s", target, exc)
+        return
+
+    free_mb = stat.free / (1024 * 1024)
+    total_mb = stat.total / (1024 * 1024)
+    pct_free = (stat.free / stat.total * 100) if stat.total else 0.0
+
+    if free_mb < 50:
+        logger.error(
+            "Receipt-store disk almost full: %.1f MB free of %.0f MB "
+            "(%.1f%%) on %s. SQLite writes will start failing — clear "
+            "space immediately or receipts will be lost silently.",
+            free_mb, total_mb, pct_free, target,
+        )
+    elif free_mb < 500 or pct_free < 5:
+        logger.warning(
+            "Receipt-store disk low: %.1f MB free (%.1f%%) on %s",
+            free_mb, pct_free, target,
+        )
+
+
+# Module-level references to the open lock files. Keeping the objects
+# alive for the whole process lifetime is what keeps the flock held —
+# the moment Python GCs the file object, the fd is closed and the
+# kernel drops the lock. Keyed by lock path so repeated calls in tests
+# can inspect state.
+_daemon_lock_handles: dict[str, "object"] = {}
+
+
+def _acquire_daemon_lock(settings) -> int:
+    """Acquire an exclusive lock on the daemon lock file.
+
+    Cross-platform:
+    - POSIX (Linux / macOS): ``fcntl.flock`` — kernel-backed advisory lock
+      that releases on process exit regardless of how the process dies.
+    - Windows: ``msvcrt.locking`` on the first byte of the file. Same
+      process-lifetime semantics; the kernel releases the lock when the
+      handle is closed.
+
+    Keyed on the receipts-store directory so dev setups with separate
+    DBs can run multiple daemons, but a double-start on the same store
+    refuses rather than silently corrupting the receipt lifecycle.
+
+    On conflict, exits with a clear message. The lock file handle is
+    stashed in a module-level dict so the OS keeps the lock held for
+    the process's lifetime (see PR #50 post-mortem — early impl lost
+    the fd to GC and the lock evaporated).
+    """
+    from pathlib import Path
+
+    store_path = Path(settings.RECEIPT_STORE_PATH).expanduser()
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = store_path.parent / "daemon.lock"
+    key = str(lock_path)
+
+    if key in _daemon_lock_handles:
+        return _daemon_lock_handles[key].fileno()
+
+    is_windows = sys.platform == "win32"
+
+    try:
+        # Windows needs the file to exist before msvcrt.locking can set
+        # a lock range on it, and "w" truncates — use "a+" to ensure the
+        # file exists without nuking an existing pid line.
+        fd = open(lock_path, "a+" if is_windows else "w")
+    except OSError as exc:
+        logger.error(
+            "Cannot open daemon lock file %s: %s — continuing without "
+            "single-instance protection.",
+            lock_path, exc,
+        )
+        return -1
+
+    # Two-layer acquisition:
+    #
+    # 1. Try the OS lock. Fast path; genuine "another live daemon" case
+    #    also hits this path and we exit after the stale-check finds a
+    #    live PID.
+    # 2. If the lock is already held, check whether the PID written in
+    #    the lock file corresponds to a **live** process. If not, treat
+    #    the lock as stale (crashed predecessor still holding a file
+    #    handle on Windows under CI load, an uncleaned-up zombie on
+    #    Unix, etc). Truncate the file, reacquire.
+    #
+    # This replaces a short retry loop that was too tight for Windows
+    # CI smoke tests where the OS sometimes took >2s to release the
+    # msvcrt lock after TerminateProcess.
+    import time as _time
+
+    def _try_acquire(fd_) -> bool:
+        try:
+            if is_windows:
+                import msvcrt
+                fd_.seek(0)
+                msvcrt.locking(fd_.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd_.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except (BlockingIOError, OSError):
+            return False
+
+    def _pid_is_our_daemon(pid: int) -> bool:
+        """True only if PID is alive AND the process image is our binary.
+
+        This catches PID reuse: if our prior daemon's PID got recycled to
+        an unrelated process (typical on Windows CI runners after
+        TerminateProcess), we treat the lock as stale rather than
+        refusing to start. Without this check we hit the
+        v1.5.0-test.85+ smoke-test failure where the second daemon in a
+        sequence sees a recycled PID and thinks "another daemon is
+        running" when there isn't one.
+        """
+        if pid <= 0:
+            return False
+
+        # Read the running process's image path; compare basename.
+        binary_basename = os.path.basename(sys.executable).lower()
+        # PyInstaller-frozen builds report the bundled binary; source
+        # runs report the python interpreter. Either is fine — both are
+        # what `os.getpid()` would resolve to from inside this daemon.
+
+        if is_windows:
+            try:
+                import ctypes
+                from ctypes import wintypes
+                kernel32 = ctypes.windll.kernel32
+                PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+                h = kernel32.OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION, False, pid,
+                )
+                if not h:
+                    return False
+                try:
+                    STILL_ACTIVE = 259
+                    code = ctypes.c_ulong(0)
+                    kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+                    if code.value != STILL_ACTIVE:
+                        return False  # cleanly exited, definitely not us
+
+                    # Process is alive — check if it's actually our binary.
+                    QueryFullProcessImageNameW = kernel32.QueryFullProcessImageNameW
+                    QueryFullProcessImageNameW.argtypes = [
+                        wintypes.HANDLE, wintypes.DWORD,
+                        wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+                    ]
+                    QueryFullProcessImageNameW.restype = wintypes.BOOL
+                    buf = ctypes.create_unicode_buffer(1024)
+                    size = wintypes.DWORD(len(buf))
+                    if not QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                        # Couldn't read the image path — be safe and treat as
+                        # not-ours so we take the lock instead of hanging.
+                        return False
+                    return os.path.basename(buf.value).lower() == binary_basename
+                finally:
+                    kernel32.CloseHandle(h)
+            except Exception:
+                # Uncertain on Windows: prefer "not ours" so we take the
+                # lock. The msvcrt.locking() call below is the real
+                # gatekeeper anyway — if a real daemon does hold it,
+                # that fails and we refuse.
+                return False
+        else:
+            # POSIX: kill(pid, 0) tells us alive/dead; /proc/<pid>/comm
+            # tells us the binary name on Linux. macOS uses `ps` since
+            # /proc isn't reliable.
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                # Alive but not ours-as-the-uid. Could still be our
+                # daemon under a different user — be safe.
+                return True
+
+            try:
+                if sys.platform.startswith("linux"):
+                    comm = open(f"/proc/{pid}/comm").read().strip()
+                    return comm.lower() in {
+                        binary_basename,
+                        "python", "python3", binary_basename.removesuffix(".exe"),
+                    }
+                else:  # macOS / BSD: use ps -p PID -o comm=
+                    import subprocess
+                    out = subprocess.run(
+                        ["ps", "-p", str(pid), "-o", "comm="],
+                        capture_output=True, text=True, timeout=2,
+                    )
+                    if out.returncode != 0:
+                        return False
+                    comm = os.path.basename(out.stdout.strip()).lower()
+                    return comm == binary_basename or comm.startswith("python")
+            except Exception:
+                # /proc read failure or ps failure — conservatively say
+                # alive (don't accidentally take a real daemon's lock).
+                return True
+
+    # Backwards-compat alias for the older check (some unit tests may
+    # still patch this name).
+    _pid_alive = _pid_is_our_daemon
+
+    if not _try_acquire(fd):
+        # Read stored PID to decide whether the lock is stale.
+        stale = False
+        try:
+            fd.seek(0)
+            content = fd.read().strip()
+            pid_line = content.splitlines()[-1] if content else ""
+            prior_pid = int(pid_line) if pid_line.isdigit() else 0
+            stale = not _pid_alive(prior_pid)
+        except Exception:
+            stale = False
+
+        if stale:
+            # The holder is gone — the OS just hasn't reaped the lock
+            # yet (typical Windows post-TerminateProcess behaviour).
+            # Close, reopen (truncating), retry a few times.
+            fd.close()
+            acquired = False
+            for _ in range(8):
+                _time.sleep(0.25)
+                try:
+                    fd = open(lock_path, "a+" if is_windows else "w")
+                except OSError:
+                    continue
+                if _try_acquire(fd):
+                    acquired = True
+                    break
+                fd.close()
+            if not acquired:
+                # Stale lock the OS refuses to release. Surface a
+                # classified error so the GUI shows actionable copy
+                # instead of the generic "unexpected error" toast that
+                # SystemExit would produce. The CLI wrapper at the end
+                # of `main()` prints this same message to stderr.
+                from app.errors import NodeError, NodeErrorCode
+                msg = (
+                    f"Daemon lock {lock_path} appears stale but the OS "
+                    f"won't release it. Delete the file manually if no "
+                    f"space-router-node process is running, then retry."
+                )
+                print(msg, file=sys.stderr)
+                raise NodeError(NodeErrorCode.ANOTHER_INSTANCE_RUNNING, msg)
+        else:
+            fd.close()
+            # Live holder. Same UX-shaping: raise a classified error so
+            # the GUI's CLI+GUI collision case (and GUI+GUI by extension)
+            # surfaces "Another node is already running" rather than the
+            # generic UNEXPECTED_ERROR fallback in node_manager._run_loop.
+            from app.errors import NodeError, NodeErrorCode
+            msg = (
+                f"Another space-router-node daemon is already running "
+                f"against {store_path}. Refusing to start to avoid "
+                f"receipt corruption. Lock: {lock_path}"
+            )
+            print(msg, file=sys.stderr)
+            raise NodeError(NodeErrorCode.ANOTHER_INSTANCE_RUNNING, msg)
+
+    # Write our PID for diagnostic purposes. Lock itself is the source
+    # of truth, but `ps`-side tooling benefits from having a PID in the
+    # file. On Windows we reserved the first byte with msvcrt.locking;
+    # append the PID after that so it doesn't overwrite the locked byte.
+    try:
+        if is_windows:
+            fd.seek(0, 2)  # end-of-file
+            fd.write(f"\n{os.getpid()}\n")
+        else:
+            fd.seek(0)
+            fd.truncate()
+            fd.write(f"{os.getpid()}\n")
+        fd.flush()
+    except Exception:
+        pass
+
+    _daemon_lock_handles[key] = fd
+    logger.info("Acquired daemon lock at %s", lock_path)
+    return fd.fileno()
+
+
 async def _run(
     settings_override=None,  # noqa: ANN001
     stop_event: asyncio.Event | None = None,
@@ -829,10 +1835,76 @@ async def _run(
         create_server_ssl_context, ensure_certificates,
     )
 
+    # ── Trust-on-first-use sync of escrow config from coord ──
+    # Track P2: on first launch, fetch `/config` once, persist the gateway
+    # rate / payer into ``settings.json``. Subsequent launches see the
+    # ``synced_from_coord_at`` stamp and skip the network call. Drift is
+    # handled gateway-side via ``SIGN_REJECTED_PRICE_CAP`` rejection
+    # messages (which include the expected rate). HTTP failures here are
+    # WARN-only — they never block daemon startup.
+    #
+    # We do this BEFORE ``load_settings()`` builds the legacy ``Settings``
+    # shape so the rate populated below is visible via ``s.NODE_RATE_PER_GB``
+    # downstream (in ``_phase_register`` → ``_init_receipt_submitter``).
+    #
+    # The sync runs on EVERY launch, including the GUI path (which passes
+    # ``settings_override=load_settings()`` from a snapshot taken before
+    # this point).  Earlier versions skipped the sync when an override
+    # was supplied — that meant GUI users never re-synced, and the
+    # bootstrap rate from PRs #88 / #93 stayed stuck at 1e15 wei/GB
+    # forever.  After sync, if anything changed, we drop the stale
+    # override and re-load from disk so downstream code sees the synced
+    # values rather than the snapshot.
+    settings_changed_on_disk = False
+    try:
+        from app.escrow_config_sync import sync_escrow_config_from_coord
+        from app.settings_loader import load_provider_settings, settings_path
+        s_path = settings_path()
+        v2_before = load_provider_settings()
+        had_stamp = bool(v2_before.escrow.synced_from_coord_at)
+        had_rate = bool(v2_before.escrow.leg2_rate_per_gb)
+        rate_before = v2_before.escrow.leg2_rate_per_gb
+        v2_after = sync_escrow_config_from_coord(v2_before)
+        # Persist when the sync actually populated something new OR
+        # overwrote a stale rate (the test.97 backfill scenario).
+        now_has_stamp = bool(v2_after.escrow.synced_from_coord_at)
+        now_has_rate = bool(v2_after.escrow.leg2_rate_per_gb)
+        rate_changed = v2_after.escrow.leg2_rate_per_gb != rate_before
+        if (
+            (now_has_stamp and not had_stamp)
+            or (now_has_rate and not had_rate)
+            or rate_changed
+        ):
+            v2_after.save(s_path)
+            settings_changed_on_disk = True
+    except Exception:
+        # Never let escrow sync block the daemon. Logged inside the
+        # function for the expected error paths; a true blow-up here
+        # (e.g. settings.json gone read-only) gets swallowed with a
+        # warning so the rest of startup still happens.
+        logger.warning("escrow config sync failed unexpectedly — continuing", exc_info=True)
+
+    if settings_changed_on_disk and settings_override is not None:
+        # GUI passed us a stale snapshot. Disk state is now authoritative;
+        # reload so the rest of the boot uses the synced rate.
+        logger.info("escrow sync wrote new settings — reloading from disk")
+        settings_override = None
+
     s = settings_override or load_settings()
 
     # Configure logging from settings (updates both logger and handler levels)
     setup_cli_logging(s.LOG_LEVEL)
+
+    # Single-instance daemon lock — keyed on the receipts DB path so two
+    # daemons pointing at different stores can run (dev use case), but a
+    # double-start on the same store refuses immediately instead of
+    # corrupting the receipt state. Released on process exit (OS-level).
+    _daemon_lock_fd = _acquire_daemon_lock(s)
+
+    # Pre-flight: warn if the receipt-store filesystem is almost full.
+    # SQLite writes silently fail at ENOSPC; better to flag it at startup
+    # than accumulate receipt loss over days.
+    _check_disk_space(s)
 
     own_stop_event = stop_event is None
     if stop_event is None:
@@ -862,6 +1934,7 @@ async def _run(
 
     async with httpx.AsyncClient() as http_client:
         ctx = _NodeContext(s, http_client)
+        ctx.sm = sm
         renewal_task = None
         health_task = None
         status_task = None
@@ -912,12 +1985,17 @@ async def _run(
             logger.info("Initializing node (version %s)...", __version__)
             try:
                 await _phase_init(ctx)
-            except KeystorePassphraseRequired:
+            except KeystorePassphraseRequired as exc:
                 if state_machine:
-                    state_machine.transition(
-                        NodeState.PASSPHRASE_REQUIRED,
-                        "Identity key is encrypted — passphrase required",
-                    )
+                    # KeystoreWrongPassphrase is a subclass of
+                    # KeystorePassphraseRequired — surface a distinct
+                    # message so the prompt UI can say "incorrect" rather
+                    # than "required" when the user has already tried.
+                    if isinstance(exc, KeystoreWrongPassphrase):
+                        reason = "Passphrase is incorrect — re-enter your passphrase"
+                    else:
+                        reason = "Identity key is encrypted — passphrase required"
+                    state_machine.transition(NodeState.PASSPHRASE_REQUIRED, reason)
                 raise
             except NodeError:
                 raise
@@ -1009,22 +2087,22 @@ async def _run(
                 )
 
             # Start UPnP renewal
-            if ctx.upnp_endpoint and s.UPNP_LEASE_DURATION > 0:
+            if ctx.upnp_endpoint and constants.UPNP_LEASE_DURATION > 0:
                 from app.upnp import renew_upnp_mapping
 
-                async def _renew_loop() -> None:
-                    interval = max(s.UPNP_LEASE_DURATION // 2, 60)
-                    while True:
-                        await asyncio.sleep(interval)
-                        ok = await renew_upnp_mapping(
-                            s.NODE_PORT, ctx.upnp_endpoint[1], s.UPNP_LEASE_DURATION,
-                        )
-                        if ok:
-                            logger.debug("UPnP lease renewed")
-                        else:
-                            logger.warning("UPnP lease renewal failed")
+                async def _renew_tick() -> bool:
+                    return await renew_upnp_mapping(
+                        s.NODE_PORT, ctx.upnp_endpoint[1],
+                        constants.UPNP_LEASE_DURATION,
+                    )
 
-                renewal_task = asyncio.create_task(_renew_loop())
+                renewal_task = asyncio.create_task(
+                    _upnp_renewal_loop(
+                        _renew_tick,
+                        long_interval=max(constants.UPNP_LEASE_DURATION // 2, 60),
+                        short_interval=60,
+                    )
+                )
 
             # Start health monitoring
             health_task = asyncio.create_task(_health_loop(ctx, sm, stop_event))
@@ -1107,7 +2185,7 @@ async def _run(
                                 from app.upnp import setup_upnp_mapping
                                 upnp_result = await setup_upnp_mapping(
                                     ctx.s.NODE_PORT,
-                                    lease_duration=ctx.s.UPNP_LEASE_DURATION,
+                                    lease_duration=constants.UPNP_LEASE_DURATION,
                                 )
                                 if upnp_result:
                                     ctx.upnp_endpoint = upnp_result
@@ -1128,16 +2206,16 @@ async def _run(
                         logger.info("Reconnected successfully")
 
                         # Recreate background tasks
-                        if ctx.upnp_endpoint and s.UPNP_LEASE_DURATION > 0:
+                        if ctx.upnp_endpoint and constants.UPNP_LEASE_DURATION > 0:
                             from app.upnp import renew_upnp_mapping
 
                             async def _renew_loop() -> None:
-                                interval = max(s.UPNP_LEASE_DURATION // 2, 60)
+                                interval = max(constants.UPNP_LEASE_DURATION // 2, 60)
                                 while True:
                                     await asyncio.sleep(interval)
                                     ok = await renew_upnp_mapping(
                                         s.NODE_PORT, ctx.upnp_endpoint[1],
-                                        s.UPNP_LEASE_DURATION,
+                                        constants.UPNP_LEASE_DURATION,
                                     )
                                     if ok:
                                         logger.debug("UPnP lease renewed")
@@ -1228,22 +2306,79 @@ async def _run(
                     except asyncio.CancelledError:
                         pass
 
+            # Stop Leg 2 receipt poller
+            if ctx.receipt_poller is not None:
+                try:
+                    await ctx.receipt_poller.stop()
+                except Exception:
+                    logger.debug("Receipt poller stop errored", exc_info=True)
+
+            # Stop claim reaper
+            if ctx.claim_reaper is not None:
+                try:
+                    await ctx.claim_reaper.stop()
+                except Exception:
+                    logger.debug("Claim reaper stop errored", exc_info=True)
+
+            # Stop auto-claim monitor (P10)
+            if ctx.auto_claim_monitor is not None:
+                try:
+                    await ctx.auto_claim_monitor.stop()
+                except Exception:
+                    logger.debug("Auto-claim monitor stop errored", exc_info=True)
+
             # Remove UPnP mapping
             if ctx.upnp_endpoint:
                 from app.upnp import remove_upnp_mapping
                 await remove_upnp_mapping(ctx.upnp_endpoint[1])
 
-            # Deregister (best-effort)
+            # Deregister (best-effort) — swallow failures here so a coord
+            # 500 / network blip during shutdown doesn't surface as a
+            # noisy traceback. rc.8 #7b made the inner helper raise so
+            # the --reset path can surface honest success/failure; the
+            # daemon shutdown path doesn't care so we keep the swallow.
             if ctx.node_id:
-                await deregister_node(ctx.http, s, ctx.node_id, identity_key=ctx.identity_key)
+                try:
+                    await deregister_node(ctx.http, s, ctx.node_id, identity_key=ctx.identity_key)
+                except Exception as exc:
+                    logger.warning("Shutdown deregister failed for %s: %s", ctx.node_id, exc)
 
     logger.info("Home Node shut down cleanly")
+
+
+def _identity_keystore_is_encrypted(s) -> bool:
+    """Return True iff the identity key on disk is an encrypted keystore JSON.
+
+    rc.8 #7a helper: ``--reset`` needs to know whether to prompt for a
+    passphrase before attempting the coord deregister. Reuses the same
+    detector used by ``_reconcile_passphrase_flag_in_place`` in
+    ``settings_loader`` so both paths agree on what "encrypted" means.
+
+    A missing file → False (no key to load → caller will skip dereg
+    cleanly via the existing identity-load failure path).
+    """
+    try:
+        from app.identity import _is_keystore_json
+    except Exception:  # noqa: BLE001
+        return False
+    key_path = s.IDENTITY_KEY_PATH
+    if not key_path or not os.path.isfile(key_path):
+        return False
+    try:
+        with open(key_path) as f:
+            return _is_keystore_json(f.read())
+    except OSError:
+        return False
 
 
 def _do_reset() -> bool:
     """Delete all config, identity key, and certificates.
 
     Returns True if reset was performed, False if cancelled.
+
+    All progress prints are flushed so that scripted callers (no TTY) see
+    each step land in their log file as it happens, rather than only at
+    process exit when Python finally flushes its block buffer.
     """
     from app.paths import config_dir
 
@@ -1256,26 +2391,97 @@ def _do_reset() -> bool:
 
     env_file = str(wellknown_env) if wellknown_env.is_file() else cwd_env
     certs_dir = os.path.dirname(os.path.abspath(s.IDENTITY_KEY_PATH)) or "certs"
+    settings_file = cfg_dir / "settings.json"
 
     if sys.stdin.isatty():
-        print("WARNING: This will delete your identity key and all configuration.")
+        print("WARNING: This will delete your identity key and all configuration.", flush=True)
         confirm = input("Type YES to confirm: ").strip()
         if confirm != "YES":
-            print("Reset cancelled.")
+            print("Reset cancelled.", flush=True)
             return False
+    else:
+        # Without a TTY we cannot prompt. Surface what is about to happen
+        # so a scripted operator sees something even if the redirected
+        # stdout buffer wouldn't flush until process exit.
+        print(
+            "Non-interactive --reset: removing all config without confirmation.",
+            flush=True,
+        )
 
-    # Delete .env
+    # rc.6 MAJ-3: tell the coord we're going away BEFORE we delete the
+    # identity key — otherwise the dashboard sees this node as online
+    # for the full health-check timeout (~3 min) after --reset returns.
+    # Best-effort; do NOT block reset on coord failure.
+    #
+    # rc.8 #7a: when the keystore is encrypted and SR_IDENTITY_PASSPHRASE
+    # is unset, ``deregister_best_effort_sync`` would silently fail to
+    # load the identity (KeystorePassphraseRequired) and skip the coord
+    # ping entirely — leaving a stale "online" row on the dashboard.
+    # Prompt interactively when we have a TTY; bail with an actionable
+    # error otherwise so scripted operators don't silently break.
+    if _identity_keystore_is_encrypted(s) and not os.environ.get("SR_IDENTITY_PASSPHRASE"):
+        if sys.stdin.isatty():
+            import getpass
+            passphrase = getpass.getpass("Identity keystore passphrase: ")
+            os.environ["SR_IDENTITY_PASSPHRASE"] = passphrase
+            # Reload settings so IDENTITY_PASSPHRASE picks up the new env.
+            s = load_settings()
+        else:
+            print(
+                "ERROR: Identity keystore is encrypted but SR_IDENTITY_PASSPHRASE is not set.\n"
+                "Set SR_IDENTITY_PASSPHRASE before running --reset on an encrypted keystore "
+                "so the coordination API can be notified before the key is deleted.",
+                file=sys.stderr, flush=True,
+            )
+            sys.exit(1)
+
+    # rc.8 #7b: surface a clean boolean so a coord 500 doesn't masquerade
+    # as success. Local wipe MUST proceed either way — the operator just
+    # needs to know whether the dashboard row got the offline ping.
+    try:
+        from app.registration import deregister_best_effort_sync
+        coord_ok = deregister_best_effort_sync(s)
+    except Exception as exc:
+        # Defensive: helper already swallows internally, but keep the
+        # outer guard so a programmer error doesn't abort --reset.
+        # rc.10 #3: no exc_info=True — the CLI logger writes tracebacks
+        # to stderr, which would leak ahead of the honest "Coord
+        # deregister failed" line below.
+        logger.warning("deregister_best_effort_sync raised unexpectedly: %s", exc)
+        coord_ok = False
+
+    if coord_ok:
+        print("Notified coordination API (status → offline).", flush=True)
+    else:
+        print(
+            "Coord deregister failed (likely server issue) — local state still wiped.",
+            flush=True,
+        )
+
+    # Delete settings.json (canonical v1.5 config)
+    if settings_file.is_file():
+        settings_file.unlink()
+        print(f"Removed {settings_file}", flush=True)
+
+    # Delete legacy .env (only present on upgrades from v1.4)
     if os.path.isfile(env_file):
         os.remove(env_file)
-        print(f"Removed {env_file}")
+        print(f"Removed {env_file}", flush=True)
 
     # Delete certs directory (identity key + all certificates)
     if os.path.isdir(certs_dir):
         import shutil
         shutil.rmtree(certs_dir)
-        print(f"Removed {certs_dir}/")
+        print(f"Removed {certs_dir}/", flush=True)
 
-    print("Reset complete.\n")
+    # Wipe operational state — receipts.db, incidents.json, logs/.
+    # Pre-rc.3 these survived a CLI --reset, so the next start
+    # surfaced stale failed-claim rows and old incidents.
+    from app.paths import wipe_operational_state
+    for note in wipe_operational_state(cfg_dir):
+        print(note, flush=True)
+
+    print("Reset complete.\n", flush=True)
     return True
 
 
@@ -1302,7 +2508,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     net = parser.add_argument_group("network")
     net.add_argument(
         "--port", "-p", type=int, metavar="PORT",
-        help="Node listen port (default: 9090)",
+        help="Node listen port, 1-65535 (default: 9090)",
     )
     net.add_argument(
         "--public-url", metavar="HOST",
@@ -1310,7 +2516,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     net.add_argument(
         "--public-port", type=int, metavar="PORT",
-        help="Advertised public port (tunnel mode)",
+        help="Advertised public port, 1-65535 (tunnel mode)",
     )
     net.add_argument(
         "--no-upnp", action="store_true",
@@ -1321,11 +2527,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     wallet = parser.add_argument_group("wallet")
     wallet.add_argument(
         "--staking-address", metavar="ADDR",
-        help="Staking wallet address",
+        help="EVM staking wallet address (0x followed by 40 hex chars)",
     )
     wallet.add_argument(
         "--collection-address", metavar="ADDR",
-        help="Collection wallet address",
+        help="EVM collection wallet address (0x followed by 40 hex chars)",
     )
     wallet.add_argument(
         "--password-file", metavar="PATH",
@@ -1343,7 +2549,138 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Human-readable node label",
     )
 
+    # Leg 2 settlement commands — run instead of starting the node.
+    claim_group = parser.add_argument_group("payment settlement")
+    claim_group.add_argument(
+        "--receipts", action="store_true",
+        help="List outstanding Leg 2 receipts and exit. Adds --failed to "
+             "show failed/retryable/locked rows with their reason; --json "
+             "for machine-readable output; --reap to run the claim reaper.",
+    )
+    claim_group.add_argument(
+        "--failed", action="store_true",
+        help="With --receipts: show only rows in failed_retryable or "
+             "failed_terminal state, including the full error reason.",
+    )
+    claim_group.add_argument(
+        "--json", action="store_true", dest="output_json",
+        help="With --receipts: emit a stable JSON payload instead of the "
+             "rich table. Schema documented in docs/cli-receipts.md.",
+    )
+    claim_group.add_argument(
+        "--reap", action="store_true",
+        help="With --receipts: run one claim-reaper tick before the "
+             "listing so stuck CLAIM_TX_TIMEOUT rows are resolved.",
+    )
+    claim_group.add_argument(
+        "--include-claimed", action="store_true", dest="include_claimed",
+        help="With --receipts --json: include already-claimed (settled) "
+             "receipts in the output alongside pending and failed rows. "
+             "Default off so the JSON payload stays focused on actionable "
+             "rows.",
+    )
+    claim_group.add_argument(
+        "--claim", action="store_true",
+        help="Submit all claimable Leg 2 receipts on-chain via claimBatch() "
+             "and exit. Combine with --include-retryable to also settle "
+             "rows that previously reverted but are still under the "
+             "attempt cap, or --uuid to settle a single receipt.",
+    )
+    claim_group.add_argument(
+        "--include-retryable", action="store_true",
+        help="With --claim: also submit rows in failed_retryable state. "
+             "Default off so scheduled cron runs don't snowball into "
+             "retry storms on terminally broken receipts.",
+    )
+    claim_group.add_argument(
+        "--uuid", metavar="UUID",
+        help="With --claim: target this specific UUID. "
+             "--claim refuses if the row is locked (failed_terminal).",
+    )
+
     return parser
+
+
+def _validate_cli_args(args: argparse.Namespace) -> None:
+    """Reject invalid CLI args before the daemon starts.
+
+    The Phase A real-user sweep showed the daemon accepting nonsense like
+    --port 0 or --staking-address bogus and starting anyway, producing
+    receipts that fail much later at claim time. We validate at the CLI
+    boundary so bad input fails fast with a clear message.
+
+    Errors print to stderr and exit with status 2 (argparse-style usage
+    error). Each check is independent so we can surface every problem in
+    a single run rather than playing whack-a-mole.
+    """
+    errors: list[str] = []
+
+    if args.port is not None and not (1 <= args.port <= 65535):
+        errors.append(
+            f"--port must be in 1..65535, got {args.port}"
+        )
+    if args.public_port is not None and not (1 <= args.public_port <= 65535):
+        errors.append(
+            f"--public-port must be in 1..65535, got {args.public_port}"
+        )
+
+    from app.wallet import validate_wallet_address
+    for flag, value in (
+        ("--staking-address", args.staking_address),
+        ("--collection-address", args.collection_address),
+    ):
+        if value is None:
+            continue
+        try:
+            validate_wallet_address(value)
+        except ValueError as exc:
+            errors.append(f"{flag}: {exc}")
+
+    if errors:
+        print("space-router-node: invalid CLI arguments:", file=sys.stderr)
+        for e in errors:
+            print(f"  - {e}", file=sys.stderr)
+        sys.exit(2)
+
+
+def _persist_network_mode_to_settings(
+    public_url: str | None,
+    public_port: int | None,
+    no_upnp: bool,
+) -> None:
+    """Write tunnel-mode network settings to settings.json.
+
+    Pre-rc.3 ``--public-url`` / ``--public-port`` only set os.environ for
+    the running process, so they were silently forgotten on every
+    restart. Headless tunnel-mode operators (CGNAT bypass via bore.pub
+    or similar) expected the values to persist the way the GUI's
+    "Tunnel mode" toggle does. Best-effort: never block startup if the
+    write fails.
+    """
+    if public_url is None and public_port is None and not no_upnp:
+        return
+    try:
+        from app.settings_loader import load_provider_settings, settings_path
+        s = load_provider_settings()
+        if public_url is not None:
+            s.node.public_ip = public_url
+            s.node.upnp_enabled = False
+        if public_port is not None:
+            s.node.public_port = int(public_port)
+        if no_upnp:
+            s.node.upnp_enabled = False
+        s_path = settings_path()
+        s_path.parent.mkdir(parents=True, exist_ok=True)
+        s.save(s_path)
+        logger.info(
+            "Persisted network mode to %s (public_ip=%s, public_port=%s, "
+            "upnp_enabled=%s)",
+            s_path, s.node.public_ip, s.node.public_port, s.node.upnp_enabled,
+        )
+    except Exception as e:  # noqa: BLE001
+        # Non-fatal: the os.environ override below still takes effect for
+        # this run; only the persistence is lost.
+        logger.warning("Could not persist network-mode CLI flags: %s", e)
 
 
 def _apply_cli_args(args: argparse.Namespace) -> None:
@@ -1351,6 +2688,11 @@ def _apply_cli_args(args: argparse.Namespace) -> None:
 
     CLI args take precedence over .env values. We set os.environ so that
     pydantic-settings picks them up when load_settings() is called.
+
+    Network-mode flags (``--public-url``, ``--public-port``, ``--no-upnp``)
+    are also persisted to settings.json so the operator doesn't have to
+    re-pass them on every restart — matching the GUI's "Tunnel mode"
+    toggle semantics.
     """
     if args.port is not None:
         os.environ["SR_NODE_PORT"] = str(args.port)
@@ -1360,6 +2702,9 @@ def _apply_cli_args(args: argparse.Namespace) -> None:
         os.environ["SR_PUBLIC_PORT"] = str(args.public_port)
     if args.no_upnp:
         os.environ["SR_UPNP_ENABLED"] = "false"
+    _persist_network_mode_to_settings(
+        args.public_url, args.public_port, args.no_upnp,
+    )
     if args.staking_address is not None:
         os.environ["SR_STAKING_ADDRESS"] = args.staking_address
     if args.collection_address is not None:
@@ -1468,17 +2813,450 @@ def _run_node(settings_override=None) -> None:  # noqa: ANN001
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
 
+async def _cmd_receipts(
+    failed_only: bool = False,
+    as_json: bool = False,
+    run_reaper: bool = False,
+    include_claimed: bool = False,
+) -> None:
+    """List Leg 2 receipts from the local store.
+
+    Default output preserves the pre-v1.5 one-line summary + table for
+    the common case (no failures, no flags). Failure columns only appear
+    once there's at least one non-zero ``attempts`` or a ``last_error_code``
+    somewhere, so the happy path looks identical to what operators know.
+    """
+    import json as json_mod
+    from app.payment.receipt_store import get_store
+    from app.payment import reasons
+
+    s = load_settings()
+
+    if run_reaper:
+        from app.payment.reaper import ClaimReaper
+        reaper = ClaimReaper(settings=s)
+        if reaper.enabled:
+            summary = await reaper.tick()
+            if not as_json:
+                print(
+                    f"Reaper: checked={summary['checked']} "
+                    f"reconciled={summary['reconciled']} "
+                    f"cleared={summary['cleared']}"
+                )
+
+    store = get_store(s.RECEIPT_STORE_PATH)
+    await store.initialize()
+    summary = await store.summary()
+
+    if failed_only:
+        rows = await store.list_by_view("failed_retryable", limit=500)
+        rows += await store.list_by_view("failed_terminal", limit=500)
+    else:
+        # Claimable first (most actionable), then retryable, then pending.
+        rows = await store.list_by_view("claimable", limit=500)
+        rows += await store.list_by_view("failed_retryable", limit=500)
+        rows += await store.list_by_view("pending_sign", limit=500)
+        # Locked rows at the end so they don't dominate the top of the
+        # list when the interesting data is further down.
+        rows += await store.list_by_view("failed_terminal", limit=500)
+        # rc.5 minor #2 — include claimed history for tools that want
+        # the full picture. Off by default so the operator-facing
+        # default stays focused on actionable rows.
+        if include_claimed:
+            rows += await store.list_by_view("claimed", limit=500)
+
+    if as_json:
+        print(json_mod.dumps({
+            "store_path": str(s.RECEIPT_STORE_PATH),
+            "summary": summary,
+            "receipts": [_receipt_to_json(sr) for sr in rows],
+        }, indent=2))
+        return
+
+    print(f"Receipt store: {s.RECEIPT_STORE_PATH}")
+    print(
+        f"Claimable: {summary['claimable']} receipt(s), "
+        f"total = {summary['claimable_total_price']} wei "
+        f"({summary['claimable_total_price'] / 10**18:.6f} tokens)"
+    )
+    if summary["failed_retryable"] or summary["failed_terminal"]:
+        print(
+            f"Needs attention: {summary['failed_retryable']} retryable, "
+            f"{summary['failed_terminal']} locked"
+        )
+    if summary["pending_sign"]:
+        print(f"Pending signing: {summary['pending_sign']}")
+
+    if not rows:
+        return
+
+    try:
+        from rich.console import Console
+        from rich.table import Table
+        console = Console()
+        use_rich = True
+    except Exception:
+        use_rich = False
+
+    if use_rich:
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("UUID", style="dim", no_wrap=True)
+        table.add_column("Bytes", justify="right")
+        table.add_column("Price (wei)", justify="right")
+        table.add_column("Age", justify="right")
+        table.add_column("Try")
+        table.add_column("Status")
+        now = int(time.time())
+        for sr in rows[:100]:
+            age = now - sr.created_at
+            tries = _tries_cell(sr)
+            status, style = _status_cell(sr)
+            uuid_display = sr.receipt.request_uuid
+            if sr.view == "failed_terminal":
+                uuid_display = f"[strike]{uuid_display}[/]"
+            table.add_row(
+                uuid_display,
+                f"{sr.receipt.data_amount:,}",
+                f"{sr.receipt.total_price:,}",
+                _humanize_age(age),
+                tries,
+                f"[{style}]{status}[/]",
+            )
+        console.print(table)
+        if len(rows) > 100:
+            console.print(f"[dim]... ({len(rows) - 100} more — use --json for full set)[/]")
+    else:
+        # Plain-text fallback for environments without rich.
+        print()
+        print(f"  {'UUID':<38} {'bytes':>12} {'price (wei)':>22} {'age':>8} {'try':>5}  status")
+        now = int(time.time())
+        for sr in rows[:50]:
+            age = now - sr.created_at
+            print(
+                f"  {sr.receipt.request_uuid:<38} "
+                f"{sr.receipt.data_amount:>12d} "
+                f"{sr.receipt.total_price:>22d} "
+                f"{_humanize_age(age):>8} "
+                f"{_tries_cell(sr):>5}  {_status_cell(sr)[0]}"
+            )
+            if sr.last_error_code:
+                msg = reasons.message_for(sr.last_error_code)
+                print(f"      {sr.last_error_code}: {msg}")
+
+
+def _humanize_age(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def _tries_cell(sr) -> str:
+    """Show sign vs claim attempts only when non-zero — the default
+    happy-path output stays clean."""
+    from app.payment import reasons
+    if sr.claim_attempts:
+        return f"{sr.claim_attempts}/{reasons.MAX_CLAIM_ATTEMPTS}"
+    if sr.sign_attempts:
+        return f"{sr.sign_attempts}/{reasons.MAX_SIGN_ATTEMPTS}"
+    return "—"
+
+
+def _status_cell(sr) -> tuple[str, str]:
+    from app.payment import reasons
+    view = sr.view
+    if view == "claimable":
+        return ("ready to claim", "cyan")
+    if view == "pending_sign":
+        return ("pending signing", "dim")
+    if view == "failed_retryable":
+        msg = reasons.message_for(sr.last_error_code) or "retryable"
+        return (f"retry: {msg}", "yellow")
+    if view == "failed_terminal":
+        msg = reasons.message_for(sr.last_error_code) or "locked"
+        return (f"locked: {msg}", "red dim")
+    if view == "claimed":
+        return ("claimed", "green dim")
+    return (view, "")
+
+
+def _receipt_to_json(sr) -> dict:
+    from app.payment import reasons as reasons_mod
+    return {
+        "request_uuid": sr.receipt.request_uuid,
+        "tunnel_request_id": sr.tunnel_request_id,
+        "client_address": sr.receipt.client_address,
+        "node_address": sr.receipt.node_address,
+        "data_amount": int(sr.receipt.data_amount),
+        "total_price": int(sr.receipt.total_price),
+        "view": sr.view,
+        "signature_present": bool(sr.signature),
+        "created_at": sr.created_at,
+        "claimed_at": sr.claimed_at,
+        "claim_tx_hash": sr.claim_tx_hash,
+        "sign_attempts": sr.sign_attempts,
+        "claim_attempts": sr.claim_attempts,
+        "max_sign_attempts": reasons_mod.MAX_SIGN_ATTEMPTS,
+        "max_claim_attempts": reasons_mod.MAX_CLAIM_ATTEMPTS,
+        "last_error_code": sr.last_error_code,
+        "last_error_detail": sr.last_error_detail,
+        "last_error_message": reasons_mod.message_for(sr.last_error_code),
+        "last_attempt_at": sr.last_attempt_at,
+        "locked": sr.locked,
+    }
+
+
+async def _cmd_claim(
+    include_retryable: bool = False, only_uuid: str | None = None,
+    as_json: bool = False,
+) -> None:
+    """Submit claimable Leg 2 receipts on-chain.
+
+    Default scope is ``claimable`` only, matching pre-v1.5 behaviour.
+    ``include_retryable=True`` picks up ``failed_retryable`` rows for
+    explicit retry. ``only_uuid`` restricts the run to a single row and
+    refuses if that row is locked.
+
+    rc.9: ``as_json=True`` (set when the operator passes ``--json``)
+    routes every exit path through a single JSON envelope — failures
+    emit ``{"ok": false, "error_code": ..., "error": ...}`` to stdout
+    + exit 1; success emits a structured summary. Cron scripts piping
+    to ``jq`` no longer get text on the failure path.
+    """
+    import json as _json
+    from app.payment.settlement import claim_all
+    from app.payment.receipt_store import get_store
+
+    def _fail(error_code: str, message: str, exit_code: int = 1) -> None:
+        if as_json:
+            print(_json.dumps({
+                "ok": False,
+                "error_code": error_code,
+                "error": message,
+            }))
+        else:
+            print(message, file=sys.stderr)
+        sys.exit(exit_code)
+
+    def _info(message: str) -> None:
+        # Informational text on the success path — suppressed in JSON
+        # mode so the only thing on stdout is the final summary object.
+        if not as_json:
+            print(message)
+
+    s = load_settings()
+
+    if only_uuid:
+        store = get_store(s.RECEIPT_STORE_PATH)
+        await store.initialize()
+        existing = await store.get_by_uuid(only_uuid)
+        if existing is None:
+            _fail("NO_RECEIPT", f"No receipt found with uuid {only_uuid}")
+        if existing.locked:
+            _fail(
+                "RECEIPT_LOCKED",
+                f"Receipt {only_uuid} is locked (failed_terminal) — refusing "
+                f"to claim. Use --unlock to reset if you're sure.",
+            )
+
+    # Use identity key by default — operator can override with SR_SETTLEMENT_KEY if they want
+    # a separate settlement wallet. Both paths require the key file on disk.
+    settlement_key_hex = os.environ.get("SR_SETTLEMENT_KEY", "")
+    override = bool(settlement_key_hex)
+    if not settlement_key_hex:
+        try:
+            identity_key, identity_address = load_or_create_identity(
+                s.IDENTITY_KEY_PATH, s.IDENTITY_PASSPHRASE,
+            )
+            settlement_key_hex = identity_key if identity_key.startswith("0x") else "0x" + identity_key
+            _info(f"Submitting as identity {identity_address}")
+        except KeystorePassphraseRequired:
+            _fail(
+                "KEYSTORE_PASSPHRASE_REQUIRED",
+                "Identity key is encrypted. Set SR_IDENTITY_PASSPHRASE or use --password-file.",
+            )
+
+    # Gas pre-check — the chain tx will revert with cryptic "insufficient
+    # funds" if the settlement wallet has 0 native tokens. Fail early with
+    # guidance instead.
+    if s.ESCROW_CHAIN_RPC:
+        from web3 import Web3
+        from eth_account import Account
+        try:
+            w3 = Web3(Web3.HTTPProvider(s.ESCROW_CHAIN_RPC, request_kwargs={"timeout": 10}))
+            addr = Account.from_key(settlement_key_hex).address
+            balance = w3.eth.get_balance(addr)
+        except Exception as e:
+            # Non-fatal warning — proceed with claim; chain may revert.
+            if not as_json:
+                print(f"Could not check gas balance ({e}); proceeding.", file=sys.stderr)
+            balance = None
+        if balance is not None and balance == 0:
+            # Pre-rc.9 used exit 0 here (treated as benign skip); rc.9
+            # keeps that exit code so existing cron behaviour is unchanged
+            # but routes through ``_fail`` so JSON mode gets a clean shape.
+            _fail(
+                "SETTLEMENT_GAS_BALANCE_ZERO",
+                f"Settlement wallet {addr} has 0 native tokens for gas. "
+                f"{'(This is your identity key.) ' if not override else ''}"
+                f"Fund it with a small amount of the chain's native token, "
+                f"or set SR_SETTLEMENT_KEY=<hex> to a funded wallet and retry.",
+                exit_code=0,
+            )
+
+    # P3/L3 — share the GUI's claim.lock so a CLI claim and a GUI
+    # claim can't double-submit the same nonces. Stale-lock recovery
+    # is inherited from the OS primitive; if a previous holder crashed,
+    # the lock will be free.
+    from app.payment.claim_lock import acquire_claim_lock, ClaimLockHeld
+
+    try:
+        with acquire_claim_lock(s):
+            try:
+                results = await claim_all(
+                    s, settlement_key_hex,
+                    include_retryable=include_retryable,
+                    only_uuids=[only_uuid] if only_uuid else None,
+                )
+            except ValueError as e:
+                _fail("CANNOT_CLAIM", f"Cannot claim: {e}")
+    except ClaimLockHeld:
+        _fail(
+            "CLAIM_LOCK_HELD",
+            "another claim is in progress (GUI or CLI). Wait for it to "
+            "finish or close the GUI.",
+        )
+
+    if not results:
+        if as_json:
+            print(_json.dumps({"ok": True, "submitted": 0, "batches": [], "message": "No receipts to submit."}))
+        else:
+            print("No receipts to submit.")
+        return
+
+    total_submitted = sum(r.submitted for r in results)
+    total_failed = sum(1 for r in results if r.error)
+    total_reconciled = sum(r.skipped_as_already_claimed for r in results)
+    total_locked = sum(r.locked_after_failure for r in results)
+
+    if as_json:
+        # Single canonical JSON envelope — cron + jq friendly.
+        batches = []
+        for i, r in enumerate(results, 1):
+            batch = {
+                "index": i,
+                "submitted": r.submitted,
+                "tx_hash": r.tx_hash,
+                "gas_used": r.gas_used,
+                "ok": not r.error,
+                "skipped_as_already_claimed": r.skipped_as_already_claimed,
+                "locked_after_failure": r.locked_after_failure,
+            }
+            if r.error:
+                batch["reason_code"] = r.reason_code
+                batch["error"] = str(r.error) if r.error is not None else None
+            batches.append(batch)
+        print(_json.dumps({
+            "ok": total_failed == 0,
+            "submitted": total_submitted,
+            "reconciled": total_reconciled,
+            "locked": total_locked,
+            "batches": batches,
+        }))
+        if total_failed:
+            sys.exit(1)
+        return
+
+    print(
+        f"Submitted {len(results)} batch(es), {total_submitted} receipt(s) total."
+    )
+    if total_reconciled:
+        print(
+            f"Reconciled {total_reconciled} receipt(s) as already-claimed on-chain."
+        )
+    for i, r in enumerate(results, 1):
+        if r.skipped_as_already_claimed and not r.submitted:
+            # The reconciliation pseudo-batch — already surfaced above.
+            continue
+        if r.error:
+            tail = f"tx={r.tx_hash}" if r.tx_hash else ""
+            print(
+                f"  Batch {i}: FAILED ({r.submitted} receipts, "
+                f"reason={r.reason_code}) {tail}"
+            )
+        else:
+            print(
+                f"  Batch {i}: OK ({r.submitted} receipts) "
+                f"tx={r.tx_hash} gas={r.gas_used}"
+            )
+    if total_locked:
+        print(
+            f"{total_locked} receipt(s) hit the retry cap and are now "
+            f"locked — run --receipts --failed to inspect."
+        )
+    if total_failed:
+        sys.exit(1)
+
+
+# ``time`` is used inside _cmd_receipts for age display.
+import time  # noqa: E402
+
+
 def main() -> None:
     from app.node_logging import setup_cli_logging, reset_activity  # noqa: E402
-
-    setup_cli_logging()
-    reset_activity()
 
     parser = _build_arg_parser()
     args = parser.parse_args()
 
+    # ``--receipts --json`` and ``--claim --json`` are consumed by tooling
+    # that reads stdout as JSON. Route INFO/WARNING/ERROR to stderr so
+    # log lines never bleed into the JSON payload. rc.9 #P1b: extended to
+    # cover --claim after #P1 wired --json into _cmd_claim — without this,
+    # the settings_loader INFO line lands on stdout right before the JSON
+    # envelope and `jq` chokes with "Extra data".
+    log_to_stderr = bool(
+        getattr(args, "output_json", False)
+        and (args.receipts or args.claim)
+    )
+    setup_cli_logging(log_to_stderr=log_to_stderr)
+    reset_activity()
+
+    # Validate CLI input before doing any work. Bad --port / --staking-address
+    # used to start the daemon anyway and surface as far-downstream failures
+    # (Phase A findings #6 / #7).
+    _validate_cli_args(args)
+
+    # First-launch on PyInstaller bundles can spend 6-9s on import + crypto
+    # init before any log line lands; without this hint the user thinks the
+    # process hung. Flush so it shows even when stdout is redirected to a
+    # file (Phase A finding #3). --receipts / --claim are short-running
+    # commands with their own output; skip the hint there to keep
+    # machine-readable output clean.
+    if not (args.receipts or args.claim):
+        print("space-router-node: starting...", flush=True)
+
     # Apply CLI args as env var overrides before loading settings
     _apply_cli_args(args)
+
+    # Settlement commands — read outstanding receipts or submit them on-chain, then exit.
+    if args.receipts:
+        asyncio.run(_cmd_receipts(
+            failed_only=args.failed,
+            as_json=args.output_json,
+            run_reaper=args.reap,
+            include_claimed=getattr(args, "include_claimed", False),
+        ))
+        return
+    if args.claim:
+        asyncio.run(_cmd_claim(
+            include_retryable=args.include_retryable,
+            only_uuid=args.uuid,
+            as_json=args.output_json,
+        ))
+        return
 
     # --reset: clear everything, then re-run wizard and start
     if args.reset:
@@ -1492,8 +3270,26 @@ def main() -> None:
             _show_staking_prompt()
             _run_node(settings_override=load_settings())
         else:
-            print("Reset complete. Run again to reconfigure.", file=sys.stderr)
+            print(
+                "Reset complete. Run interactively to reconfigure, or set "
+                "values in ~/.spacerouter/settings.json before next launch.",
+                flush=True,
+            )
         return
+
+    # --setup explicitly requested but no TTY: refuse with a clear error
+    # rather than silently falling through to a default daemon start
+    # (Phase A finding #11). The detect-and-auto-launch wizard path below
+    # is unaffected; only the explicit flag is hard-stopped.
+    if args.setup and not sys.stdin.isatty():
+        print(
+            "Error: --setup requires a TTY (interactive shell).\n"
+            "  - To configure non-interactively, edit ~/.spacerouter/settings.json directly.\n"
+            "  - Or pass values via flags: --staking-address, --port, --label, --log-level, etc.\n",
+            file=sys.stderr,
+            flush=True,
+        )
+        sys.exit(2)
 
     # Setup wizard: trigger when --setup is passed, identity key is missing,
     # or config looks unconfigured. Only in interactive TTY.
