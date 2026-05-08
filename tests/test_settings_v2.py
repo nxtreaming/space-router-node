@@ -422,6 +422,10 @@ class TestLoader:
             # Backfilled — assert the testnet contract addrs are present.
             assert s.escrow.enabled is True
             assert s.escrow.contract_address.lower().startswith("0xc5740e4e")
+        elif s.build_variant == "production":
+            # v1.5.1+: production variant also backfills with mainnet defaults.
+            assert s.escrow.enabled is True
+            assert s.escrow.contract_address.lower().startswith("0xc130f5d76f")
         else:
             assert s.escrow == bare.escrow
 
