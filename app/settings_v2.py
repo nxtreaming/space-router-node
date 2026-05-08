@@ -194,15 +194,23 @@ class Settings(BaseModel):
         """
         if self.build_variant == "test":
             return self
+        from urllib.parse import urlparse
+        # Loopback addresses are exempt — no MITM possible on local interface;
+        # required for production-build CI smoke tests against a localhost mock.
+        _LOOPBACK = {"127.0.0.1", "localhost", "::1", "[::1]"}
         for label, value in (
             ("coordination.url", self.coordination.url),
             ("escrow.chain_rpc", self.escrow.chain_rpc),
         ):
-            if value and not value.startswith("https://"):
-                raise ValueError(
-                    f"{label} must use https:// on build_variant={self.build_variant!r} "
-                    f"(got {value!r}). Plaintext is only allowed in test builds."
-                )
+            if not value or value.startswith("https://"):
+                continue
+            host = (urlparse(value).hostname or "").lower()
+            if host in _LOOPBACK:
+                continue
+            raise ValueError(
+                f"{label} must use https:// on build_variant={self.build_variant!r} "
+                f"(got {value!r}). Plaintext is only allowed in test builds or on loopback."
+            )
         return self
 
     # ── Load / save ──────────────────────────────────────────────────
