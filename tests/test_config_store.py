@@ -163,9 +163,12 @@ class TestEscrowDefaults:
         assert cs._DEFAULTS["SR_PAYMENT_ENABLED"] == "true"
         assert "SR_NODE_RATE_PER_GB" not in cs._DEFAULTS
 
-    def test_prod_variant_leaves_escrow_empty(self, monkeypatch):
-        """Prod keeps the fields empty so operators configure them at
-        rollout — mainnet escrow isn't a deployed constant yet."""
+    def test_prod_variant_seeds_mainnet_escrow_defaults(self, monkeypatch):
+        """v1.5.1+: prod ships with mainnet escrow constants baked in.
+
+        Pre-v1.5.1 this returned empty strings because mainnet escrow
+        wasn't deployed yet. Now that it is, the production binary
+        defaults match what coord /config returns on TOFU sync."""
         import importlib
 
         import app.variant as variant_mod
@@ -174,12 +177,11 @@ class TestEscrowDefaults:
         import gui.config_store as cs
         cs = importlib.reload(cs)
 
-        assert cs._DEFAULTS["SR_ESCROW_CONTRACT_ADDRESS"] == ""
-        assert cs._DEFAULTS["SR_ESCROW_CHAIN_RPC"] == ""
-        assert cs._DEFAULTS["SR_ESCROW_CHAIN_ID"] == ""
-        # Prod stays opt-in until mainnet escrow is rolled out — operators
-        # must explicitly flip the flag for now.
-        assert cs._DEFAULTS["SR_PAYMENT_ENABLED"] == "false"
+        assert cs._DEFAULTS["SR_ESCROW_CONTRACT_ADDRESS"] == cs._PROD_ESCROW_CONTRACT
+        assert cs._DEFAULTS["SR_ESCROW_CHAIN_RPC"] == cs._PROD_ESCROW_CHAIN_RPC
+        assert cs._DEFAULTS["SR_ESCROW_CHAIN_ID"] == cs._PROD_ESCROW_CHAIN_ID
+        # Production opts in by default now — mainnet escrow is live.
+        assert cs._DEFAULTS["SR_PAYMENT_ENABLED"] == "true"
         # Same as test variant: rate comes from coord, not from defaults.
         assert "SR_NODE_RATE_PER_GB" not in cs._DEFAULTS
 
@@ -275,9 +277,13 @@ class TestFreshRestartPreservesEscrow:
         # Rate is left null after reset; TOFU sync at boot fills it.
         assert s.escrow.leg2_rate_per_gb is None
 
-    def test_reset_then_reload_does_not_force_escrow_on_prod_variant(self, monkeypatch, tmp_path):
-        """Prod must NOT auto-opt-into escrow until mainnet rollout —
-        operators decide. Reset + reload on prod yields escrow.enabled=false.
+    def test_reset_then_reload_seeds_mainnet_escrow_on_prod_variant(self, monkeypatch, tmp_path):
+        """v1.5.1+: prod auto-opts into mainnet escrow on reset.
+
+        Pre-v1.5.1 we left these empty so operators set them by hand.
+        Mainnet escrow is now live and the canonical addresses are
+        baked into the binary, so reset + reload on prod yields the
+        same enabled state as a test build, just pointed at mainnet.
         """
         import importlib
 
@@ -292,6 +298,9 @@ class TestFreshRestartPreservesEscrow:
 
         from app.settings_loader import load_provider_settings
         s = load_provider_settings(tmp_path)
-        assert s.escrow.enabled is False
-        assert not s.escrow.contract_address
-        assert not s.escrow.chain_rpc
+        assert s.escrow.enabled is True
+        assert s.escrow.contract_address.lower().startswith("0xc130f5d76f")
+        assert "mainnet3.creditcoin.network" in s.escrow.chain_rpc
+        assert s.escrow.chain_id == 102030
+        # Rate is left null after reset; TOFU sync at boot fills it.
+        assert s.escrow.leg2_rate_per_gb is None

@@ -125,9 +125,15 @@ def sync_escrow_config_from_coord(settings_v2: Settings) -> Settings:
     # ── Apply each field defensively ─────────────────────────────────
     raw_payer = payload.get("gatewayPayerAddress")
     raw_rate = payload.get("gatewayLeg2RatePerGb")
+    raw_contract = payload.get("escrowContractAddress")
+    raw_chain_rpc = payload.get("chainRpc")
+    raw_chain_id = payload.get("chainId")
 
     payer_applied = False
     rate_applied = False
+    contract_applied = False
+    chain_rpc_applied = False
+    chain_id_applied = False
 
     # gateway_payer_address — only set if currently empty AND coord gave a non-empty value.
     if not escrow.gateway_payer_address:
@@ -138,6 +144,34 @@ def sync_escrow_config_from_coord(settings_v2: Settings) -> Settings:
             logger.warning(
                 "escrow config sync: coord returned empty/missing gatewayPayerAddress — skipping",
             )
+
+    # escrow.contract_address — only fill if currently empty AND coord gave one.
+    # Operator-set contract addresses are respected (never overwritten).
+    if not escrow.contract_address:
+        if isinstance(raw_contract, str) and raw_contract.strip():
+            escrow.contract_address = raw_contract.strip()
+            contract_applied = True
+
+    # escrow.chain_rpc — same rule.
+    if not escrow.chain_rpc:
+        if isinstance(raw_chain_rpc, str) and raw_chain_rpc.strip():
+            escrow.chain_rpc = raw_chain_rpc.strip()
+            chain_rpc_applied = True
+
+    # escrow.chain_id — same rule (coord returns int).
+    if not escrow.chain_id:
+        if isinstance(raw_chain_id, int) and raw_chain_id > 0:
+            escrow.chain_id = raw_chain_id
+            chain_id_applied = True
+
+    # If we just populated a contract address from coord, the operator's
+    # intent is clearly "use this contract for Leg 2." Flip enabled=true so
+    # the GUI surfaces Earnings/Receipts/Claim and the daemon signs receipts.
+    # Only flip on *first* contract install — never override an explicit
+    # `enabled=false` once the contract is already in place (that's an
+    # operator opt-out we should respect).
+    if contract_applied and not escrow.enabled:
+        escrow.enabled = True
 
     # leg2_rate_per_gb — apply coord's value whenever we got past the
     # early-skip (which only fires when BOTH timestamp AND rate are
@@ -181,14 +215,25 @@ def sync_escrow_config_from_coord(settings_v2: Settings) -> Settings:
     # field was applied (coord returned 0/empty for both, or both were
     # already set), there's nothing to remember and no reason to skip
     # future syncs.
-    if payer_applied or rate_applied:
+    if (
+        payer_applied
+        or rate_applied
+        or contract_applied
+        or chain_rpc_applied
+        or chain_id_applied
+    ):
         escrow.synced_from_coord_at = datetime.now(tz=UTC).isoformat()
         logger.info(
             "escrow config synced from %s — leg2_rate_per_gb=%s wei, "
-            "gateway_payer_address=%s, synced_at=%s",
+            "gateway_payer_address=%s, contract=%s, chain_rpc=%s, "
+            "chain_id=%s, enabled=%s, synced_at=%s",
             config_url,
             escrow.leg2_rate_per_gb,
             escrow.gateway_payer_address,
+            escrow.contract_address,
+            escrow.chain_rpc,
+            escrow.chain_id,
+            escrow.enabled,
             escrow.synced_from_coord_at,
         )
 

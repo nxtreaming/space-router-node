@@ -109,8 +109,25 @@ class WalletSection(_Section):
         return _validate_evm_address(v)
 
 
+def _default_coord_url() -> str:
+    """Pick the right coord URL for the current build variant.
+
+    Production builds default to the public coordination URL; test builds
+    default to the test fly.dev hostname. Other variants (dev/staging) get
+    the public URL too — easier to override via settings.json than to
+    silently route a fresh install to test.
+    """
+    try:
+        from app._build_variant import BUILD_VARIANT  # type: ignore[import-not-found]
+    except ImportError:
+        BUILD_VARIANT = "production"
+    if BUILD_VARIANT == "test":
+        return "https://spacerouter-coordination-api-test.fly.dev"
+    return "https://coordination.spacerouter.org"
+
+
 class CoordinationSection(_Section):
-    url: str = "https://spacerouter-coordination-api-test.fly.dev"
+    url: str = Field(default_factory=_default_coord_url)
 
     @field_validator("url")
     @classmethod

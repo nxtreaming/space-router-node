@@ -92,10 +92,27 @@ def test_does_not_touch_operator_configured_escrow(tmp_path):
     assert s.escrow.chain_id == 999
 
 
-def test_does_not_run_on_prod_variant(tmp_path):
-    """Prod doesn't auto-flip escrow on. Operators configure it
-    explicitly until mainnet escrow is rolled out."""
+def test_runs_on_prod_variant_with_mainnet_defaults(tmp_path):
+    """v1.5.1+: prod auto-seeds mainnet escrow defaults on first load.
+
+    Pre-v1.5.1 prod was operator-configured because mainnet escrow
+    wasn't deployed yet. Now mainnet escrow is live and the canonical
+    addresses are baked into the binary."""
     s = Settings(build_variant="production")
+    s.save(settings_path(tmp_path))
+
+    s = load_provider_settings(tmp_path)
+
+    assert s.escrow.enabled is True
+    assert s.escrow.contract_address.lower().startswith("0xc130f5d76f")
+    assert "mainnet3.creditcoin.network" in s.escrow.chain_rpc
+    assert s.escrow.chain_id == 102030
+
+
+def test_unknown_variant_leaves_escrow_empty(tmp_path):
+    """Variants other than 'test' and 'production' get no backfill —
+    operators must hand-configure (e.g. for staging or local-dev builds)."""
+    s = Settings(build_variant="staging")
     s.save(settings_path(tmp_path))
 
     s = load_provider_settings(tmp_path)

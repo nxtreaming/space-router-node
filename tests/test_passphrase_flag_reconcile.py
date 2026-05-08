@@ -32,13 +32,17 @@ _PRIVKEY_HEX = "0x" + "11" * 32
 def _seed_settings(tmp_path: Path, *, flag: bool, key_path_basename: str = "node-identity.key") -> Path:
     """Write a settings.json with ``identity_passphrase_set=flag``.
 
-    Uses ``build_variant="production"`` so the test-variant escrow
-    backfill (a sibling reconciler) doesn't fire and conflate the
-    mtime / dirty-write assertions.
+    Pre-populates ``escrow.contract_address`` so the escrow-defaults
+    backfill reconciler treats this as already-configured and no-ops,
+    keeping the mtime / dirty-write assertions clean. Pre-v1.5.1 we
+    used ``build_variant="production"`` for the same effect (prod had
+    no backfill); now that mainnet escrow ships with prod defaults,
+    we pin the contract directly.
     """
     s = Settings(build_variant="production")
     s.wallet.identity_passphrase_set = flag
     s.wallet.settlement_key_path = str(tmp_path / key_path_basename)
+    s.escrow.contract_address = "0x0000000000000000000000000000000000000001"
     sp = settings_path(tmp_path)
     s.save(sp)
     return sp

@@ -45,6 +45,14 @@ _TEST_ESCROW_CONTRACT = "0xC5740e4e9175301a24FB6d22bA184b8ec0762852"
 _TEST_ESCROW_CHAIN_RPC = "https://rpc.cc3-testnet.creditcoin.network"
 _TEST_ESCROW_CHAIN_ID = "102031"
 
+# Mainnet equivalents — used by production builds so a fresh install
+# (no settings.json, no coord network reach yet) still has the right
+# defaults baked in. Coord ``/config`` will overwrite these on TOFU sync
+# if the operator ever rotates the contract address.
+_PROD_ESCROW_CONTRACT = "0xC130F5D76f0b4Ce8FE2ceA0D2C2b8f53A39a5cd0"
+_PROD_ESCROW_CHAIN_RPC = "https://mainnet3.creditcoin.network"
+_PROD_ESCROW_CHAIN_ID = "102030"
+
 # Pre-configured environments for easy switching (test builds only)
 ENVIRONMENTS = {
     "production": {
@@ -77,23 +85,36 @@ def _default_coordination_url() -> str:
 
 
 def _default_escrow_contract() -> str:
-    return _TEST_ESCROW_CONTRACT if BUILD_VARIANT == "test" else ""
+    if BUILD_VARIANT == "test":
+        return _TEST_ESCROW_CONTRACT
+    if BUILD_VARIANT == "production":
+        return _PROD_ESCROW_CONTRACT
+    return ""
 
 
 def _default_escrow_chain_rpc() -> str:
-    return _TEST_ESCROW_CHAIN_RPC if BUILD_VARIANT == "test" else ""
+    if BUILD_VARIANT == "test":
+        return _TEST_ESCROW_CHAIN_RPC
+    if BUILD_VARIANT == "production":
+        return _PROD_ESCROW_CHAIN_RPC
+    return ""
 
 
 def _default_escrow_chain_id() -> str:
-    return _TEST_ESCROW_CHAIN_ID if BUILD_VARIANT == "test" else ""
+    if BUILD_VARIANT == "test":
+        return _TEST_ESCROW_CHAIN_ID
+    if BUILD_VARIANT == "production":
+        return _PROD_ESCROW_CHAIN_ID
+    return ""
 
 
 def _default_payment_enabled() -> str:
-    # Test variant opts in by default — the alternative is "fresh test
+    # Both test and production opt in by default — mainnet escrow is
+    # live (v1.5.0 cutover 2026-05-08), so production builds need
+    # payment paths active out of the box. The alternative is "fresh
     # builds silently never sign Leg 2 receipts because escrow is off,"
-    # which is the bug shipped in test.95. Prod stays opt-in until the
-    # mainnet escrow rollout flips this.
-    return "true" if BUILD_VARIANT == "test" else "false"
+    # which is the bug shipped in test.95 / v1.5.0.
+    return "false" if BUILD_VARIANT not in ("test", "production") else "true"
 
 
 _DEFAULTS = {

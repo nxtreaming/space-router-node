@@ -178,13 +178,17 @@ def load_provider_settings(directory: Path | None = None) -> Settings:
     return s
 
 
-# Testnet defaults — duplicated from gui/config_store.py on purpose.
+# Test/prod escrow defaults — duplicated from gui/config_store.py on purpose.
 # settings_loader is reachable from both the daemon (no GUI deps) and the
 # CLI; importing gui.* would pull pywebview into a CLI-only invocation.
 # Keep the two lists in lock-step.
 _TEST_ESCROW_CONTRACT_ADDRESS = "0xC5740e4e9175301a24FB6d22bA184b8ec0762852"
 _TEST_ESCROW_CHAIN_RPC = "https://rpc.cc3-testnet.creditcoin.network"
 _TEST_ESCROW_CHAIN_ID = 102031
+
+_PROD_ESCROW_CONTRACT_ADDRESS = "0xC130F5D76f0b4Ce8FE2ceA0D2C2b8f53A39a5cd0"
+_PROD_ESCROW_CHAIN_RPC = "https://mainnet3.creditcoin.network"
+_PROD_ESCROW_CHAIN_ID = 102030
 
 
 def reconcile_passphrase_flag_in_place(s: Settings) -> bool:
@@ -267,16 +271,16 @@ def _heal_settlement_key_path_in_place(s: Settings) -> bool:
 
 
 def _backfill_test_escrow_in_place(s: Settings) -> bool:
-    """Backfill testnet escrow defaults onto an unconfigured test variant.
+    """Backfill escrow defaults onto an unconfigured test or production variant.
 
     Returns True if any field was modified — caller saves only on True.
 
-    The discriminator is ``escrow.contract_address``: if that's None on
-    a test build, the section was clearly never populated (or was
-    wiped by the test.95 reset bug). We can safely fill in the testnet
-    addresses + flip ``enabled=true``. We do NOT touch a build that
-    already has a contract address (operator-set or future mainnet
-    configuration), nor non-test variants.
+    The discriminator is ``escrow.contract_address``: if that's None,
+    the section was clearly never populated (or was wiped by the
+    test.95 reset bug, or is a fresh production install on v1.5.0+).
+    We can safely fill in the appropriate variant's escrow addresses
+    and flip ``enabled=true``. We do NOT touch a build that already
+    has a contract address (operator-set), nor unknown variants.
 
     NOTE: ``leg2_rate_per_gb`` is INTENTIONALLY not seeded here. The
     daemon's TOFU sync (PR #76 + #94 fix) fetches the canonical rate
@@ -289,14 +293,23 @@ def _backfill_test_escrow_in_place(s: Settings) -> bool:
     the safe behavior when the coord is unreachable.
     """
     bv = (s.build_variant or "").lower()
-    if bv != "test":
+    if bv == "test":
+        contract = _TEST_ESCROW_CONTRACT_ADDRESS
+        rpc = _TEST_ESCROW_CHAIN_RPC
+        chain_id = _TEST_ESCROW_CHAIN_ID
+    elif bv == "production":
+        contract = _PROD_ESCROW_CONTRACT_ADDRESS
+        rpc = _PROD_ESCROW_CHAIN_RPC
+        chain_id = _PROD_ESCROW_CHAIN_ID
+    else:
         return False
+
     if s.escrow.contract_address:
         # Operator already configured an escrow contract — respect it.
         return False
 
     s.escrow.enabled = True
-    s.escrow.contract_address = _TEST_ESCROW_CONTRACT_ADDRESS
-    s.escrow.chain_rpc = _TEST_ESCROW_CHAIN_RPC
-    s.escrow.chain_id = _TEST_ESCROW_CHAIN_ID
+    s.escrow.contract_address = contract
+    s.escrow.chain_rpc = rpc
+    s.escrow.chain_id = chain_id
     return True
